@@ -60,6 +60,20 @@ struct bn254fr_class {
     uint64_t get_u64() const;
 
     /**
+     * Get field element as byte buffer.
+     * Write "len" bytes to buffer (up to 32 bytes).
+     * Get bytes in little-endian order.
+     */
+    void get_bytes_little(unsigned char *bytes, uint32_t len) const;
+
+    /**
+     * Get field element as byte buffer.
+     * Write "len" bytes to buffer (up to 32 bytes).
+     * Get bytes in big-endian order.
+     */
+    void get_bytes_big(unsigned char *bytes, uint32_t len) const;
+
+    /**
      * Debug print a field element - value printed with base 10.
     */
     void print_dec() const;

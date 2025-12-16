@@ -263,6 +263,20 @@ impl Bn254Fr {
         }
     }
 
+    /// Get field element as bytes in little-endian order
+    pub fn get_bytes_little(&self, bytes: &mut [u8]) {
+        unsafe {
+            _bn254fr_get_bytes(&self.data, bytes.as_mut_ptr(), bytes.len() as u32, -1);
+        }
+    }
+
+    /// Get field element as bytes in big-endian order
+    pub fn get_bytes_big(&self, bytes: &mut [u8]) {
+        unsafe {
+            _bn254fr_get_bytes(&self.data, bytes.as_mut_ptr(), bytes.len() as u32, 1);
+        }
+    }
+
     /// Print field element for debugging (base 10 or 16)
     pub fn print_dec(&self) {
         unsafe {
@@ -738,6 +752,9 @@ extern "C" {
     // Getters
     #[link_name = "bn254fr_get_u64"]
     fn _bn254fr_get_u64(x: *const bn254fr_t) -> u64;
+
+    #[link_name = "bn254fr_get_bytes"]
+    fn _bn254fr_get_bytes(x: *const bn254fr_t, bytes: *mut u8, len: u32, order: i32);
 
     #[link_name = "bn254fr_copy"]
     fn _bn254fr_copy(dest: *mut bn254fr_t, src: *const bn254fr_t);

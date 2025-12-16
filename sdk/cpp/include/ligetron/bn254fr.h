@@ -142,6 +142,16 @@ void bn254fr_set_str(bn254fr_t out, const char* str, uint32_t base = 0);
 LIGETRON_API(bn254fr, bn254fr_set_bytes)
 void bn254fr_set_bytes(bn254fr_t out, const unsigned char *bytes, uint32_t len, int32_t order);
 
+/**
+ * Get field element as byte buffer.
+ * Write "len" bytes to buffer (up to 32 bytes).
+ * "order" value:
+ *   -1: use little-endian byte order,
+ *    1: use big-endian byte order
+ */
+LIGETRON_API(bn254fr, bn254fr_get_bytes)
+void bn254fr_get_bytes(const bn254fr_t x, unsigned char *bytes, uint32_t len, int32_t order);
+
 /* --------------- Misc --------------- */
 /** Get field element in a uint64_t constant. */
 LIGETRON_API(bn254fr, bn254fr_get_u64)
@@ -286,6 +296,20 @@ void bn254fr_set_bytes_little(bn254fr_t out, const unsigned char *bytes, uint32_
  * Set bytes in big-endian order.
  */
 void bn254fr_set_bytes_big(bn254fr_t out, const unsigned char *bytes, uint32_t len);
+
+/**
+ * Get field element as byte buffer.
+ * Write "len" bytes to buffer (up to 32 bytes).
+ * Get bytes in little-endian order.
+ */
+void bn254fr_get_bytes_little(const bn254fr_t x, unsigned char *bytes, uint32_t len);
+
+/**
+ * Get field element as byte buffer.
+ * Write "len" bytes to buffer (up to 32 bytes).
+ * Get bytes in big-endian order.
+ */
+void bn254fr_get_bytes_big(const bn254fr_t x, unsigned char *bytes, uint32_t len);
 
 /**
  * "bn254fr_<operation>_checked" funtions execute corresponding "bn254fr_<operation>" function
