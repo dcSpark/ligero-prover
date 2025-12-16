@@ -14,8 +14,11 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -123,19 +126,42 @@ int main(int argc, const char *argv[]) {
                 input_args.emplace_back((u8*)str.c_str(), (u8*)str.c_str() + str.size() + 1);
             }
             else if (arg.contains("hex")) {
-                std::vector<u8> hex_vec;
-                auto hex_str = arg["hex"].template get<std::string>();
-                
-                // Remove leading "0x"
-                if (hex_str.starts_with("0x")) {
-                    hex_str = hex_str.substr(2);
+                // Pass hex as ASCII string (not decoded bytes) - guest parses it
+                std::string hex_str = arg["hex"].template get<std::string>();
+
+                // Ensure no embedded NULs (would truncate if guest uses C-string ops)
+                if (hex_str.find('\0') != std::string::npos) {
+                    std::cerr << "Error: hex arg contains embedded NUL byte" << std::endl;
+                    exit(EXIT_FAILURE);
                 }
-                
-                if (hex_str.size() % 2 == 1) {
-                    hex_str.insert(hex_str.begin(), '0');
+
+                // Ensure 0x prefix (guest/SDK expects it for base-0 parsing)
+                if (!(hex_str.size() >= 2 && hex_str[0] == '0' &&
+                      (hex_str[1] == 'x' || hex_str[1] == 'X'))) {
+                    hex_str = "0x" + hex_str;
+                } else if (hex_str[1] == 'X') {
+                    hex_str[1] = 'x';  // normalize to lowercase
                 }
-                boost::algorithm::unhex(hex_str.c_str(), std::back_inserter(hex_vec));
-                input_args.emplace_back(std::move(hex_vec));
+
+                // Pad odd digit counts with leading 0 (after 0x) for proper byte alignment
+                const size_t digit_count = hex_str.size() - 2;
+                if (digit_count % 2 == 1) {
+                    hex_str.insert(hex_str.begin() + 2, '0');
+                }
+
+                // Validate hex characters
+                auto is_hex_digit = [](unsigned char c) { return std::isxdigit(c) != 0; };
+                if (!std::all_of(hex_str.begin() + 2, hex_str.end(), is_hex_digit)) {
+                    std::cerr << "Error: invalid hex string: " << hex_str << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+
+                // Pass as ASCII string with explicit NUL terminator
+                std::vector<u8> buf(hex_str.size() + 1);
+                std::memcpy(buf.data(), hex_str.data(), hex_str.size());
+                buf[hex_str.size()] = 0;
+
+                input_args.emplace_back(std::move(buf));
             }
             else {
                 std::cerr << "Invalid args type: " << arg.dump() << std::endl;
