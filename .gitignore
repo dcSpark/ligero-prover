@@ -7,3 +7,5 @@ build/
 build-web/
 sdk/build/
 sdk/rust/ligetron/target
+.portable
+utils/ligero-webgpu-runner/target
