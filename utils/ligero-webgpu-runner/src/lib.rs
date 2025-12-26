@@ -224,6 +224,18 @@ impl LigeroRunner {
 
     /// Run the prover with explicit options controlling artifact directories and cleanup.
     pub fn run_prover_with_options(&self, options: ProverRunOptions) -> Result<Vec<u8>> {
+        let (proof, _stdout, _stderr) = self.run_prover_with_output(options)?;
+        Ok(proof)
+    }
+
+    /// Run the prover and return `(proof_bytes, stdout, stderr)`.
+    ///
+    /// This is useful for tests/benchmarks that want to print prover output without re-implementing
+    /// process management outside this crate.
+    pub fn run_prover_with_output(
+        &self,
+        options: ProverRunOptions,
+    ) -> Result<(Vec<u8>, String, String)> {
         let config_json =
             serde_json::to_string(&self.config).context("Failed to serialize Ligero config")?;
 
@@ -305,7 +317,8 @@ impl LigeroRunner {
             );
         }
 
-        Ok(proof)
+    
+        Ok((proof, stdout, stderr))
     }
 
     /// Run the verifier binary for the current config and return true if it prints a successful result.
