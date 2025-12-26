@@ -850,6 +850,26 @@ pub mod verifier {
     }
 
     fn locate_verifier_binary(program_parent: Option<&Path>) -> Result<PathBuf> {
+        fn portable_platform_dir() -> Option<&'static str> {
+            if cfg!(target_os = "macos") {
+                if cfg!(target_arch = "aarch64") {
+                    Some("macos-arm64")
+                } else {
+                    None
+                }
+            } else if cfg!(target_os = "linux") {
+                if cfg!(target_arch = "aarch64") {
+                    Some("linux-arm64")
+                } else if cfg!(target_arch = "x86_64") {
+                    Some("linux-amd64")
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+
         if let Ok(path_str) = std::env::var("LIGERO_VERIFIER_BIN") {
             let path = Path::new(&path_str);
             if path.exists() {
@@ -868,16 +888,21 @@ pub mod verifier {
 
         if let Ok(root) = std::env::var("LIGERO_ROOT") {
             let root = PathBuf::from(root);
-            let candidates = [
+            let mut candidates: Vec<PathBuf> = vec![
                 root.join("build/webgpu_verifier"),
                 root.join("build-web/webgpu_verifier"),
                 root.join("bins/webgpu_verifier"),
                 root.join("bin/webgpu_verifier"),
-                // dcSpark packaging: `<root>/utils/portable-binaries/<platform>/bin/webgpu_verifier`
-                root.join("utils/portable-binaries/linux-amd64/bin/webgpu_verifier"),
-                root.join("utils/portable-binaries/linux-arm64/bin/webgpu_verifier"),
-                root.join("utils/portable-binaries/macos-arm64/bin/webgpu_verifier"),
             ];
+            if let Some(p) = portable_platform_dir() {
+                candidates.push(
+                    root.join("utils")
+                        .join("portable-binaries")
+                        .join(p)
+                        .join("bin")
+                        .join("webgpu_verifier"),
+                );
+            }
             for c in candidates {
                 if c.exists() {
                     return fs::canonicalize(c).context("Failed to resolve verifier binary under LIGERO_ROOT");
@@ -896,15 +921,21 @@ pub mod verifier {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         for ancestor in manifest_dir.ancestors().take(10) {
             let root = ancestor;
-            let candidates = [
-                root.join("utils/portable-binaries/linux-amd64/bin/webgpu_verifier"),
-                root.join("utils/portable-binaries/linux-arm64/bin/webgpu_verifier"),
-                root.join("utils/portable-binaries/macos-arm64/bin/webgpu_verifier"),
+            let mut candidates: Vec<PathBuf> = vec![
                 root.join("build/webgpu_verifier"),
                 root.join("build-web/webgpu_verifier"),
                 root.join("bins/webgpu_verifier"),
                 root.join("bin/webgpu_verifier"),
             ];
+            if let Some(p) = portable_platform_dir() {
+                candidates.push(
+                    root.join("utils")
+                        .join("portable-binaries")
+                        .join(p)
+                        .join("bin")
+                        .join("webgpu_verifier"),
+                );
+            }
             for c in candidates {
                 if c.exists() {
                     return fs::canonicalize(c)
