@@ -34,7 +34,8 @@ EOF
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-PROVER_ROOT="$REPO_ROOT/ligero-prover"
+PROVER_ROOT="$REPO_ROOT"
+PORTABLE_SCRIPTS_DIR="$REPO_ROOT/utils/portable-binaries/build-portable-binaries"
 
 OUT_DIR="$REPO_ROOT/ligero"
 DOCKER_IMAGE="${DOCKER_IMAGE:-ubuntu:24.04}"
@@ -93,6 +94,13 @@ fi
 
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+
+if [[ ! -f "$PORTABLE_SCRIPTS_DIR/linux-build-and-stage.sh" || ! -f "$PORTABLE_SCRIPTS_DIR/macos-build-and-stage.sh" ]]; then
+  echo "error: portable build scripts not found where expected" >&2
+  echo "  expected: $PORTABLE_SCRIPTS_DIR/{linux-build-and-stage.sh,macos-build-and-stage.sh}" >&2
+  echo "  repo root: $REPO_ROOT" >&2
+  exit 1
+fi
 
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
@@ -158,7 +166,7 @@ build_linux() {
     -e "HOST_GID=$HOST_GID" \
     -e "CMAKE_JOB_COUNT=${CMAKE_JOB_COUNT:-}" \
     -v "$OUT_DIR:/out" \
-    -v "$PROVER_ROOT/scripts/portable/linux-build-and-stage.sh:/run.sh:ro" \
+    -v "$PORTABLE_SCRIPTS_DIR/linux-build-and-stage.sh:/run.sh:ro" \
     -w / \
     "$DOCKER_IMAGE" \
     bash /run.sh --arch "$arch" --out /out --no-tar
@@ -175,7 +183,7 @@ build_macos_arm64() {
     exit 1
   fi
   # Standalone script; stage into our shared multi-arch output and skip its tarball
-  bash "$PROVER_ROOT/scripts/portable/macos-build-and-stage.sh" --out "$OUT_DIR" --no-tar
+  bash "$PORTABLE_SCRIPTS_DIR/macos-build-and-stage.sh" --out "$OUT_DIR" --no-tar
 }
 
 # De-dupe arches while preserving order
