@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#[cfg(not(feature = "native"))]
 use crate::vbn254fr::VBn254Fr;
+#[cfg(not(feature = "native"))]
 use lazy_static::lazy_static;
 
 
@@ -22,7 +24,8 @@ use lazy_static::lazy_static;
 pub const POSEIDON2_BN254_RF: usize = 8;  // Full rounds
 pub const POSEIDON2_BN254_RP: usize = 56; // Partial rounds
 pub const POSEIDON2_BN254_T: usize = 2;   // State size
-pub const POSEIDON2_BN254_T2_RC_LEN: usize = (POSEIDON2_BN254_RF + POSEIDON2_BN254_RP) * 2;
+pub const POSEIDON2_BN254_T2_RC_LEN: usize =
+    (POSEIDON2_BN254_RF + POSEIDON2_BN254_RP) * POSEIDON2_BN254_T;
 
 /// Poseidon2 round constants for t=2 (state size 2) on BN254 curve
 /// These constants are used in the Poseidon2 hash function for field elements
@@ -162,6 +165,7 @@ pub const POSEIDON2_T2_RC_STR: &[&str; POSEIDON2_BN254_T2_RC_LEN] = &[
     "0x0e32db320a044e3197f45f7649a19675ef5eedfea546dea9251de39f9639779a",
 ];
 
+#[cfg(not(feature = "native"))]
 lazy_static! {
     /// Poseidon2 round constants for vectorized BN254 field elements (t=2)
     /// Contains 128 constants (64 rounds × 2 constants per round)
