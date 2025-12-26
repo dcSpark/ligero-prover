@@ -543,9 +543,16 @@ pub mod verifier {
                 let program = std::env::var("LIGERO_PROGRAM_PATH").context(
                     "LIGERO_PROGRAM_PATH environment variable is required for Ligero verification",
                 )?;
-                let shader_path = std::env::var("LIGERO_SHADER_PATH").context(
-                    "LIGERO_SHADER_PATH environment variable is required for Ligero verification",
-                )?;
+                // `LIGERO_SHADER_PATH` is optional: we can auto-discover the Ligero repo's `shader/`
+                // directory in most setups (including when this crate is pulled via a git dependency).
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let shader_path = std::env::var("LIGERO_SHADER_PATH")
+                    .ok()
+                    .and_then(|p| canonicalize(&p).ok())
+                    .or_else(|| Self::find_shader_path(&cwd))
+                    .context("Failed to find shader path")?
+                    .to_string_lossy()
+                    .to_string();
                 let packing = std::env::var("LIGERO_PACKING")
                     .ok()
                     .and_then(|value| value.parse::<u32>().ok())
@@ -640,15 +647,51 @@ pub mod verifier {
         }
 
         fn find_shader_path(current_dir: &Path) -> Option<PathBuf> {
-            let candidates = [
+            // 1) Sovereign historical layout (kept for backward compatibility)
+            let legacy = [
                 current_dir.join("crates/adapters/ligero/bins/shader"),
                 current_dir.join("../crates/adapters/ligero/bins/shader"),
             ];
+            if let Some(p) = legacy.into_iter().find(|p| p.exists()) {
+                if let Some(s) = p.to_str() {
+                    if let Ok(c) = canonicalize(s) {
+                        return Some(c);
+                    }
+                }
+            }
 
-            candidates
-                .into_iter()
-                .find(|p| p.exists())
-                .and_then(|p| p.to_str().and_then(|s| canonicalize(s).ok()))
+            // 2) dcSpark Ligero repo layout: `<ligero-prover>/shader`
+            // Try to locate `shader/` by walking up from:
+            // - the current working directory
+            // - this crate's source directory
+            fn find_shader_upwards(start: &Path) -> Option<PathBuf> {
+                for ancestor in start.ancestors().take(10) {
+                    let cand = ancestor.join("shader");
+                    if cand.exists() {
+                        return cand.to_str().and_then(|s| canonicalize(s).ok());
+                    }
+                }
+                None
+            }
+
+            if let Some(p) = find_shader_upwards(current_dir) {
+                return Some(p);
+            }
+
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            if let Some(p) = find_shader_upwards(&manifest_dir) {
+                return Some(p);
+            }
+
+            // 3) If user provided `LIGERO_ROOT`, prefer `<root>/shader`
+            if let Ok(root) = std::env::var("LIGERO_ROOT") {
+                let cand = PathBuf::from(root).join("shader");
+                if cand.exists() {
+                    return cand.to_str().and_then(|s| canonicalize(s).ok());
+                }
+            }
+
+            None
         }
 
         pub fn to_config(&self, args: Vec<LigeroArg>, private_indices: Vec<usize>) -> LigeroConfig {
