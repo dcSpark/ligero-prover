@@ -14,3 +14,4 @@ Cargo.lock
 ligero-bins.tar.gz
 utils/ligero-webgpu-runner/target
 utils/circuits/**/target/
+utils/circuits/bins/

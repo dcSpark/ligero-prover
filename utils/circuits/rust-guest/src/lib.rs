@@ -77,11 +77,20 @@ pub unsafe extern "C" fn _start() -> ! {
         proc_exit(71);
     }
 
+    // Requires argv[1] and argv[2]. Reject short argument lists before dereferencing.
+    if argc < 3 {
+        proc_exit(71);
+    }
+
     let mut ptrs: [*mut u8; MAX_ARGS] = [core::ptr::null_mut(); MAX_ARGS];
     let mut buf: [u8; MAX_BUF] = [0; MAX_BUF];
 
     // 3) Fetch argv into our buffers
     if args_get(ptrs.as_mut_ptr(), buf.as_mut_ptr()) != 0 {
+        proc_exit(71);
+    }
+
+    if ptrs[1].is_null() || ptrs[2].is_null() {
         proc_exit(71);
     }
 
