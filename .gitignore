@@ -11,4 +11,5 @@ Cargo.lock
 .clangd
 **/.vscode
 .portable
+ligero-bins.tar.gz
 utils/ligero-webgpu-runner/target

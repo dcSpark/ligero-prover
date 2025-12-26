@@ -406,12 +406,44 @@ fn find_bins_in_root(root: &Path) -> Option<LigeroPaths> {
     // - <root>/build/webgpu_prover
     // - <root>/build-web/webgpu_prover
     // - <root>/bins/webgpu_prover  (some repos package portable binaries like this)
-    let candidates = [
+    // - <root>/utils/portable-binaries/<platform>/bin/webgpu_prover (dcSpark packaging)
+    fn portable_platform_dir() -> Option<&'static str> {
+        if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                Some("macos-arm64")
+            } else {
+                None
+            }
+        } else if cfg!(target_os = "linux") {
+            if cfg!(target_arch = "aarch64") {
+                Some("linux-arm64")
+            } else if cfg!(target_arch = "x86_64") {
+                Some("linux-amd64")
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    let portable_dir = portable_platform_dir().map(|p| {
+        root.join("utils")
+            .join("portable-binaries")
+            .join(p)
+            .join("bin")
+    });
+
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(6);
+    if let Some(p) = portable_dir {
+        candidates.push(p);
+    }
+    candidates.extend([
         root.join("build"),
         root.join("build-web"),
         root.join("bins"),
         root.join("bin"),
-    ];
+    ]);
 
     for dir in candidates {
         let prover = dir.join("webgpu_prover");
