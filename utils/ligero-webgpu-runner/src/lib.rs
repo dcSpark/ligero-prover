@@ -873,10 +873,42 @@ pub mod verifier {
                 root.join("build-web/webgpu_verifier"),
                 root.join("bins/webgpu_verifier"),
                 root.join("bin/webgpu_verifier"),
+                // dcSpark packaging: `<root>/utils/portable-binaries/<platform>/bin/webgpu_verifier`
+                root.join("utils/portable-binaries/linux-amd64/bin/webgpu_verifier"),
+                root.join("utils/portable-binaries/linux-arm64/bin/webgpu_verifier"),
+                root.join("utils/portable-binaries/macos-arm64/bin/webgpu_verifier"),
             ];
             for c in candidates {
                 if c.exists() {
                     return fs::canonicalize(c).context("Failed to resolve verifier binary under LIGERO_ROOT");
+                }
+            }
+        }
+
+
+
+        // Final fallback: try to locate the verifier binary inside the Ligero repo checkout that
+        // this crate is built from (works for git/path dependencies).
+        //
+        // We walk upwards from CARGO_MANIFEST_DIR and look for:
+        // - `utils/portable-binaries/<platform>/bin/webgpu_verifier`
+        // - `build*/webgpu_verifier`, `bins/webgpu_verifier`, `bin/webgpu_verifier`
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for ancestor in manifest_dir.ancestors().take(10) {
+            let root = ancestor;
+            let candidates = [
+                root.join("utils/portable-binaries/linux-amd64/bin/webgpu_verifier"),
+                root.join("utils/portable-binaries/linux-arm64/bin/webgpu_verifier"),
+                root.join("utils/portable-binaries/macos-arm64/bin/webgpu_verifier"),
+                root.join("build/webgpu_verifier"),
+                root.join("build-web/webgpu_verifier"),
+                root.join("bins/webgpu_verifier"),
+                root.join("bin/webgpu_verifier"),
+            ];
+            for c in candidates {
+                if c.exists() {
+                    return fs::canonicalize(c)
+                        .context("Failed to resolve verifier binary relative to crate checkout");
                 }
             }
         }
