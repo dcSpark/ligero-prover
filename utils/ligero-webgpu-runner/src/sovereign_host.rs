@@ -136,6 +136,14 @@ impl LigeroHostCore {
         self.runner.verify_proof_smoke()
     }
 
+    /// Verify a proof for the current config (smoke check).
+    ///
+    /// Alias of [`Self::verify_proof_smoke`] kept for compatibility with downstream wrappers.
+    pub fn verify_proof(&self) -> Result<bool> {
+        self.verify_proof_smoke()
+    }
+
+
     /// Compute the Ligero code commitment as `SHA-256(wasm_bytes || packing_u32_le)`.
     pub fn code_commitment_raw(&self) -> [u8; 32] {
         let program_bytes = std::fs::read(&self.runner.config().program).unwrap_or_default();
