@@ -5,6 +5,7 @@
 //! environment-variable overrides.
 
 use crate::config::{LigeroArg, LigeroConfig};
+use crate::redaction::redact_arg;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -12,6 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
+
+use crate::pool::default_verifier_pool;
+use crate::pool::BinaryWorkerPool;
 
 /// Resolved verifier inputs.
 #[derive(Debug, Clone)]
@@ -253,7 +257,34 @@ pub fn ensure_code_commitment(paths: &VerifierPaths, expected: &[u8; 32]) -> Res
 /// Verify a proof and return `(success, stdout, stderr)` for debugging.
 ///
 /// This runs `webgpu_verifier` and captures its output even when verification fails.
+/// Verify a proof and return `(success, stdout, stderr)` for debugging.
+///
+/// This runs `webgpu_verifier` on an always-on worker pool sized to `available_parallelism()`.
 pub fn verify_proof_with_output(
+    paths: &VerifierPaths,
+    proof_bytes: &[u8],
+    args: Vec<LigeroArg>,
+    private_indices: Vec<usize>,
+) -> Result<(bool, String, String)> {
+    verify_proof_with_output_in_pool(default_verifier_pool(), paths, proof_bytes, args, private_indices)
+}
+
+/// Verify a proof and return `(success, stdout, stderr)` for debugging, running on a provided worker pool.
+pub fn verify_proof_with_output_in_pool(
+    pool: &BinaryWorkerPool,
+    paths: &VerifierPaths,
+    proof_bytes: &[u8],
+    args: Vec<LigeroArg>,
+    private_indices: Vec<usize>,
+) -> Result<(bool, String, String)> {
+    let paths = paths.clone();
+    let proof_bytes = proof_bytes.to_vec();
+    pool.execute(move || {
+        verify_proof_with_output_direct(&paths, &proof_bytes, args, private_indices)
+    })
+}
+
+fn verify_proof_with_output_direct(
     paths: &VerifierPaths,
     proof_bytes: &[u8],
     mut args: Vec<LigeroArg>,
@@ -270,7 +301,7 @@ pub fn verify_proof_with_output(
     for &idx in &private_indices {
         if idx > 0 && idx <= args.len() {
             let arg_idx = idx - 1;
-            args[arg_idx] = redact(&args[arg_idx]);
+            args[arg_idx] = redact_arg(&args[arg_idx]);
         }
     }
 
@@ -313,42 +344,6 @@ pub fn verify_proof(
     }
 
     Ok(())
-}
-
-fn redact(arg: &LigeroArg) -> LigeroArg {
-    match arg {
-        LigeroArg::String { str: s } => {
-            let trimmed = s.trim();
-            if trimmed.starts_with("0x") && trimmed.len() >= 2 {
-                let body = &trimmed[2..];
-                return LigeroArg::String {
-                    str: format!("0x{}", "0".repeat(body.len())),
-                };
-            }
-
-            let is_hex = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit());
-            if is_hex {
-                return LigeroArg::String {
-                    str: "0".repeat(trimmed.len()),
-                };
-            }
-
-            let is_dec = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
-            if is_dec {
-                return LigeroArg::String {
-                    str: "0".repeat(trimmed.len().max(1)),
-                };
-            }
-
-            LigeroArg::String {
-                str: "x".repeat(trimmed.len().max(1)),
-            }
-        }
-        LigeroArg::I64 { .. } => LigeroArg::I64 { i64: 0 },
-        LigeroArg::Hex { hex: h } => LigeroArg::Hex {
-            hex: "0".repeat(h.len().max(1)),
-        },
-    }
 }
 
 fn canonicalize(path: &str) -> Result<PathBuf> {

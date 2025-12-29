@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Argument type for Ligero prover.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum LigeroArg {
     /// String argument.
@@ -31,7 +31,7 @@ pub enum LigeroArg {
 }
 
 /// Configuration for Ligero prover/verifier.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LigeroConfig {
     /// Path to the WASM program.
     pub program: String,

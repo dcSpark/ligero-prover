@@ -21,6 +21,20 @@ pub struct LigeroPaths {
     pub bins_dir: PathBuf,
 }
 
+impl LigeroPaths {
+    /// Discover `webgpu_prover` / `webgpu_verifier` / `shader` paths.
+    ///
+    /// This uses the same environment-variable overrides and repo-root heuristics as `LigeroRunner`.
+    pub fn discover() -> Result<Self> {
+        discover_paths()
+    }
+
+    /// Return minimal fallback paths (assumes binaries are in PATH and shaders are in `./shader`).
+    pub fn fallback() -> Self {
+        fallback_paths()
+    }
+}
+
 pub(crate) fn discover_paths() -> Result<LigeroPaths> {
     // 1) explicit prover binary override
     if let Some(prover) = env_path("LIGERO_PROVER_BIN")

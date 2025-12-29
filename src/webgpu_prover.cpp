@@ -15,13 +15,17 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 
 #include <transpiler.hpp>
@@ -58,7 +62,34 @@ using buffer_t = typename executor_t::buffer_type;
 
 constexpr bool enable_RAM = false;
 
-int main(int argc, const char *argv[]) {
+namespace {
+struct DaemonError final : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+[[noreturn]] void fail(bool daemon_mode, const std::string& msg) {
+    if (daemon_mode) {
+        throw DaemonError(msg);
+    }
+    std::cerr << msg << std::endl;
+    std::exit(EXIT_FAILURE);
+}
+
+struct NullBuffer final : public std::streambuf {
+    int overflow(int c) override { return c; }
+};
+
+std::string make_temp_proof_path() {
+    static std::atomic<uint64_t> ctr{0};
+    const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const uint64_t c = ++ctr;
+    fs::path dir = fs::temp_directory_path() / std::format("ligero-proof-{}-{}", now_us, c);
+    fs::create_directories(dir);
+    return (dir / "proof_data.gz").string();
+}
+
+int run_prover_from_config(const json& jconfig, bool daemon_mode, std::string* proof_path_out) {
     const std::string ligero_version_string =
         std::format("ligero-prover v{}.{}.{}+{}.{}",
                     LIGETRON_VERSION_MAJOR,
@@ -66,26 +97,27 @@ int main(int argc, const char *argv[]) {
                     LIGETRON_VERSION_PATCH,
                     LIGETRON_GIT_BRANCH,
                     LIGETRON_GIT_COMMIT_HASH);
-    std::cout << ligero_version_string << std::endl;
-    
+    if (!daemon_mode) {
+        std::cout << ligero_version_string << std::endl;
+    }
+
     std::vector<std::vector<u8>> input_args;
     std::string shader_path;
     std::string proof_name = "proof_data.gz";
-
-    if (argc < 2) {
-        std::cerr << "Error: No JSON input provided" << std::endl;
-        exit(EXIT_FAILURE);
+    if (jconfig.contains("proof-path")) {
+        proof_name = jconfig["proof-path"].template get<std::string>();
+        try {
+            fs::create_directories(fs::path(proof_name).parent_path());
+        } catch (const std::exception& e) {
+            fail(daemon_mode,
+                 std::format("Error: failed to create proof directory for {}: {}",
+                             proof_name, e.what()));
+        }
+    } else if (daemon_mode) {
+        proof_name = make_temp_proof_path();
     }
-    
-    std::string_view jstr = argv[1];
-    json jconfig;
-
-    try {
-        jconfig = json::parse(jstr);
-    }
-    catch (json::exception& e) {
-        std::cerr << e.what() << std::endl;
-        exit(EXIT_FAILURE);
+    if (proof_path_out) {
+        *proof_path_out = proof_name;
     }
 
     uint64_t k = params::default_row_size;
@@ -132,8 +164,7 @@ int main(int argc, const char *argv[]) {
 
                 // Ensure no embedded NULs (would truncate if guest uses C-string ops)
                 if (hex_str.find('\0') != std::string::npos) {
-                    std::cerr << "Error: hex arg contains embedded NUL byte" << std::endl;
-                    exit(EXIT_FAILURE);
+                    fail(daemon_mode, "Error: hex arg contains embedded NUL byte");
                 }
 
                 // Ensure 0x prefix (guest/SDK expects it for base-0 parsing)
@@ -153,8 +184,7 @@ int main(int argc, const char *argv[]) {
                 // Validate hex characters
                 auto is_hex_digit = [](unsigned char c) { return std::isxdigit(c) != 0; };
                 if (!std::all_of(hex_str.begin() + 2, hex_str.end(), is_hex_digit)) {
-                    std::cerr << "Error: invalid hex string: " << hex_str << std::endl;
-                    exit(EXIT_FAILURE);
+                    fail(daemon_mode, std::format("Error: invalid hex string: {}", hex_str));
                 }
 
                 // Pass as ASCII string with explicit NUL terminator
@@ -165,8 +195,7 @@ int main(int argc, const char *argv[]) {
                 input_args.emplace_back(std::move(buf));
             }
             else {
-                std::cerr << "Error: Invalid args type: " << arg.dump() << std::endl;
-                exit(EXIT_FAILURE);
+                fail(daemon_mode, std::format("Error: Invalid args type: {}", arg.dump()));
             }
         }
     }
@@ -189,10 +218,9 @@ int main(int argc, const char *argv[]) {
         wabt::Result read_result = wabt::ReadFile(program_name.c_str(), &program_data);
 
         if (wabt::Failed(read_result)) {
-            std::cerr << std::format("Error: Could not read from file \"{}\"",
-                                     program_name.c_str())
-                      << std::endl;
-            exit(EXIT_FAILURE);
+            fail(daemon_mode,
+                 std::format("Error: Could not read from file \"{}\"",
+                             program_name.c_str()));
         }
 
         wabt::Features wabt_features;
@@ -223,11 +251,9 @@ int main(int argc, const char *argv[]) {
         if (wabt::Failed(parsing_result)) {
             auto err_msg = wabt::FormatErrorsToString(parsing_errors,
                                                       wabt::Location::Type::Binary);
-            std::cerr << std::format("wabt: {}", err_msg)
-                      << std::format("Error: Failed to parse WASM module \"{}\"",
-                                     program_name.c_str())
-                      << std::endl;
-            exit(EXIT_FAILURE);
+            fail(daemon_mode,
+                 std::format("wabt: {}Error: Failed to parse WASM module \"{}\"",
+                             err_msg, program_name.c_str()));
         }
     }
 
@@ -418,9 +444,7 @@ int main(int argc, const char *argv[]) {
                              std::ios::out | std::ios::binary | std::ios::trunc);
 
     if (!proof_file) {
-        std::cerr << std::format("Error: Could not write to file \"{}\"", proof_name)
-                  << std::endl;
-        exit(EXIT_FAILURE);
+        fail(daemon_mode, std::format("Error: Could not write to file \"{}\"", proof_name));
     }
 
     proof_file << compressed_proof.rdbuf();
@@ -458,4 +482,68 @@ int main(int argc, const char *argv[]) {
     clear_timers();
 #endif
     return !prove_result;
+}
+
+} // namespace
+
+int main(int argc, const char *argv[]) {
+    const bool daemon_mode = (argc >= 2 && std::string_view(argv[1]) == "--daemon");
+
+    if (daemon_mode) {
+        // Protocol: one JSON request per line on stdin, one JSON response per line on stdout.
+        // stdout is reserved for the protocol, so silence normal informational logs while proving.
+        NullBuffer null_buf;
+        std::ostream null_out(&null_buf);
+        auto* orig_cout_buf = std::cout.rdbuf();
+
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            json resp;
+            try {
+                json jconfig = json::parse(line);
+                if (jconfig.contains("id")) {
+                    resp["id"] = jconfig["id"];
+                }
+
+                std::string proof_path;
+                std::cout.rdbuf(null_out.rdbuf());
+                int exit_code = run_prover_from_config(jconfig, /*daemon_mode=*/true, &proof_path);
+                std::cout.rdbuf(orig_cout_buf);
+
+                resp["ok"] = (exit_code == 0);
+                resp["exit_code"] = exit_code;
+                resp["proof_path"] = proof_path;
+            } catch (const json::exception& e) {
+                std::cout.rdbuf(orig_cout_buf);
+                resp["ok"] = false;
+                resp["error"] = std::string("json parse error: ") + e.what();
+            } catch (const DaemonError& e) {
+                std::cout.rdbuf(orig_cout_buf);
+                resp["ok"] = false;
+                resp["error"] = e.what();
+            } catch (const std::exception& e) {
+                std::cout.rdbuf(orig_cout_buf);
+                resp["ok"] = false;
+                resp["error"] = e.what();
+            }
+
+            std::cout << resp.dump() << "\n" << std::flush;
+        }
+        return 0;
+    }
+
+    if (argc < 2) {
+        std::cerr << "Error: No JSON input provided" << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    json jconfig;
+    try {
+        jconfig = json::parse(std::string_view(argv[1]));
+    } catch (json::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    return run_prover_from_config(jconfig, /*daemon_mode=*/false, /*proof_path_out=*/nullptr);
 }

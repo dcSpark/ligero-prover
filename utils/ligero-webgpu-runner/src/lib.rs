@@ -6,7 +6,11 @@
 
 
 mod config;
+pub mod daemon;
 mod paths;
+mod pool;
+mod proof_package;
+pub mod redaction;
 mod runner;
 
 pub mod sovereign_host;
@@ -14,4 +18,7 @@ pub mod verifier;
 
 pub use config::{LigeroArg, LigeroConfig};
 pub use paths::LigeroPaths;
+pub use pool::{default_prover_pool, default_verifier_pool, BinaryWorkerPool};
+pub use proof_package::LigeroProofPackage;
+pub use redaction::{redact_arg, redact_private_args, redacted_args};
 pub use runner::{LigeroRunner, ProverRunOptions};

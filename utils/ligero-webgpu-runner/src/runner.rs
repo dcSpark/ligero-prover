@@ -11,6 +11,9 @@ use anyhow::{Context, Result};
 
 use crate::config::LigeroConfig;
 use crate::paths::{discover_paths, fallback_paths, LigeroPaths};
+use crate::pool::default_prover_pool;
+use crate::pool::default_verifier_pool;
+use crate::pool::BinaryWorkerPool;
 use crate::LigeroArg;
 
 fn sh_single_quote(value: &str) -> String {
@@ -207,7 +210,26 @@ impl LigeroRunner {
     ///
     /// This is useful for tests/benchmarks that want to print prover output without re-implementing
     /// process management outside this crate.
+    ///
+    /// The prover execution is dispatched onto an always-on worker pool sized to `available_parallelism()`.
     pub fn run_prover_with_output(
+        &self,
+        options: ProverRunOptions,
+    ) -> Result<(Vec<u8>, String, String)> {
+        self.run_prover_with_output_in_pool(default_prover_pool(), options)
+    }
+
+    /// Run the prover on a specific worker pool (useful for tests/benchmarks).
+    pub fn run_prover_with_output_in_pool(
+        &self,
+        pool: &BinaryWorkerPool,
+        options: ProverRunOptions,
+    ) -> Result<(Vec<u8>, String, String)> {
+        let runner = self.clone();
+        pool.execute(move || runner.run_prover_with_output_direct(options))
+    }
+
+    fn run_prover_with_output_direct(
         &self,
         options: ProverRunOptions,
     ) -> Result<(Vec<u8>, String, String)> {
@@ -340,7 +362,19 @@ exec \"$PROVER_BIN\" \"$CONFIG_JSON\"
     }
 
     /// Run the verifier binary for the current config and return true if it prints a successful result.
+    ///
+    /// The verifier execution is dispatched onto an always-on worker pool sized to `available_parallelism()`.
     pub fn verify_proof_smoke(&self) -> Result<bool> {
+        self.verify_proof_smoke_in_pool(default_verifier_pool())
+    }
+
+    /// Run the verifier smoke check on a specific worker pool (useful for tests/benchmarks).
+    pub fn verify_proof_smoke_in_pool(&self, pool: &BinaryWorkerPool) -> Result<bool> {
+        let runner = self.clone();
+        pool.execute(move || runner.verify_proof_smoke_direct())
+    }
+
+    fn verify_proof_smoke_direct(&self) -> Result<bool> {
         let caller_cwd = std::env::current_dir().context("Failed to get current directory")?;
         let config = canonicalize_config_for_run(&self.config, &caller_cwd)?;
         let config_json =
