@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use ligero_webgpu_runner::{daemon::DaemonPool, LigeroArg, LigeroRunner};
+use ligero_runner::{daemon::DaemonPool, LigeroArg, LigeroRunner};
 use ligetron::poseidon2_hash_bytes;
 
 type Hash32 = [u8; 32];

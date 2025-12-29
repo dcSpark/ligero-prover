@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use ligero_webgpu_runner::{sovereign_host::LigeroHostCore, LigeroProofPackage};
+use ligero_runner::{sovereign_host::LigeroHostCore, LigeroProofPackage};
 
 fn repo_root() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -204,15 +204,15 @@ fn test_simulation_with_private_args_redaction() {
     let package = LigeroProofPackage::from_bytes(&proof_bytes).unwrap();
 
     // Check that private args are redacted in the package
-    let args: Vec<ligero_webgpu_runner::LigeroArg> = package.args_as().unwrap();
+    let args: Vec<ligero_runner::LigeroArg> = package.args_as().unwrap();
     assert_eq!(args.len(), 3);
 
     // First arg (public) should be unchanged
-    assert_eq!(args[0], ligero_webgpu_runner::LigeroArg::I64 { i64: 100 });
+    assert_eq!(args[0], ligero_runner::LigeroArg::I64 { i64: 100 });
 
     // Second arg (private) should be redacted (same length, all zeros)
     match &args[1] {
-        ligero_webgpu_runner::LigeroArg::Hex { hex } => {
+        ligero_runner::LigeroArg::Hex { hex } => {
             assert_eq!(hex.len(), "secret_hex_data".len());
             assert!(hex.chars().all(|c| c == '0'));
         }
@@ -221,7 +221,7 @@ fn test_simulation_with_private_args_redaction() {
 
     // Third arg (public) should be unchanged
     match &args[2] {
-        ligero_webgpu_runner::LigeroArg::String { str } => {
+        ligero_runner::LigeroArg::String { str } => {
             assert_eq!(str, "public_string");
         }
         other => panic!("Expected String argument, got {other:?}"),

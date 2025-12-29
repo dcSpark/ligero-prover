@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use ligero_webgpu_runner::{verifier, BinaryWorkerPool, LigeroArg, LigeroRunner};
+use ligero_runner::{verifier, BinaryWorkerPool, LigeroArg, LigeroRunner};
 use ligetron::poseidon2_hash_bytes;
 
 type Hash32 = [u8; 32];
@@ -273,7 +273,7 @@ fn test_two_pass_prover_and_verifier_timings() -> Result<()> {
 
     // --- Prover two-pass timing ---
     let t0 = Instant::now();
-    let (proof1, _s1, _e1) = runner.run_prover_with_output_in_pool(&prover_pool, ligero_webgpu_runner::ProverRunOptions {
+    let (proof1, _s1, _e1) = runner.run_prover_with_output_in_pool(&prover_pool, ligero_runner::ProverRunOptions {
         keep_proof_dir: false,
         proof_outputs_base: None,
         write_replay_script: true,
@@ -281,7 +281,7 @@ fn test_two_pass_prover_and_verifier_timings() -> Result<()> {
     let d1 = t0.elapsed();
 
     let t1 = Instant::now();
-    let (proof2, _s2, _e2) = runner.run_prover_with_output_in_pool(&prover_pool, ligero_webgpu_runner::ProverRunOptions {
+    let (proof2, _s2, _e2) = runner.run_prover_with_output_in_pool(&prover_pool, ligero_runner::ProverRunOptions {
         keep_proof_dir: false,
         proof_outputs_base: None,
         write_replay_script: true,

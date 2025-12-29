@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use ligero_webgpu_runner::{daemon::DaemonServer, LigeroPaths};
+use ligero_runner::{daemon::DaemonServer, LigeroPaths};
 
 fn parse_usize(flag: &str, v: Option<&String>) -> Result<usize> {
     let s = v.with_context(|| format!("missing value for {flag}"))?;

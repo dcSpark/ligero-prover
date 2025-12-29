@@ -1,4 +1,4 @@
-//! Proof roundtrip test for `ligero-webgpu-runner` using the `note_spend_guest` circuit.
+//! Proof roundtrip test for `ligero-runner` using the `note_spend_guest` circuit.
 //!
 //! This test requires:
 //! - `webgpu_prover` + `webgpu_verifier` binaries
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use ligero_webgpu_runner::{verifier, LigeroArg, LigeroRunner};
+use ligero_runner::{verifier, LigeroArg, LigeroRunner};
 use ligetron::poseidon2_hash_bytes;
 
 type Hash32 = [u8; 32];
@@ -23,7 +23,7 @@ fn hx32(b: &Hash32) -> String {
 
 fn repo_root() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // utils/ligero-webgpu-runner -> utils -> repo
+    // utils/ligero-runner -> utils -> repo
     Ok(manifest_dir
         .ancestors()
         .nth(2)
@@ -328,7 +328,7 @@ fn test_note_spend_proof_roundtrip_one_output() -> Result<()> {
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
 
-    let (proof_bytes, prover_stdout, prover_stderr) = match runner.run_prover_with_output(ligero_webgpu_runner::ProverRunOptions {
+    let (proof_bytes, prover_stdout, prover_stderr) = match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
         keep_proof_dir: false,
         proof_outputs_base: None,
         write_replay_script: true,

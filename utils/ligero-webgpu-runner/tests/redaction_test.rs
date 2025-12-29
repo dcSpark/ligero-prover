@@ -2,7 +2,7 @@
 //!
 //! This crate ships redaction helpers used by the verifier path and replay-script generation.
 
-use ligero_webgpu_runner::{redact_arg, redact_private_args, redacted_args, LigeroArg};
+use ligero_runner::{redact_arg, redact_private_args, redacted_args, LigeroArg};
 
 // ============================================================================
 // Basic Redaction Tests

@@ -50,7 +50,7 @@ pub(crate) fn discover_paths() -> Result<LigeroPaths> {
         }
     }
 
-    // 3) heuristic: walk up from this crate towards the repo root (sdk/rust/ligero-webgpu-runner -> root)
+    // 3) heuristic: walk up from this crate towards the repo root (sdk/rust/ligero-runner -> root)
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for ancestor in manifest_dir.ancestors().take(6) {
         if let Some(p) = find_bins_in_root(ancestor) {
