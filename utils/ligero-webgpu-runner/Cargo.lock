@@ -352,12 +352,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 
 [[package]]
+name = "ligero-proof-package"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ligero-webgpu-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
  "hex",
+ "ligero-proof-package",
  "ligetron",
  "serde",
  "serde_json",

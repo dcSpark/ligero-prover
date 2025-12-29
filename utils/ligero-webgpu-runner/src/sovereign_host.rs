@@ -189,12 +189,9 @@ impl LigeroHostCore {
     pub fn run_simulation(&self) -> Result<Vec<u8>> {
         let public_output = self.public_output.clone().unwrap_or_default();
         let cfg = self.runner.config();
-        let pkg = LigeroProofPackage::new(
-            Vec::new(),
-            public_output,
-            cfg.args.clone(),
-            cfg.private_indices.clone(),
-        );
+        let args_json =
+            serde_json::to_vec(&cfg.args).context("Failed to serialize Ligero args as JSON")?;
+        let pkg = LigeroProofPackage::new(Vec::new(), public_output, args_json, cfg.private_indices.clone())?;
         pkg.to_bytes()
     }
 
@@ -205,12 +202,9 @@ impl LigeroHostCore {
         let proof = self.run_prover()?;
         let public_output = self.public_output.clone().unwrap_or_default();
         let cfg = self.runner.config();
-        let pkg = LigeroProofPackage::new(
-            proof,
-            public_output,
-            cfg.args.clone(),
-            cfg.private_indices.clone(),
-        );
+        let args_json =
+            serde_json::to_vec(&cfg.args).context("Failed to serialize Ligero args as JSON")?;
+        let pkg = LigeroProofPackage::new(proof, public_output, args_json, cfg.private_indices.clone())?;
         pkg.to_bytes()
     }
 

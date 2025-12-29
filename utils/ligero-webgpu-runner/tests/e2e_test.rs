@@ -204,7 +204,7 @@ fn test_simulation_with_private_args_redaction() {
     let package = LigeroProofPackage::from_bytes(&proof_bytes).unwrap();
 
     // Check that private args are redacted in the package
-    let args = package.args().unwrap();
+    let args: Vec<ligero_webgpu_runner::LigeroArg> = package.args_as().unwrap();
     assert_eq!(args.len(), 3);
 
     // First arg (public) should be unchanged
