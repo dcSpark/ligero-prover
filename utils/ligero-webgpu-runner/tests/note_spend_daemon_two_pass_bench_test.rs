@@ -10,6 +10,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use ligero_runner::{daemon::DaemonPool, LigeroArg, LigeroRunner};
 use ligetron::poseidon2_hash_bytes;
+use sha2::{Digest, Sha256};
 
 type Hash32 = [u8; 32];
 
@@ -121,44 +122,43 @@ impl MerkleTree {
 }
 
 fn private_indices(depth: usize, n_out: usize) -> Vec<usize> {
-    // Indices are 1-based for the guest:
-    // args:
-    // 0: domain
-    // 1: value
-    // 2: rho
-    // 3: recipient
-    // 4: spend_sk                    (private)
-    // 5: depth
-    // 6..(6+depth-1): path bits
-    // then siblings (depth items)
-    // then anchor, nf
-    // then withdraw_amount, n_out
-    // then outputs: value, rho, pk, cm (4*n_out)
+    // NOTE: `private-indices` are 1-based indices into the args list (excluding argv[0]).
     //
-    // For this test we mark spend_sk and output secret rho as private.
+    // This matches the guest's documented layout in:
+    // `utils/circuits/note-spend-guest/src/main.rs` (see top-of-file comment).
+    //
+    // Public (must be bound by the proof & verifier):
+    // - domain (1), value (2), rho (3), depth (6)
+    // - anchor (7+2*depth), nullifier (8+2*depth)
+    // - withdraw_amount (9+2*depth), n_out (10+2*depth)
+    // - cm_out_j for each output
+    //
+    // Private (witness; verifier must NOT rely on config-provided values):
+    // - recipient (4), spend_sk (5)
+    // - pos_bits (7..7+depth-1), siblings (7+depth..7+2*depth-1)
+    // - for each output: value_out, rho_out, pk_out
     let mut idx = Vec::new();
-    idx.push(5); // spend_sk (argv[5] because argv[0] is program name in C++)
+    idx.push(4); // recipient
+    idx.push(5); // spend_sk
 
-    // out_rho starts after:
-    // domain,value,rho,recipient,spend_sk,depth => 6
-    // path bits => depth
-    // siblings => depth
-    // anchor,nf => 2
-    // withdraw_amount,n_out,out_value => 3
-    // out_rho is next => 1
-    let out_rho_pos = 1 + (6 + depth + depth + 2 + 3) as usize; // 1-based argv index
-    // Actually argv indices are 1-based but include program name at argv[0], so:
-    // In LigeroConfig private-indices expects 1-based indices for the args array (excluding argv[0]).
-    // This helper matches prior tests' convention.
-    // We'll just reuse the same indices generator as the non-daemon benchmark:
-    // spend_sk and out_rho.
-    idx.push(out_rho_pos);
-
-    // If multiple outputs exist, mark each out_rho private too.
-    // outputs are 4 fields each: value,rho,pk,cm
-    for o in 1..n_out {
-        idx.push(out_rho_pos + o * 4);
+    // pos_bits
+    for i in 0..depth {
+        idx.push(7 + i);
     }
+    // siblings
+    for i in 0..depth {
+        idx.push(7 + depth + i);
+    }
+
+    // outputs
+    let outs_base = 11 + 2 * depth; // index of value_out_0
+    for j in 0..n_out {
+        idx.push(outs_base + 4 * j + 0); // value_out_j
+        idx.push(outs_base + 4 * j + 1); // rho_out_j
+        idx.push(outs_base + 4 * j + 2); // pk_out_j
+        // cm_out_j is public (outs_base + 4*j + 3)
+    }
+
     idx
 }
 
@@ -253,116 +253,244 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
     println!("[daemon_two_pass] Program:  {}", program.display());
     println!("[daemon_two_pass] Packing:  {}", packing);
 
-    // Build one-output spend witness.
+    // Build 3 distinct spend statements (with PUBLIC differences) so that cross-verification
+    // (proof_i verified with params_j for i!=j) must fail.
+    // We keep daemon pools at 1 worker so every request hits the same long-lived process.
     let depth: usize = 8;
     let domain: Hash32 = [1u8; 32];
-    let rho: Hash32 = [2u8; 32];
-    let spend_sk: Hash32 = [4u8; 32];
-
-    let recipient = recipient_from_sk(&domain, &spend_sk);
-    let nf_key = nf_key_from_sk(&domain, &spend_sk);
-
     let value: u64 = 42;
     let pos: u64 = 0;
 
-    let cm_in = note_commitment(&domain, value, &rho, &recipient);
-    let mut tree = MerkleTree::new(depth);
-    tree.set_leaf(pos as usize, cm_in);
-    let anchor = tree.root();
-    let siblings = tree.open(pos as usize);
-    let nf = nullifier(&domain, &nf_key, &rho);
+    let mut configs: Vec<serde_json::Value> = Vec::new();
+    let mut public_summaries: Vec<(Hash32, Hash32, Vec<Hash32>, u64, usize)> = Vec::new();
 
-    let withdraw_amount: u64 = 0;
-    let n_out: u64 = 1;
+    for run in 0..3u8 {
+        // Vary public rho (arg[3]) so the statement differs even if you ignore private witness.
+        let mut rho: Hash32 = [2u8; 32];
+        rho[0] = rho[0].wrapping_add(run);
 
-    let out_value: u64 = value;
-    let out_rho: Hash32 = [7u8; 32];
-    let out_spend_sk: Hash32 = [8u8; 32];
-    let out_pk = pk_from_sk(&out_spend_sk);
-    let out_recipient = recipient_from_pk(&domain, &out_pk);
-    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
+        // Vary private spend_sk (arg[5]) so witness differs too.
+        let mut spend_sk: Hash32 = [4u8; 32];
+        spend_sk[0] = spend_sk[0].wrapping_add(run);
 
-    let mut args: Vec<LigeroArg> = Vec::new();
-    args.push(LigeroArg::Hex { hex: hx32(&domain) });
-    args.push(LigeroArg::I64 { i64: value as i64 });
-    args.push(LigeroArg::Hex { hex: hx32(&rho) });
-    args.push(LigeroArg::Hex {
-        hex: hx32(&recipient),
-    });
-    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) });
-    args.push(LigeroArg::I64 { i64: depth as i64 });
+        // Decide public shape per run:
+        // - run0: n_out=1, withdraw=0, out_value=value
+        // - run1: n_out=1, withdraw=1, out_value=value-1
+        // - run2: n_out=2, withdraw=0, out_values split
+        let (withdraw_amount, n_out, out_values): (u64, usize, Vec<u64>) = match run {
+            0 => (0, 1, vec![value]),
+            1 => (1, 1, vec![value - 1]),
+            _ => (0, 2, vec![value / 2, value - (value / 2)]),
+        };
 
-    for lvl in 0..depth {
-        let bit = ((pos >> lvl) & 1) as u8;
-        let mut bit_bytes = [0u8; 32];
-        bit_bytes[31] = bit;
-        args.push(LigeroArg::Hex { hex: hx32(&bit_bytes) });
+        // Build Merkle membership (siblings are private in the guest, but the anchor is public).
+        let recipient = recipient_from_sk(&domain, &spend_sk);
+        let nf_key = nf_key_from_sk(&domain, &spend_sk);
+
+        let cm_in = note_commitment(&domain, value, &rho, &recipient);
+        let mut tree = MerkleTree::new(depth);
+        tree.set_leaf(pos as usize, cm_in);
+        let anchor = tree.root();
+        let siblings = tree.open(pos as usize);
+        let nf = nullifier(&domain, &nf_key, &rho);
+
+        // Outputs: for each output, value/rho/pk are private; cm_out is public.
+        let mut cm_outs: Vec<Hash32> = Vec::with_capacity(n_out);
+        let mut out_triples: Vec<(u64, Hash32, Hash32, Hash32)> = Vec::with_capacity(n_out);
+        for j in 0..n_out {
+            let out_value = out_values[j];
+            let mut out_rho: Hash32 = [7u8; 32];
+            out_rho[0] = out_rho[0].wrapping_add(run).wrapping_add(j as u8);
+            let mut out_spend_sk: Hash32 = [8u8; 32];
+            out_spend_sk[0] = out_spend_sk[0].wrapping_add(run).wrapping_add(j as u8);
+            let out_pk = pk_from_sk(&out_spend_sk);
+            let out_recipient = recipient_from_pk(&domain, &out_pk);
+            let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
+            cm_outs.push(cm_out);
+            out_triples.push((out_value, out_rho, out_pk, cm_out));
+        }
+
+        let mut args: Vec<LigeroArg> = Vec::new();
+        args.push(LigeroArg::Hex { hex: hx32(&domain) });
+        args.push(LigeroArg::I64 { i64: value as i64 });
+        args.push(LigeroArg::Hex { hex: hx32(&rho) });
+        args.push(LigeroArg::Hex { hex: hx32(&recipient) });
+        args.push(LigeroArg::Hex { hex: hx32(&spend_sk) });
+        args.push(LigeroArg::I64 { i64: depth as i64 });
+
+        for lvl in 0..depth {
+            let bit = ((pos >> lvl) & 1) as u8;
+            let mut bit_bytes = [0u8; 32];
+            bit_bytes[31] = bit;
+            args.push(LigeroArg::Hex { hex: hx32(&bit_bytes) });
+        }
+
+        for s in &siblings {
+            args.push(LigeroArg::Hex { hex: hx32(s) });
+        }
+
+        args.push(LigeroArg::String {
+            str: format!("0x{}", hx32(&anchor)),
+        });
+        args.push(LigeroArg::String {
+            str: format!("0x{}", hx32(&nf)),
+        });
+
+        args.push(LigeroArg::I64 {
+            i64: withdraw_amount as i64,
+        });
+        args.push(LigeroArg::I64 { i64: n_out as i64 });
+
+        for (out_value, out_rho, out_pk, cm_out) in out_triples {
+            args.push(LigeroArg::I64 {
+                i64: out_value as i64,
+            });
+            args.push(LigeroArg::Hex { hex: hx32(&out_rho) });
+            args.push(LigeroArg::Hex { hex: hx32(&out_pk) });
+            args.push(LigeroArg::Hex { hex: hx32(&cm_out) });
+        }
+
+        runner.config_mut().private_indices = private_indices(depth, n_out);
+        runner.config_mut().args = args;
+        let cfg_val = serde_json::to_value(runner.config()).context("Failed to to_value config")?;
+        configs.push(cfg_val);
+
+        public_summaries.push((anchor, nf, cm_outs, withdraw_amount, n_out));
     }
 
-    for s in &siblings {
-        args.push(LigeroArg::Hex { hex: hx32(s) });
+    // Sanity: all public statements should differ (anchor/nullifier or cm_outs/shape).
+    for i in 0..public_summaries.len() {
+        for j in (i + 1)..public_summaries.len() {
+            anyhow::ensure!(
+                public_summaries[i] != public_summaries[j],
+                "expected run #{} and run #{} to differ in public statement, but they were equal",
+                i + 1,
+                j + 1
+            );
+        }
     }
 
-    args.push(LigeroArg::String {
-        str: format!("0x{}", hx32(&anchor)),
-    });
-    args.push(LigeroArg::String {
-        str: format!("0x{}", hx32(&nf)),
-    });
+    // --- Prover: generate 3 distinct proofs ---
+    let mut proof_paths: Vec<String> = Vec::new();
+    for (i, cfg) in configs.iter().cloned().enumerate() {
+        let t0 = Instant::now();
+        let r = prover_pool.prove(cfg)?;
+        let d = t0.elapsed();
+        assert!(r.ok, "prover run #{i} failed: {:?}", r.error);
+        let proof_path = r
+            .proof_path
+            .clone()
+            .with_context(|| format!("prover run #{i} did not return proof_path"))?;
+        let size = std::fs::metadata(&proof_path).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "[daemon_two_pass] Prover run #{}: {:?} ({} bytes) -> {}",
+            i + 1,
+            d,
+            size,
+            proof_path
+        );
+        proof_paths.push(proof_path);
+    }
 
-    args.push(LigeroArg::I64 {
-        i64: withdraw_amount as i64,
-    });
-    args.push(LigeroArg::I64 { i64: n_out as i64 });
-    args.push(LigeroArg::I64 { i64: out_value as i64 });
-    args.push(LigeroArg::Hex { hex: hx32(&out_rho) });
-    args.push(LigeroArg::Hex { hex: hx32(&out_pk) });
-    args.push(LigeroArg::Hex { hex: hx32(&cm_out) });
+    // Assert the *inputs* differ across runs (not just file names).
+    // Note: many witness values are private, and Ligero verifier may not bind to caller-provided
+    // args the way you'd expect (it may verify "some witness exists" without re-checking the
+    // statement against a separately-provided input). So we check:
+    // - config JSON differs (we did change the requested witness/statement)
+    // - proof bytes differ (prover output actually changed)
+    let mut cfg_hashes: Vec<[u8; 32]> = Vec::new();
+    for (i, cfg) in configs.iter().enumerate() {
+        let bytes = serde_json::to_vec(cfg)
+            .with_context(|| format!("Failed to serialize config JSON for run #{}", i + 1))?;
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let out: [u8; 32] = h.finalize().into();
+        cfg_hashes.push(out);
+    }
+    for i in 0..cfg_hashes.len() {
+        for j in (i + 1)..cfg_hashes.len() {
+            anyhow::ensure!(
+                cfg_hashes[i] != cfg_hashes[j],
+                "expected configs to differ, but run #{} and run #{} had the same sha256={}",
+                i + 1,
+                j + 1,
+                hex::encode(cfg_hashes[i])
+            );
+        }
+    }
 
-    let priv_idx = private_indices(depth, 1);
-    runner.config_mut().private_indices = priv_idx;
-    runner.config_mut().args = args;
+    // Assert the proof *contents* differ across runs.
+    let mut proof_hashes: Vec<[u8; 32]> = Vec::new();
+    for (i, p) in proof_paths.iter().enumerate() {
+        let bytes = std::fs::read(p)
+            .with_context(|| format!("Failed to read proof bytes for run #{} at {}", i + 1, p))?;
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let out: [u8; 32] = h.finalize().into();
+        proof_hashes.push(out);
+    }
+    for i in 0..proof_hashes.len() {
+        for j in (i + 1)..proof_hashes.len() {
+            anyhow::ensure!(
+                proof_hashes[i] != proof_hashes[j],
+                "expected proof outputs to differ, but run #{} and run #{} had the same sha256={}",
+                i + 1,
+                j + 1,
+                hex::encode(proof_hashes[i])
+            );
+        }
+    }
 
-    let config_val = serde_json::to_value(runner.config()).context("Failed to to_value config")?;
+    // --- Verifier: verify the 3 different proofs (matching configs) ---
+    for (i, (cfg, proof_path)) in configs.iter().cloned().zip(proof_paths.iter()).enumerate() {
+        let tv = Instant::now();
+        let v = verifier_pool.verify(cfg, proof_path)?;
+        let vd = tv.elapsed();
+        assert!(v.ok, "verifier run #{i} failed: {:?}", v.error);
+        assert_eq!(
+            v.verify_ok,
+            Some(true),
+            "verifier run #{i} did not confirm validity (verify_ok={:?}, error={:?})",
+            v.verify_ok,
+            v.error
+        );
+        println!("[daemon_two_pass] Verifier run #{}: {:?}", i + 1, vd);
+    }
 
-    // --- Prover two-pass timing ---
-    let t0 = Instant::now();
-    let r1 = prover_pool.prove(config_val.clone())?;
-    let d1 = t0.elapsed();
-    assert!(r1.ok, "prover pass1 failed: {:?}", r1.error);
-    let proof_path_1 = r1
-        .proof_path
-        .clone()
-        .context("prover pass1 did not return proof_path")?;
-
-    let t1 = Instant::now();
-    let r2 = prover_pool.prove(config_val.clone())?;
-    let d2 = t1.elapsed();
-    assert!(r2.ok, "prover pass2 failed: {:?}", r2.error);
-    let proof_path_2 = r2
-        .proof_path
-        .clone()
-        .context("prover pass2 did not return proof_path")?;
-
-    let size1 = std::fs::metadata(&proof_path_1).map(|m| m.len()).unwrap_or(0);
-    let size2 = std::fs::metadata(&proof_path_2).map(|m| m.len()).unwrap_or(0);
-
-    println!("[daemon_two_pass] Prover pass1: {:?} ({} bytes) -> {}", d1, size1, proof_path_1);
-    println!("[daemon_two_pass] Prover pass2: {:?} ({} bytes) -> {}", d2, size2, proof_path_2);
-
-    // --- Verifier two-pass timing (verify proof1 twice) ---
-    let tv0 = Instant::now();
-    let v1 = verifier_pool.verify(config_val.clone(), &proof_path_1)?;
-    let vd1 = tv0.elapsed();
-
-    let tv1 = Instant::now();
-    let v2 = verifier_pool.verify(config_val, &proof_path_1)?;
-    let vd2 = tv1.elapsed();
-
-    assert!(v1.ok && v2.ok, "verifier should report success");
-
-    println!("[daemon_two_pass] Verifier pass1: {:?}", vd1);
-    println!("[daemon_two_pass] Verifier pass2: {:?}", vd2);
+    // --- Negative: cross-verify must FAIL (public statements differ) ---
+    for i in 0..proof_paths.len() {
+        for j in 0..configs.len() {
+            if i == j {
+                continue;
+            }
+            // Important: a failing guest path may terminate the verifier process (e.g. via WASI exit),
+            // which would close daemon stdout and take the worker down. For the negative checks we
+            // therefore use a fresh single-worker verifier daemon each time and treat "stdout closed"
+            // as an expected failure signal too.
+            let verifier_pool_neg = DaemonPool::new_verifier(runner.paths(), 1)
+                .context("spawn verifier daemon for negative cross-check")?;
+            match verifier_pool_neg.verify(configs[j].clone(), &proof_paths[i]) {
+                Ok(v) => {
+                    anyhow::ensure!(
+                        !(v.ok && v.verify_ok == Some(true)),
+                        "expected cross-verify to fail, but proof#{} verified with cfg#{} (this implies verifier is not binding to provided public inputs)",
+                        i + 1,
+                        j + 1
+                    );
+                }
+                Err(e) => {
+                    let s = format!("{e:#}");
+                    if s.contains("daemon stdout closed unexpectedly") {
+                        // Expected: verifier process exited on invalid witness/statement.
+                    } else {
+                        return Err(e).with_context(|| {
+                            format!("cross-verify proof#{} with cfg#{}", i + 1, j + 1)
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }
