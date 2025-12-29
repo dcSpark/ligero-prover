@@ -14,17 +14,40 @@
 //! - [`eddsa`] - Edwards-curve Digital Signature Algorithm
 //! ```
 
-pub mod api;
-pub mod sha2;
-pub mod bn254fr;
-pub mod vbn254fr;
-pub mod poseidon;
-pub mod poseidon2;
-pub mod babyjubjub;
-pub mod eddsa;
-// private modules
-mod poseidon_constant;
-mod poseidon2_constant;
+// Native implementations (for testing outside WASM)
+#[cfg(feature = "native")]
+pub mod bn254fr_native;
+#[cfg(feature = "native")]
+pub mod poseidon2_native;
 
-// Re-export core types and functions for convenience
+// WASM implementations (using host functions)
+#[cfg(not(feature = "native"))]
+pub mod api;
+#[cfg(not(feature = "native"))]
+pub mod sha2;
+#[cfg(not(feature = "native"))]
+pub mod bn254fr;
+#[cfg(not(feature = "native"))]
+pub mod vbn254fr;
+#[cfg(not(feature = "native"))]
+pub mod poseidon;
+#[cfg(not(feature = "native"))]
+pub mod poseidon2;
+#[cfg(not(feature = "native"))]
+pub mod babyjubjub;
+#[cfg(not(feature = "native"))]
+pub mod eddsa;
+
+// Shared modules
+mod poseidon2_constant;
+#[cfg(not(feature = "native"))]
+mod poseidon_constant;
+
+// Re-export for convenience
+#[cfg(not(feature = "native"))]
 pub use api::*;
+
+#[cfg(feature = "native")]
+pub use bn254fr_native::{Bn254Fr, addmod_checked, mulmod_checked};
+#[cfg(feature = "native")]
+pub use poseidon2_native::{Poseidon2Context, poseidon2_hash, poseidon2_hash_bytes};
