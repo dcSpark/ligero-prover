@@ -10,6 +10,8 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod sovereign_host;
+
 /// Argument type for Ligero prover.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
