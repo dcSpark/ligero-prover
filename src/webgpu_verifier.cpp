@@ -218,7 +218,15 @@ int run_verifier_from_config(const json& jconfig, bool daemon_mode, VerifierDaem
 
     std::vector<std::vector<u8>> input_args;
     std::string shader_path;
-    std::string proof_name = "proof_data.gz";
+
+    bool gzip_proof = true;
+    bool gzip_proof_overridden = false;
+    if (jconfig.contains("gzip-proof")) {
+        gzip_proof = jconfig["gzip-proof"].template get<bool>();
+        gzip_proof_overridden = true;
+    }
+
+    std::string proof_name = gzip_proof ? "proof_data.gz" : "proof_data.bin";
     if (jconfig.contains("proof-path")) {
         proof_name = jconfig["proof-path"].template get<std::string>();
     }
@@ -360,7 +368,18 @@ int run_verifier_from_config(const json& jconfig, bool daemon_mode, VerifierDaem
         compressed_proof << proof_file.rdbuf();
         proof_file.close();
 
-        proof_stream.push(io::gzip_decompressor());
+        // If caller didn't specify gzip-proof, auto-detect gzip by magic bytes.
+        if (!gzip_proof_overridden) {
+            const std::string s = compressed_proof.str();
+            const bool is_gzip = s.size() >= 2 &&
+                                 (static_cast<unsigned char>(s[0]) == 0x1f) &&
+                                 (static_cast<unsigned char>(s[1]) == 0x8b);
+            gzip_proof = is_gzip;
+        }
+
+        if (gzip_proof) {
+            proof_stream.push(io::gzip_decompressor());
+        }
         proof_stream.push(compressed_proof);
 
         archive_ptr = std::make_unique<portable_binary_iarchive>(proof_stream);

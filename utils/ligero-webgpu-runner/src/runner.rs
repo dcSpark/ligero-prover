@@ -102,6 +102,8 @@ impl LigeroRunner {
                 shader_path,
                 gpu_threads: None,
                 packing: 8192,
+                gzip_proof: true,
+                proof_path: None,
                 private_indices: vec![],
                 args: vec![],
             },
@@ -125,6 +127,8 @@ impl LigeroRunner {
                 shader_path,
                 gpu_threads: None,
                 packing: 8192,
+                gzip_proof: true,
+                proof_path: None,
                 private_indices: vec![],
                 args: vec![],
             },
@@ -193,7 +197,10 @@ impl LigeroRunner {
         self.config.args.push(LigeroArg::Hex { hex: value });
     }
 
-    /// Run the prover and return the compressed proof bytes (the contents of `proof_data.gz`).
+    /// Run the prover and return the proof bytes written by `webgpu_prover`.
+    ///
+    /// By default this is the compressed `proof_data.gz`. If `gzip-proof=false` is set in the
+    /// config, the prover writes an uncompressed proof file instead.
     ///
     /// The prover is executed in a per-run directory under `<cwd>/proof_outputs/` (unless overridden).
     pub fn run_prover(&self) -> Result<Vec<u8>> {
@@ -329,18 +336,26 @@ exec \"$PROVER_BIN\" \"$CONFIG_JSON\"
             );
         }
 
-        // Read the proof from proof_data.gz (compressed - this goes into the transaction).
-        let proof_path = unique_proof_dir.join("proof_data.gz");
+        // Read the proof file (compressed by default).
+        let proof_filename = if config.gzip_proof {
+            "proof_data.gz"
+        } else {
+            "proof_data.bin"
+        };
+        let proof_path = unique_proof_dir.join(proof_filename);
         if !proof_path.exists() {
             anyhow::bail!(
-                "Ligero prover did not produce proof_data.gz\nproof dir: {}\nNote: check prover.stdout.log / prover.stderr.log in that directory.",
+                "Ligero prover did not produce {}\nproof dir: {}\nNote: check prover.stdout.log / prover.stderr.log in that directory.",
+                proof_filename,
                 unique_proof_dir.display()
             );
         }
-        let proof = std::fs::read(&proof_path).context("Failed to read proof_data.gz")?;
+        let proof = std::fs::read(&proof_path)
+            .with_context(|| format!("Failed to read {}", proof_path.display()))?;
         if proof.is_empty() {
             anyhow::bail!(
-                "Ligero prover produced an empty proof_data.gz\nproof dir: {}",
+                "Ligero prover produced an empty proof file ({})\nproof dir: {}",
+                proof_filename,
                 unique_proof_dir.display()
             );
         }

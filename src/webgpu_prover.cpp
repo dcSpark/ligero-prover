@@ -206,14 +206,14 @@ static void ensure_cached_executor(ProverDaemonCache& cache,
     }
 }
 
-std::string make_temp_proof_path() {
+std::string make_temp_proof_path(bool gzip_proof) {
     static std::atomic<uint64_t> ctr{0};
     const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const uint64_t c = ++ctr;
     fs::path dir = fs::temp_directory_path() / std::format("ligero-proof-{}-{}", now_us, c);
     fs::create_directories(dir);
-    return (dir / "proof_data.gz").string();
+    return (dir / (gzip_proof ? "proof_data.gz" : "proof_data.bin")).string();
 }
 
 int run_prover_from_config(const json& jconfig,
@@ -233,7 +233,13 @@ int run_prover_from_config(const json& jconfig,
 
     std::vector<std::vector<u8>> input_args;
     std::string shader_path;
-    std::string proof_name = "proof_data.gz";
+
+    bool gzip_proof = true;
+    if (jconfig.contains("gzip-proof")) {
+        gzip_proof = jconfig["gzip-proof"].template get<bool>();
+    }
+
+    std::string proof_name = gzip_proof ? "proof_data.gz" : "proof_data.bin";
     if (jconfig.contains("proof-path")) {
         proof_name = jconfig["proof-path"].template get<std::string>();
         try {
@@ -244,7 +250,7 @@ int run_prover_from_config(const json& jconfig,
                              proof_name, e.what()));
         }
     } else if (daemon_mode) {
-        proof_name = make_temp_proof_path();
+        proof_name = make_temp_proof_path(gzip_proof);
     }
     if (proof_path_out) {
         *proof_path_out = proof_name;
@@ -512,14 +518,16 @@ int run_prover_from_config(const json& jconfig,
     // -------------------------------------------------------------------------------- //
     std::cout << "Start Stage 3" << std::endl;
 
-    std::stringstream compressed_proof;
+    std::stringstream proof_bytes;
     {
         auto t3 = make_timer("stage3");
 
-        constexpr int gzip_compression_level = 6;
         io::filtering_ostream proof_stream;
-        proof_stream.push(io::gzip_compressor(io::gzip_params(gzip_compression_level)));
-        proof_stream.push(compressed_proof);
+        if (gzip_proof) {
+            constexpr int gzip_compression_level = 6;
+            proof_stream.push(io::gzip_compressor(io::gzip_params(gzip_compression_level)));
+        }
+        proof_stream.push(proof_bytes);
         portable_binary_oarchive oa(proof_stream);
     
         oa << stage1_root
@@ -548,7 +556,7 @@ int run_prover_from_config(const json& jconfig,
         fail(daemon_mode, std::format("Error: Could not write to file \"{}\"", proof_name));
     }
 
-    proof_file << compressed_proof.rdbuf();
+    proof_file << proof_bytes.rdbuf();
     proof_file.close();
 
     // ================================================================================

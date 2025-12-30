@@ -84,6 +84,8 @@ impl VerifierPaths {
                 shader_path,
                 gpu_threads: None,
                 packing,
+                gzip_proof: true,
+                proof_path: None,
                 private_indices: Vec::new(),
                 args: Vec::new(),
             }
@@ -221,6 +223,8 @@ impl VerifierPaths {
             shader_path: self.shader_path.to_string_lossy().into_owned(),
             gpu_threads: None,
             packing: self.packing,
+            gzip_proof: true,
+            proof_path: None,
             private_indices,
             args,
         }
@@ -292,10 +296,13 @@ fn verify_proof_with_output_direct(
 ) -> Result<(bool, String, String)> {
     let temp_dir = tempdir().context("Failed to create temporary directory for Ligero verification")?;
 
-    // Write proof as proof_data.gz (the format verifier expects)
-    let proof_path = temp_dir.path().join("proof_data.gz");
+    // Write proof bytes for `webgpu_verifier`.
+    // If this is gzip (0x1f, 0x8b), keep the conventional name; otherwise write an uncompressed file.
+    let is_gzip = proof_bytes.len() >= 2 && proof_bytes[0] == 0x1f && proof_bytes[1] == 0x8b;
+    let proof_filename = if is_gzip { "proof_data.gz" } else { "proof_data.bin" };
+    let proof_path = temp_dir.path().join(proof_filename);
     fs::write(&proof_path, proof_bytes)
-        .context("Failed to write proof_data.gz for Ligero verification")?;
+        .with_context(|| format!("Failed to write {} for Ligero verification", proof_filename))?;
 
     // Redact private arguments (replace with dummy values) while preserving basic parseability.
     for &idx in &private_indices {
@@ -305,7 +312,10 @@ fn verify_proof_with_output_direct(
         }
     }
 
-    let config = paths.to_config(args, private_indices);
+    let mut config = paths.to_config(args, private_indices);
+    // Ensure verifier reads the file we just wrote, and uses consistent decompression behavior.
+    config.proof_path = Some(proof_filename.to_string());
+    config.gzip_proof = is_gzip;
     let config_json = serde_json::to_string(&config)
         .context("Failed to serialize Ligero verifier config")?;
 
