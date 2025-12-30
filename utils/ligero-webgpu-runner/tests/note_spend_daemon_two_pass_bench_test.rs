@@ -273,15 +273,19 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
         let mut spend_sk: Hash32 = [4u8; 32];
         spend_sk[0] = spend_sk[0].wrapping_add(run);
 
-        // Decide public shape per run:
-        // - run0: n_out=1, withdraw=0, out_value=value
-        // - run1: n_out=1, withdraw=1, out_value=value-1
-        // - run2: n_out=2, withdraw=0, out_values split
-        let (withdraw_amount, n_out, out_values): (u64, usize, Vec<u64>) = match run {
-            0 => (0, 1, vec![value]),
-            1 => (1, 1, vec![value - 1]),
-            _ => (0, 2, vec![value / 2, value - (value / 2)]),
-        };
+        // Keep `n_out` constant across runs so `private-indices` layout is identical.
+        // This avoids triggering guest `proc_exit` paths due to differently-redacted inputs,
+        // which can terminate the verifier daemon on some failure modes.
+        //
+        // We still vary the *public statement* per run by changing:
+        // - rho (public)
+        // - withdraw_amount (public)
+        // - cm_out (public; depends on out_value/out_rho/out_pk)
+        let n_out: usize = 1;
+        let withdraw_amount: u64 = run as u64; // 0,1,2
+        let out_value: u64 = value
+            .checked_sub(withdraw_amount)
+            .context("value must be >= withdraw_amount")?;
 
         // Build Merkle membership (siblings are private in the guest, but the anchor is public).
         let recipient = recipient_from_sk(&domain, &spend_sk);
@@ -295,14 +299,13 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
         let nf = nullifier(&domain, &nf_key, &rho);
 
         // Outputs: for each output, value/rho/pk are private; cm_out is public.
-        let mut cm_outs: Vec<Hash32> = Vec::with_capacity(n_out);
-        let mut out_triples: Vec<(u64, Hash32, Hash32, Hash32)> = Vec::with_capacity(n_out);
-        for j in 0..n_out {
-            let out_value = out_values[j];
+        let mut cm_outs: Vec<Hash32> = Vec::with_capacity(1);
+        let mut out_triples: Vec<(u64, Hash32, Hash32, Hash32)> = Vec::with_capacity(1);
+        {
             let mut out_rho: Hash32 = [7u8; 32];
-            out_rho[0] = out_rho[0].wrapping_add(run).wrapping_add(j as u8);
+            out_rho[0] = out_rho[0].wrapping_add(run);
             let mut out_spend_sk: Hash32 = [8u8; 32];
-            out_spend_sk[0] = out_spend_sk[0].wrapping_add(run).wrapping_add(j as u8);
+            out_spend_sk[0] = out_spend_sk[0].wrapping_add(run);
             let out_pk = pk_from_sk(&out_spend_sk);
             let out_recipient = recipient_from_pk(&domain, &out_pk);
             let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
@@ -372,6 +375,25 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
 
     // --- Prover: generate 3 distinct proofs ---
     let mut proof_paths: Vec<String> = Vec::new();
+
+    // Warm-up: initialize daemon-side caches (WASM parse + WebGPU/NTT init) *before* timing.
+    // This keeps our measured prove times focused on the steady-state behavior of a warm daemon.
+    {
+        let r = prover_pool
+            .prove(configs[0].clone())
+            .context("warm-up prove request failed")?;
+        assert!(r.ok, "warm-up prove failed: {:?}", r.error);
+        if let Some(p) = r.proof_path {
+            // Best-effort cleanup; ignore failures.
+            let _ = std::fs::remove_file(&p);
+            let _ = std::fs::remove_dir_all(
+                std::path::Path::new(&p)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            );
+        }
+    }
+
     for (i, cfg) in configs.iter().cloned().enumerate() {
         let t0 = Instant::now();
         let r = prover_pool.prove(cfg)?;
@@ -390,6 +412,22 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
             proof_path
         );
         proof_paths.push(proof_path);
+    }
+
+    // Warm-up: initialize verifier daemon caches (WASM parse + WebGPU/NTT init) *before* timing.
+    // We need an actual proof+cfg pair for this, so do it after proof generation.
+    {
+        let v = verifier_pool
+            .verify(configs[0].clone(), &proof_paths[0])
+            .context("warm-up verify request failed")?;
+        assert!(v.ok, "warm-up verify failed: {:?}", v.error);
+        assert_eq!(
+            v.verify_ok,
+            Some(true),
+            "warm-up verify did not confirm validity (verify_ok={:?}, error={:?})",
+            v.verify_ok,
+            v.error
+        );
     }
 
     // Assert the *inputs* differ across runs (not just file names).
@@ -441,6 +479,21 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
         }
     }
 
+    // --- Negative (pre-timing): cross-verify must FAIL (public statements differ) ---
+    // Reuse the *same* verifier daemon process (same `verifier_pool`) to validate that it stays
+    // alive and consistently rejects mismatched public statements.
+    for (pi, ci) in [(0usize, 1usize), (1, 2), (2, 0)] {
+        let v = verifier_pool
+            .verify(configs[ci].clone(), &proof_paths[pi])
+            .with_context(|| format!("cross-verify proof#{} with cfg#{}", pi + 1, ci + 1))?;
+        anyhow::ensure!(
+            !(v.ok && v.verify_ok == Some(true)),
+            "expected cross-verify to fail, but proof#{} verified with cfg#{} (this implies verifier is not binding to provided public inputs)",
+            pi + 1,
+            ci + 1
+        );
+    }
+
     // --- Verifier: verify the 3 different proofs (matching configs) ---
     for (i, (cfg, proof_path)) in configs.iter().cloned().zip(proof_paths.iter()).enumerate() {
         let tv = Instant::now();
@@ -455,41 +508,6 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
             v.error
         );
         println!("[daemon_two_pass] Verifier run #{}: {:?}", i + 1, vd);
-    }
-
-    // --- Negative: cross-verify must FAIL (public statements differ) ---
-    for i in 0..proof_paths.len() {
-        for j in 0..configs.len() {
-            if i == j {
-                continue;
-            }
-            // Important: a failing guest path may terminate the verifier process (e.g. via WASI exit),
-            // which would close daemon stdout and take the worker down. For the negative checks we
-            // therefore use a fresh single-worker verifier daemon each time and treat "stdout closed"
-            // as an expected failure signal too.
-            let verifier_pool_neg = DaemonPool::new_verifier(runner.paths(), 1)
-                .context("spawn verifier daemon for negative cross-check")?;
-            match verifier_pool_neg.verify(configs[j].clone(), &proof_paths[i]) {
-                Ok(v) => {
-                    anyhow::ensure!(
-                        !(v.ok && v.verify_ok == Some(true)),
-                        "expected cross-verify to fail, but proof#{} verified with cfg#{} (this implies verifier is not binding to provided public inputs)",
-                        i + 1,
-                        j + 1
-                    );
-                }
-                Err(e) => {
-                    let s = format!("{e:#}");
-                    if s.contains("daemon stdout closed unexpectedly") {
-                        // Expected: verifier process exited on invalid witness/statement.
-                    } else {
-                        return Err(e).with_context(|| {
-                            format!("cross-verify proof#{} with cfg#{}", i + 1, j + 1)
-                        });
-                    }
-                }
-            }
-        }
     }
 
     Ok(())

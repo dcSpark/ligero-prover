@@ -57,6 +57,12 @@ value_kind transpile_wabt_type(const wabt::Type& type) {
     }
 }
 
+// Newer wabt represents some types (e.g. `ref.null`) as `wabt::Var` (which may carry an optional type).
+// Provide an overload so we can support both wabt APIs without pinning a specific version.
+inline value_kind transpile_wabt_type(const wabt::Var& var) {
+    return transpile_wabt_type(var.to_type());
+}
+
 // ------------------------------------------------------------
 
 /** Set args[0] = type, args[1] = k */
