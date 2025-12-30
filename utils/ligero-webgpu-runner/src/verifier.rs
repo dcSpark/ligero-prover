@@ -1,7 +1,7 @@
 //! Utilities to run the Ligero WebGPU prover/verifier binaries.
 //!
 //! This crate is intentionally "just a runner": it shells out to `webgpu_prover` / `webgpu_verifier`,
-//! writes/reads expected artifacts (e.g. `proof_data.gz`) and provides light path-discovery with
+//! writes/reads expected artifacts (e.g. `proof_data.gz` or `proof_data.bin`) and provides light path-discovery with
 //! environment-variable overrides.
 
 use crate::config::{LigeroArg, LigeroConfig};
@@ -255,7 +255,8 @@ pub fn ensure_code_commitment(paths: &VerifierPaths, expected: &[u8; 32]) -> Res
     Ok(())
 }
 
-/// Verify a proof by writing `proof_data.gz` into a temp dir and invoking `webgpu_verifier`.
+/// Verify a proof by writing `proof_data.gz` (default) or `proof_data.bin` (when gzip is disabled)
+/// into a temp dir and invoking `webgpu_verifier`.
 ///
 /// Private arguments are redacted according to `private_indices` (1-based).
 /// Verify a proof and return `(success, stdout, stderr)` for debugging.

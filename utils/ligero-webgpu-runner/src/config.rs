@@ -1,7 +1,7 @@
 //! Utilities to run the Ligero WebGPU prover/verifier binaries.
 //!
 //! This crate is intentionally "just a runner": it shells out to `webgpu_prover` / `webgpu_verifier`,
-//! writes/reads expected artifacts (e.g. `proof_data.gz`) and provides light path-discovery with
+//! writes/reads expected artifacts (e.g. `proof_data.gz` or `proof_data.bin`) and provides light path-discovery with
 //! environment-variable overrides.
 
 use serde::{Deserialize, Serialize};

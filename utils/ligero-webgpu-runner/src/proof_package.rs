@@ -3,7 +3,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// A Ligero proof package containing both the proof and serialized public output.
 ///
-/// - `proof` is expected to be `proof_data.gz` bytes (Boost portable archive + gzip).
+/// - `proof` is expected to be the prover's proof file bytes:
+///   - default: `proof_data.gz` (Boost portable archive + gzip)
+///   - when gzip is disabled: `proof_data.bin` (Boost portable archive, uncompressed)
 /// - `public_output` is bincode-serialized bytes produced by the caller.
 /// - `args_json` contains the (redacted) prover/verifier args as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
