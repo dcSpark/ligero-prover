@@ -63,11 +63,15 @@ fn canonicalize_if_possible(p: &str) -> String {
         .unwrap_or_else(|_| p.to_string())
 }
 
-fn canonicalize_config_paths(mut cfg: Value) -> Value {
-    // Best-effort: if program/shader-path are strings, make them absolute.
+fn canonicalize_config_paths(mut cfg: Value) -> Result<Value> {
+    // Ensure the daemon always gets a real `.wasm` file path.
+    // Callers may pass a circuit name (e.g. "note_spend_guest"); resolve it here.
     if let Value::Object(ref mut map) = cfg {
         if let Some(Value::String(program)) = map.get("program").cloned() {
-            map.insert("program".to_string(), Value::String(canonicalize_if_possible(&program)));
+            let resolved = crate::resolve_program(&program)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| canonicalize_if_possible(&program));
+            map.insert("program".to_string(), Value::String(resolved));
         }
         if let Some(Value::String(shader)) = map.get("shader-path").cloned() {
             map.insert(
@@ -82,7 +86,7 @@ fn canonicalize_config_paths(mut cfg: Value) -> Value {
             );
         }
     }
-    cfg
+    Ok(cfg)
 }
 
 struct DaemonIo {
@@ -251,7 +255,8 @@ impl DaemonPool {
     pub fn prove(&self, config: Value) -> Result<DaemonResponse> {
         let i = self.acquire();
         let worker = self.workers[i].clone();
-        let res = worker.request_json_line(&canonicalize_config_paths(config));
+        let config = canonicalize_config_paths(config)?;
+        let res = worker.request_json_line(&config);
         self.release(i);
         res
     }
@@ -266,7 +271,8 @@ impl DaemonPool {
         }
         let i = self.acquire();
         let worker = self.workers[i].clone();
-        let res = worker.request_json_line(&canonicalize_config_paths(config));
+        let config = canonicalize_config_paths(config)?;
+        let res = worker.request_json_line(&config);
         self.release(i);
         res
     }
