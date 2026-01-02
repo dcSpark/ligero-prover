@@ -157,7 +157,9 @@ impl LigeroHostCore {
 
     /// Compute the Ligero code commitment as `SHA-256(wasm_bytes || packing_u32_le)`.
     pub fn code_commitment_raw(&self) -> [u8; 32] {
-        let program_bytes = std::fs::read(&self.runner.config().program).unwrap_or_default();
+        let program_bytes = crate::resolve_program(&self.runner.config().program)
+            .and_then(|p| std::fs::read(p).map_err(anyhow::Error::from))
+            .unwrap_or_default();
 
         let mut hasher = Sha256::new();
         hasher.update(&program_bytes);

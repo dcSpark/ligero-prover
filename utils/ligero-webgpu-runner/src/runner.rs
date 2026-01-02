@@ -34,10 +34,13 @@ fn canonicalize_config_for_run(config: &LigeroConfig, caller_cwd: &Path) -> Resu
     }
 
     let mut cfg = config.clone();
-    cfg.program = resolve(caller_cwd, &cfg.program)
-        .with_context(|| format!("Failed to resolve Ligero program path: {}", cfg.program))?
-        .to_string_lossy()
-        .into_owned();
+    cfg.program = match resolve(caller_cwd, &cfg.program) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => crate::resolve_program(&cfg.program)
+            .with_context(|| format!("Failed to resolve Ligero program (path or name): {}", cfg.program))?
+            .to_string_lossy()
+            .into_owned(),
+    };
     cfg.shader_path = resolve(caller_cwd, &cfg.shader_path)
         .with_context(|| format!("Failed to resolve Ligero shader path: {}", cfg.shader_path))?
         .to_string_lossy()

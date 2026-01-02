@@ -64,6 +64,11 @@ impl VerifierPaths {
             let program = std::env::var("LIGERO_PROGRAM_PATH").context(
                 "LIGERO_PROGRAM_PATH environment variable is required for Ligero verification",
             )?;
+
+            let program = crate::resolve_program(&program)
+                .with_context(|| format!("Failed to resolve program (path or name): {program}"))?
+                .to_string_lossy()
+                .to_string();
             // `LIGERO_SHADER_PATH` is optional: we can auto-discover the Ligero repo's `shader/`
             // directory in most setups (including when this crate is pulled via a git dependency).
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -127,9 +132,6 @@ impl VerifierPaths {
             current_dir.join("utils/circuits/bins"),
             current_dir.join("../utils/circuits/bins"),
             current_dir.join("../../utils/circuits/bins"),
-            current_dir.join("crates/adapters/ligero/guest/bins/programs"),
-            current_dir.join("../crates/adapters/ligero/guest/bins/programs"),
-            current_dir.join("../../crates/adapters/ligero/guest/bins/programs"),
         ];
 
         for base_path in &base_paths {
