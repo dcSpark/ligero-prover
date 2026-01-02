@@ -163,12 +163,12 @@ fn private_indices(depth: usize, n_out: usize) -> Vec<usize> {
 }
 
 fn maybe_build_note_spend_guest(repo: &PathBuf) -> Result<()> {
-    let wasm = repo.join("utils/circuits/bins/programs/note_spend_guest.wasm");
+    let wasm = repo.join("utils/circuits/bins/note_spend_guest.wasm");
     if wasm.exists() {
         return Ok(());
     }
 
-    let build_sh = repo.join("utils/circuits/note-spend-guest/build.sh");
+    let build_sh = repo.join("utils/circuits/note-spend/build.sh");
     if !build_sh.exists() {
         anyhow::bail!(
             "note_spend_guest.wasm not found at {}, and build script missing at {}",
@@ -181,10 +181,10 @@ fn maybe_build_note_spend_guest(repo: &PathBuf) -> Result<()> {
         .arg(build_sh)
         .current_dir(repo)
         .status()
-        .context("Failed to run note-spend-guest/build.sh")?;
+        .context("Failed to run note-spend/build.sh")?;
 
     if !status.success() {
-        anyhow::bail!("note-spend-guest/build.sh failed with status {status}");
+        anyhow::bail!("note-spend/build.sh failed with status {status}");
     }
 
     Ok(())
@@ -196,7 +196,7 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
     maybe_build_note_spend_guest(&repo)?;
 
     let program = repo
-        .join("utils/circuits/bins/programs/note_spend_guest.wasm")
+        .join("utils/circuits/bins/note_spend_guest.wasm")
         .canonicalize()
         .context("Failed to canonicalize note_spend_guest.wasm")?;
 

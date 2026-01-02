@@ -32,14 +32,14 @@ fn repo_root() -> Result<PathBuf> {
 }
 
 fn maybe_build_note_spend_guest(repo: &Path) -> Result<()> {
-    let out = repo.join("utils/circuits/bins/programs/note_spend_guest.wasm");
+    let out = repo.join("utils/circuits/bins/note_spend_guest.wasm");
     if out.exists() {
         return Ok(());
     }
 
-    let guest_dir = repo.join("utils/circuits/note-spend-guest");
+    let guest_dir = repo.join("utils/circuits/note-spend");
     if !guest_dir.exists() {
-        anyhow::bail!("note-spend-guest sources not found at {}", guest_dir.display());
+        anyhow::bail!("note-spend sources not found at {}", guest_dir.display());
     }
 
     println!(
@@ -52,10 +52,10 @@ fn maybe_build_note_spend_guest(repo: &Path) -> Result<()> {
         .arg("build.sh")
         .current_dir(&guest_dir)
         .status()
-        .context("Failed to run note-spend-guest/build.sh")?;
+        .context("Failed to run note-spend/build.sh")?;
 
     if !status.success() {
-        anyhow::bail!("note-spend-guest/build.sh failed with status {status}");
+        anyhow::bail!("note-spend/build.sh failed with status {status}");
     }
 
     if !out.exists() {
@@ -75,7 +75,7 @@ fn note_spend_program_path(repo: &Path) -> Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
 
-    let p = repo.join("utils/circuits/bins/programs/note_spend_guest.wasm");
+    let p = repo.join("utils/circuits/bins/note_spend_guest.wasm");
     Ok(p)
 }
 
@@ -197,7 +197,7 @@ impl MerkleTree {
 }
 
 fn private_indices(depth: usize, n_out: usize) -> Vec<usize> {
-    // Mirrors the guest layout described in utils/circuits/note-spend-guest/src/main.rs.
+    // Mirrors the guest layout described in utils/circuits/note-spend/src/main.rs.
     let mut v = vec![3usize, 4usize, 5usize]; // rho, recipient, spend_sk
     for i in 0..depth {
         v.push(7 + i); // pos_bits

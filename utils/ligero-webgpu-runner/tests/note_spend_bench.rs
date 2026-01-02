@@ -146,7 +146,7 @@ fn private_indices(depth: usize, n_out: usize) -> Vec<usize> {
     // NOTE: `private-indices` are 1-based indices into the args list (excluding argv[0]).
     //
     // This matches the guest's documented layout in:
-    // `utils/circuits/note-spend-guest/src/main.rs` (see top-of-file comment).
+    // `utils/circuits/note-spend/src/main.rs` (see top-of-file comment).
     //
     // Private (witness):
     // - recipient (4), spend_sk (5)
@@ -178,14 +178,14 @@ fn private_indices(depth: usize, n_out: usize) -> Vec<usize> {
 }
 
 fn maybe_build_note_spend_guest(repo: &Path) -> Result<()> {
-    let out = repo.join("utils/circuits/bins/programs/note_spend_guest.wasm");
+    let out = repo.join("utils/circuits/bins/note_spend_guest.wasm");
     if out.exists() {
         return Ok(());
     }
 
-    let guest_dir = repo.join("utils/circuits/note-spend-guest");
+    let guest_dir = repo.join("utils/circuits/note-spend");
     if !guest_dir.exists() {
-        anyhow::bail!("note-spend-guest sources not found at {}", guest_dir.display());
+        anyhow::bail!("note-spend sources not found at {}", guest_dir.display());
     }
 
     println!(
@@ -197,10 +197,10 @@ fn maybe_build_note_spend_guest(repo: &Path) -> Result<()> {
         .arg("build.sh")
         .current_dir(&guest_dir)
         .status()
-        .context("Failed to run note-spend-guest/build.sh")?;
+        .context("Failed to run note-spend/build.sh")?;
 
     if !status.success() {
-        anyhow::bail!("note-spend-guest/build.sh failed with status {status}");
+        anyhow::bail!("note-spend/build.sh failed with status {status}");
     }
 
     Ok(())
@@ -303,7 +303,7 @@ fn test_note_spend_daemon_bench() -> Result<()> {
     maybe_build_note_spend_guest(&repo)?;
 
     let program = repo
-        .join("utils/circuits/bins/programs/note_spend_guest.wasm")
+        .join("utils/circuits/bins/note_spend_guest.wasm")
         .canonicalize()
         .context("Failed to canonicalize note_spend_guest.wasm")?;
 
@@ -515,7 +515,7 @@ fn test_note_spend_direct_bench() -> Result<()> {
     maybe_build_note_spend_guest(&repo)?;
 
     let program = repo
-        .join("utils/circuits/bins/programs/note_spend_guest.wasm")
+        .join("utils/circuits/bins/note_spend_guest.wasm")
         .canonicalize()
         .context("Failed to canonicalize note_spend_guest.wasm")?;
 

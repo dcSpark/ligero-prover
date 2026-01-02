@@ -74,15 +74,15 @@ fn repo_root() -> Result<PathBuf> {
 }
 
 fn maybe_build_note_spend_guest(repo: &Path) -> Result<PathBuf> {
-    let out = repo.join("utils/circuits/bins/programs/note_spend_guest.wasm");
+    let out = repo.join("utils/circuits/bins/note_spend_guest.wasm");
     if out.exists() {
         return Ok(out);
     }
 
-    let guest_dir = repo.join("utils/circuits/note-spend-guest");
+    let guest_dir = repo.join("utils/circuits/note-spend");
     anyhow::ensure!(
         guest_dir.exists(),
-        "note-spend-guest sources not found at {}",
+        "note-spend sources not found at {}",
         guest_dir.display()
     );
 
@@ -95,8 +95,8 @@ fn maybe_build_note_spend_guest(repo: &Path) -> Result<PathBuf> {
         .arg("build.sh")
         .current_dir(&guest_dir)
         .status()
-        .context("Failed to run note-spend-guest/build.sh")?;
-    anyhow::ensure!(status.success(), "note-spend-guest/build.sh failed: {status}");
+        .context("Failed to run note-spend/build.sh")?;
+    anyhow::ensure!(status.success(), "note-spend/build.sh failed: {status}");
 
     Ok(out)
 }
@@ -270,7 +270,7 @@ fn build_transfer_witness(
     let out_recipient = recipient_from_pk(&domain, &out_pk);
     let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
 
-    // args layout follows `note-spend-guest/src/main.rs` top-of-file comment.
+    // args layout follows `note-spend/src/main.rs` top-of-file comment.
     let mut args: Vec<LigeroArg> = Vec::new();
     args.push(LigeroArg::Hex { hex: hx32(&domain) });
     args.push(LigeroArg::I64 {

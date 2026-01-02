@@ -115,10 +115,18 @@ impl VerifierPaths {
             .unwrap_or(8192);
 
         // Common program names.
-        let program_candidates = ["note_spend_guest.wasm", "value_validator.wasm"];
+        let program_candidates = [
+            "note_spend_guest.wasm",
+            "value_validator_rust.wasm",
+            "value_validator.wasm", // legacy name
+        ];
 
         // Common base directories in Sovereign checkouts.
         let base_paths = [
+            // Ligero prover repo layout (this workspace)
+            current_dir.join("utils/circuits/bins"),
+            current_dir.join("../utils/circuits/bins"),
+            current_dir.join("../../utils/circuits/bins"),
             current_dir.join("crates/adapters/ligero/guest/bins/programs"),
             current_dir.join("../crates/adapters/ligero/guest/bins/programs"),
             current_dir.join("../../crates/adapters/ligero/guest/bins/programs"),

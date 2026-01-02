@@ -14,7 +14,7 @@ fn repo_root() -> Option<PathBuf> {
 }
 
 fn note_spend_program_path(repo_root: &PathBuf) -> PathBuf {
-    repo_root.join("utils/circuits/bins/programs/note_spend_guest.wasm")
+    repo_root.join("utils/circuits/bins/note_spend_guest.wasm")
 }
 
 fn maybe_build_note_spend_guest(repo_root: &PathBuf) -> bool {
@@ -23,7 +23,7 @@ fn maybe_build_note_spend_guest(repo_root: &PathBuf) -> bool {
         return true;
     }
 
-    let build_sh = repo_root.join("utils/circuits/note-spend-guest/build.sh");
+    let build_sh = repo_root.join("utils/circuits/note-spend/build.sh");
     if !build_sh.exists() {
         return false;
     }
