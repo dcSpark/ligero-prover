@@ -48,6 +48,20 @@ fn read_gzip_proof(default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn is_verbose() -> bool {
+    std::env::var("LIGERO_VERBOSE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn read_num_runs() -> u8 {
+    std::env::var("LIGERO_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+}
+
 fn poseidon2_hash_domain(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
     let mut buf_len = tag.len();
     for part in parts {
@@ -556,19 +570,21 @@ fn test_note_spend_direct_bench() -> Result<()> {
     let value: u64 = 42;
     let pos: u64 = 0;
 
-    // Prove 3 distinct proofs.
+    // Prove N distinct proofs (controlled by LIGERO_RUNS env var, default 3).
+    let num_runs = read_num_runs();
+    println!("[direct] Running {} proof(s)", num_runs);
     let mut proofs: Vec<Vec<u8>> = Vec::new();
     let mut configs: Vec<Vec<LigeroArg>> = Vec::new();
     let mut all_priv_idx: Vec<Vec<usize>> = Vec::new();
 
-    for run in 0..3u8 {
+    for run in 0..num_runs {
         let (args, _summary) = build_statement(run, depth, domain, value, pos)?;
         let priv_idx = private_indices(depth, 1);
         runner.config_mut().private_indices = priv_idx.clone();
         runner.config_mut().args = args.clone();
 
         let t = Instant::now();
-        let (proof, _s, _e) = runner.run_prover_with_output_in_pool(
+        let (proof, stdout, stderr) = runner.run_prover_with_output_in_pool(
             &prover_pool,
             ProverRunOptions {
                 keep_proof_dir: false,
@@ -583,6 +599,15 @@ fn test_note_spend_direct_bench() -> Result<()> {
             d,
             proof.len()
         );
+        if is_verbose() {
+            println!("--- Prover stdout (run #{}) ---", run + 1);
+            print!("{}", stdout);
+            if !stderr.is_empty() {
+                println!("--- Prover stderr (run #{}) ---", run + 1);
+                print!("{}", stderr);
+            }
+            println!("--- End prover output ---");
+        }
         proofs.push(proof);
         configs.push(args);
         all_priv_idx.push(priv_idx);
@@ -603,7 +628,7 @@ fn test_note_spend_direct_bench() -> Result<()> {
         .enumerate()
     {
         let tv = Instant::now();
-        let (ok, _vs, _ve) = verifier::verify_proof_with_output_in_pool(
+        let (ok, vs, ve) = verifier::verify_proof_with_output_in_pool(
             &verifier_pool,
             &vpaths,
             proof,
@@ -613,31 +638,42 @@ fn test_note_spend_direct_bench() -> Result<()> {
         let vd = tv.elapsed();
         assert!(ok, "verifier should report success for run #{}", i + 1);
         println!("[direct] Verifier run #{}: {:?}", i + 1, vd);
+        if is_verbose() {
+            println!("--- Verifier stdout (run #{}) ---", i + 1);
+            print!("{}", vs);
+            if !ve.is_empty() {
+                println!("--- Verifier stderr (run #{}) ---", i + 1);
+                print!("{}", ve);
+            }
+            println!("--- End verifier output ---");
+        }
     }
 
-    // Cross-verify must fail.
-    for i in 0..proofs.len() {
-        for j in 0..configs.len() {
-            if i == j {
-                continue;
-            }
-            match verifier::verify_proof_with_output_in_pool(
-                &verifier_pool,
-                &vpaths,
-                &proofs[i],
-                configs[j].clone(),
-                all_priv_idx[j].clone(),
-            ) {
-                Ok((ok, _vs, _ve)) => {
-                    anyhow::ensure!(
-                        !ok,
-                        "expected cross-verify to fail, but proof#{} verified with cfg#{} (this implies verifier is not binding to provided public inputs)",
-                        i + 1,
-                        j + 1
-                    );
+    // Cross-verify must fail (only when we have 2+ proofs).
+    if proofs.len() >= 2 {
+        for i in 0..proofs.len() {
+            for j in 0..configs.len() {
+                if i == j {
+                    continue;
                 }
-                Err(_e) => {
-                    // Any error is also an acceptable failure signal for cross-verification.
+                match verifier::verify_proof_with_output_in_pool(
+                    &verifier_pool,
+                    &vpaths,
+                    &proofs[i],
+                    configs[j].clone(),
+                    all_priv_idx[j].clone(),
+                ) {
+                    Ok((ok, _vs, _ve)) => {
+                        anyhow::ensure!(
+                            !ok,
+                            "expected cross-verify to fail, but proof#{} verified with cfg#{} (this implies verifier is not binding to provided public inputs)",
+                            i + 1,
+                            j + 1
+                        );
+                    }
+                    Err(_e) => {
+                        // Any error is also an acceptable failure signal for cross-verification.
+                    }
                 }
             }
         }
