@@ -18,3 +18,4 @@ rand = "0.8"
 ligetron = { path = "../../sdk/rust", features = ["native"] }
 
 [dev-dependencies]
+lazy_static = "1.4"

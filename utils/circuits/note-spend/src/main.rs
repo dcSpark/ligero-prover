@@ -1,18 +1,77 @@
 /*
  * Rust Guest Program: Note Spend Verifier for Midnight Privacy Pool (outputs + balance)
  *
+ * NOTE: DEPOSIT is implemented as a separate, cheaper guest program:
+ *   - `utils/circuits/note-deposit` → `utils/circuits/bins/note_deposit_guest.wasm`
+ * This guest verifies spends (TRANSFER / WITHDRAW) of an existing note.
+ *
  * Verifies a single-input spend with up to two shielded outputs:
  *   1) Merkle root (anchor) from note commitment + auth path
  *   2) PRF-based nullifier: Poseidon2("PRF_NF_V1" || domain || nf_key || rho)
  *   3) Output note commitments (0..=2): Poseidon2("NOTE_V1" || domain || value || rho || recipient)
  *   4) Balance: input_value == withdraw_amount + sum(output_values)
  *
+ * =============================================================================
+ * BUSINESS REQUIREMENTS - Privacy Pool Transaction Types
+ * =============================================================================
+ *
+ * This circuit supports three transaction types in a shielded payment system:
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ DEPOSIT - Enter the privacy pool                                           │
+ * │                                                                             │
+ * │   Public:  value (input amount), origin (sender address on transparent)    │
+ * │   Private: recipient (who receives the shielded note)                       │
+ * │                                                                             │
+ * │   Use case: User deposits 100 tokens from their public address into the    │
+ * │   shielded pool. Everyone sees the deposit amount and source, but the      │
+ * │   recipient's shielded address is hidden.                                  │
+ * │                                                                             │
+ * │   Circuit config: n_out=1, withdraw_amount=0                               │
+ * │   The input comes from a transparent source (not a spent note).            │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ TRANSFER - Fully private transaction within the pool                       │
+ * │                                                                             │
+ * │   Public:  anchor (state root), nullifier (prevents double-spend),         │
+ * │            cm_out (output commitments)                                      │
+ * │   Private: value, origin (which note is spent), recipient                   │
+ * │                                                                             │
+ * │   Use case: Alice sends 50 tokens to Bob. Observers see that *some*        │
+ * │   transaction occurred (nullifier published, new commitments added),       │
+ * │   but cannot determine the amount, sender, or recipient.                   │
+ * │                                                                             │
+ * │   Circuit config: n_out=1 or 2, withdraw_amount=0                          │
+ * │   Can have 2 outputs for change (e.g., spend 100, send 50, keep 50).       │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ WITHDRAW - Exit the privacy pool                                           │
+ * │                                                                             │
+ * │   Public:  withdraw_amount (value leaving pool), recipient (transparent),  │
+ * │            anchor, nullifier, cm_out (change commitment if any)            │
+ * │   Private: input value, origin (which note), change value                  │
+ * │                                                                             │
+ * │   Use case: User withdraws 30 tokens to their public address. Observers    │
+ * │   see the withdrawal amount and destination, but don't know which note     │
+ * │   was spent or the original balance (change is re-shielded).               │
+ * │                                                                             │
+ * │   Circuit config: n_out=0 or 1, withdraw_amount>0                          │
+ * │   - n_out=0: full withdrawal (entire note value exits)                     │
+ * │   - n_out=1: partial withdrawal (change goes to shielded output)           │
+ * │                                                                             │
+ * │   Balance constraint: input_value = withdraw_amount + sum(output_values)   │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * =============================================================================
+ *
  * ARGUMENT LAYOUT (WASI args_get, 1-indexed):
  * ============================================
- * Mixed ABI - hex args for 32-byte values, i64 for integers, str for field elements:
- *   - LigeroArg::Hex { hex: "0x..." }  → Raw 32 bytes (unhexed by prover)
- *   - LigeroArg::I64 { i64: N }        → 8 bytes little-endian
- *   - String arg                       → Parsed as field element via Bn254Fr::from_c_str
+ * Mixed ABI - hex args for 32-byte values, i64 for integers, and strings for human-readable hex:
+ *   - LigeroArg::Hex { hex: "0x..." }   → Passed as ASCII hex string to guest, parsed here
+ *   - LigeroArg::I64 { i64: N }         → 8 bytes little-endian
+ *   - LigeroArg::String { str: "0x..." } → Passed as ASCII string to guest, parsed here
  *
  * Arguments:
  *   [1]  domain         — hex arg → 32 bytes
@@ -27,8 +86,8 @@
  *   [7..7+depth)        — pos_bits[i] — hex arg → 32 bytes each  [PRIVATE]
  *                        Position bits as field elements (0x00...00 or 0x00...01)
  *   [7+depth..7+2*depth) — siblings[i] — hex arg → 32 bytes each  [PRIVATE]
- *   [7+2*depth]  anchor       — str arg → field element (expected Merkle root)
- *   [8+2*depth]  nullifier    — str arg → field element (expected nullifier)
+ *   [7+2*depth]  anchor       — str/hex arg → 32 bytes (expected Merkle root)
+ *   [8+2*depth]  nullifier    — str/hex arg → 32 bytes (expected nullifier)
  *   [9+2*depth]  withdraw_amount — i64 arg → 8 bytes
  *   [10+2*depth] n_out           — i64 arg → 8 bytes (0, 1, or 2)
  *   For each j in [0..n_out):
@@ -148,41 +207,21 @@ fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
     result
 }
 
-/// Assert that a computed field element equals an expected hash (public).
-/// This uses Bn254Fr::assert_equal which is a proper ZK constraint.
+/// Assert that a computed field element equals an expected 32-byte digest (public).
 #[inline(always)]
 fn assert_fr_eq_hash32(computed: &Bn254Fr, expected_be: &Hash32) {
-    let expected = bn254fr_from_hash32_be(expected_be);
-    Bn254Fr::assert_equal(computed, &expected);
-}
-
-/// Read a public field element from a string argument (like "0x...").
-/// Use this for public values that will be compared with Bn254Fr::assert_equal.
-#[inline(always)]
-fn read_fr_str(args: &ArgHolder, index: usize) -> Bn254Fr {
-    let str_ptr = args.get_as_c_str(index);
-    Bn254Fr::from_c_str(str_ptr)
+    // Bind the expected digest bytes into the statement as a constant and constrain `computed` to it.
+    //
+    // NOTE: This is critical for soundness when the verifier reconstructs the constraint system
+    // without evaluating private inputs: parsing bytes into a field element via `set_bytes_big`
+    // does *not* by itself constrain the value to equal those bytes.
+    Bn254Fr::assert_equal_bytes_be(computed, expected_be);
 }
 
 // ============================================================================
-// FIELD-LEVEL MUX FOR OBLIVIOUS MERKLE PATH
-// Standard mux uses lte assertion which fails with private conditions.
-// This version skips that check and is safe for private condition values.
+// FIELD-LEVEL SELECT FOR OBLIVIOUS MERKLE PATH
+// Uses arithmetic selection with private bits (no witness-dependent branching).
 // ============================================================================
-
-/// MUX without lte assertion - safe for private condition
-/// Computes: out = cond ? a1 : a0 = a0 + cond * (a1 - a0)
-/// 
-/// IMPORTANT: This creates uniform constraints regardless of cond's value.
-/// The prover proves it was satisfied with real values; the verifier checks
-/// the proof without re-evaluating with obscured values.
-#[inline(always)]
-fn mux_private(out: &mut Bn254Fr, cond: &Bn254Fr, a0: &Bn254Fr, a1: &Bn254Fr) {
-    let mut diff = Bn254Fr::new();
-    submod_checked(&mut diff, a1, a0);  // diff = a1 - a0
-    diff.mulmod_checked(cond);           // diff = cond * (a1 - a0)
-    addmod_checked(out, a0, &diff);      // out = a0 + diff
-}
 
 /// Enforce that a field element is a boolean (0 or 1).
 /// Constraint: cond * (cond - 1) == 0
@@ -209,28 +248,8 @@ fn assert_bit(cond: &Bn254Fr) {
 /// Returns a Bn254Fr that is either 0 or 1.
 #[inline(always)]
 fn read_position_bit(args: &ArgHolder, index: usize) -> Bn254Fr {
-    let bytes = args.get_as_bytes(index);
-    let mut out = [0u8; 32];
-    
-    // Fast path: raw 32-byte input
-    if bytes.len() == 32 {
-        out.copy_from_slice(bytes);
-    } else {
-        // Fallback: decode hex if needed (check for 0x prefix properly)
-        let hex_bytes = if bytes.len() >= 2 && bytes[0] == b'0' && (bytes[1] == b'x' || bytes[1] == b'X') {
-            &bytes[2..]
-        } else {
-            bytes
-        };
-        for i in 0..32 {
-            let idx = i * 2;
-            let hi = if idx < hex_bytes.len() { hex_char_to_nibble(hex_bytes[idx]) } else { 0 };
-            let lo = if idx + 1 < hex_bytes.len() { hex_char_to_nibble(hex_bytes[idx + 1]) } else { 0 };
-            out[i] = (hi << 4) | lo;
-        }
-    }
-    
-    bn254fr_from_hash32_be(&out)
+    let b = read_hash32(args, index);
+    bn254fr_from_hash32_be(&b)
 }
 
 // ============================================================================
@@ -402,11 +421,32 @@ fn recipient_from_pk(h: &Poseidon2Core, domain: &Hash32, pk: &Hash32) -> Hash32 
     h.hash_padded(&buf)
 }
 
+/// recipient_addr = H("ADDR_V1" || domain || pk)
+/// Returns both (field element, 32-byte hash) to avoid re-parsing hashes into the field.
+#[inline(always)]
+fn recipient_from_pk_fr(h: &Poseidon2Core, domain: &Hash32, pk: &Hash32) -> (Bn254Fr, Hash32) {
+    let mut buf = [0u8; ADDR_BUF_LEN];
+    buf[..7].copy_from_slice(b"ADDR_V1");
+    buf[7..39].copy_from_slice(domain);
+    buf[39..71].copy_from_slice(pk);
+    let fr = h.hash_padded_fr(&buf);
+    let bytes = bn254fr_to_hash32(&fr);
+    (fr, bytes)
+}
+
 /// recipient_addr from spend_sk (sk -> pk -> recipient)
 
+#[allow(dead_code)]
 fn recipient_from_sk(h: &Poseidon2Core, domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
     let pk = pk_from_sk(h, spend_sk);
     recipient_from_pk(h, domain, &pk)
+}
+
+/// recipient_addr from spend_sk (sk -> pk -> recipient), returning (field element, bytes).
+#[inline(always)]
+fn recipient_from_sk_fr(h: &Poseidon2Core, domain: &Hash32, spend_sk: &Hash32) -> (Bn254Fr, Hash32) {
+    let pk = pk_from_sk(h, spend_sk);
+    recipient_from_pk_fr(h, domain, &pk)
 }
 
 /// nf_key = H("NFKEY_V1" || domain || spend_sk)
@@ -486,44 +526,46 @@ fn root_from_path_field_level(
     leaf_bytes: &Hash32,
     pos_bits: &[Bn254Fr],
     siblings_fr: &[Bn254Fr],
-    depth: u32,
-) -> (Bn254Fr, Hash32) {
-    if depth == 0 { hard_fail(77); }
-    
+    depth: usize,
+) -> Bn254Fr {
+    if depth == 0 {
+        hard_fail(77);
+    }
+
     // Initialize current node from leaf
     let mut cur_fr = bn254fr_from_hash32_be(leaf_bytes);
-    let mut cur_bytes = *leaf_bytes;
-    
-    let mut lvl = 0u32;
+
+    // Reuse temporaries; this also reduces per-level host overhead.
+    let mut left_fr = Bn254Fr::new();
+    let mut right_fr = Bn254Fr::new();
+    let mut delta = Bn254Fr::new();
+    let mut left_bytes = [0u8; 32];
+    let mut right_bytes = [0u8; 32];
+
+    let mut lvl = 0usize;
     while lvl < depth {
-        let bit = &pos_bits[lvl as usize];
-        let sib_fr = &siblings_fr[lvl as usize];
-        
-        // Field-level MUX for left/right selection
-        // if bit == 0: left = cur, right = sib
-        // if bit == 1: left = sib, right = cur
-        let mut left_fr = Bn254Fr::new();
-        let mut right_fr = Bn254Fr::new();
-        mux_private(&mut left_fr, bit, &cur_fr, sib_fr);   // left = bit ? sib : cur
-        mux_private(&mut right_fr, bit, sib_fr, &cur_fr);  // right = bit ? cur : sib
-        
-        // Get bytes from the MUXed field elements (NOT from the private bit!)
-        // The MUX already correctly selected left/right at the field level.
-        // Extracting bytes from the result doesn't depend on the private bit value.
-        let mut left_bytes = [0u8; 32];
-        let mut right_bytes = [0u8; 32];
+        let bit = &pos_bits[lvl];
+        let sib_fr = &siblings_fr[lvl];
+
+        // 1-mul select:
+        // delta = bit * (sib - cur)
+        // left  = cur + delta
+        // right = sib - delta
+        submod_checked(&mut delta, sib_fr, &cur_fr);
+        delta.mulmod_checked(bit);
+        addmod_checked(&mut left_fr, &cur_fr, &delta);
+        submod_checked(&mut right_fr, sib_fr, &delta);
+
         left_fr.get_bytes_big(&mut left_bytes);
         right_fr.get_bytes_big(&mut right_bytes);
-        
-        // Compute hash using byte preimage
-        let (next_fr, next_bytes) = mt_combine(h, lvl as u8, &left_bytes, &right_bytes);
-        
+
+        // Compute hash using byte preimage.
+        let (next_fr, _next_bytes) = mt_combine(h, lvl as u8, &left_bytes, &right_bytes);
         cur_fr = next_fr;
-        cur_bytes = next_bytes;
         lvl += 1;
     }
-    
-    (cur_fr, cur_bytes)
+
+    cur_fr
 }
 
 // === Level B: Viewer Attestation Functions ===
@@ -660,19 +702,19 @@ fn main() {
     let rho = read_hash32(&args, 3);
 
     // 4) recipient [PRIVATE] [hex arg -> 32 bytes]
-    // Note: We don't use this value directly - we derive recipient from spend_sk
-    // This read still happens to maintain argument layout consistency
-    let _recipient = read_hash32(&args, 4);
+    let recipient_arg = read_hash32(&args, 4);
 
     // 5) spend_sk [PRIVATE] [hex arg -> 32 bytes]
     let spend_sk = read_hash32(&args, 5);
 
     // Derive recipient from spend_sk (authorization binding)
-    // We use the derived value everywhere instead of asserting equality,
-    // because both spend_sk and recipient are private. The binding is enforced
-    // by using recipient_expected in note_commitment.
-    let recipient_expected = recipient_from_sk(&h, &domain, &spend_sk);
-    // Don't assert byte equality - use recipient_expected directly in all constraints
+    let (recipient_expected_fr, recipient_expected) = recipient_from_sk_fr(&h, &domain, &spend_sk);
+    // Enforce: recipient_arg == recipient_from_sk(domain, spend_sk)
+    //
+    // SECURITY: This is a constraint (not a runtime branch) so the verifier's
+    // redacted-private-input execution still builds the same circuit.
+    let recipient_arg_fr = bn254fr_from_hash32_be(&recipient_arg);
+    Bn254Fr::assert_equal(&recipient_arg_fr, &recipient_expected_fr);
 
     // Sender identity (attested) = input-note owner identity
     let sender_id = recipient_expected;
@@ -710,18 +752,19 @@ fn main() {
 
     // 7+depth to 7+2*depth-1) siblings [PRIVATE] [hex args -> 32 bytes each]
     // Read both as bytes (for hash preimage) and as field elements (for MUX)
-    let mut siblings_bytes: [Hash32; MAX_DEPTH] = [[0u8; 32]; MAX_DEPTH];
     let mut siblings_fr: Vec<Bn254Fr> = Vec::with_capacity(depth);
     for i in 0..depth {
-        siblings_bytes[i] = read_hash32(&args, 7 + depth + i);
-        siblings_fr.push(bn254fr_from_hash32_be(&siblings_bytes[i]));
+        let sibling = read_hash32(&args, 7 + depth + i);
+        siblings_fr.push(bn254fr_from_hash32_be(&sibling));
     }
 
-    // 7+2*depth) anchor [str arg -> field element]
-    let anchor_fr = read_fr_str(&args, 7 + 2 * depth);
+    // 7+2*depth) anchor [str/hex arg -> 32 bytes]
+    // NOTE: We bind it as bytes (not as a parsed field element) to ensure it is part of the
+    // public statement in the proof system.
+    let anchor_arg = read_hash32(&args, 7 + 2 * depth);
 
-    // 8+2*depth) nullifier [str arg -> field element]
-    let nullifier_fr = read_fr_str(&args, 8 + 2 * depth);
+    // 8+2*depth) nullifier [str/hex arg -> 32 bytes]
+    let nullifier_arg = read_hash32(&args, 8 + 2 * depth);
 
     // 9+2*depth) withdraw amount [i64 arg -> 8 bytes]
     let withdraw_amount = read_u64(&args, 9 + 2 * depth, 82);
@@ -730,6 +773,17 @@ fn main() {
     let n_out_u32 = read_u32(&args, 10 + 2 * depth, 83);
     if n_out_u32 > MAX_OUTS as u32 { hard_fail(83); }
     let n_out = n_out_u32 as usize;
+
+    // Enforce business transaction-type rules:
+    // - withdraw_amount == 0  => n_out ∈ {1,2} (deposit/transfer must create outputs)
+    // - withdraw_amount  > 0  => n_out ∈ {0,1} (withdraw can have at most one change note)
+    //
+    // These are PUBLIC checks (withdraw_amount + n_out are public), so branching is safe.
+    if withdraw_amount == 0 {
+        if n_out == 0 { hard_fail(87); }
+    } else if n_out > 1 {
+        hard_fail(87);
+    }
 
     // Expected argc without viewers
     // argv[0] (program name) + 1 domain + 1 value + 1 rho + 1 recipient + 1 spend_sk + 1 depth
@@ -789,21 +843,21 @@ fn main() {
     let (_cm_in_fr, cm_in_bytes) = note_commitment(&h, &domain, value, &rho, &recipient_expected);
     
     // Use field-level Merkle path computation
-    let (anchor_computed_fr, _anchor_computed_bytes) = root_from_path_field_level(
+    let anchor_computed_fr = root_from_path_field_level(
         &h,
         &cm_in_bytes,
         &pos_bits[..depth],
         &siblings_fr[..depth],
-        depth_u32,
+        depth,
     );
-    // Use field-level constraint: anchor_computed == anchor (from string arg)
-    Bn254Fr::assert_equal(&anchor_computed_fr, &anchor_fr);
+    // Use field-level constraint (bytes-bound): anchor_computed == anchor_arg
+    assert_fr_eq_hash32(&anchor_computed_fr, &anchor_arg);
 
     // Compute PRF nullifier and check (nf_key is derived; not prover-chosen)
     let nf_key = nf_key_from_sk(&h, &domain, &spend_sk);
     let (nf_computed_fr, _nf_bytes) = nullifier(&h, &domain, &nf_key, &rho);
-    // Use field-level constraint: nullifier_computed == nullifier (from string arg)
-    Bn254Fr::assert_equal(&nf_computed_fr, &nullifier_fr);
+    // Use field-level constraint (bytes-bound): nullifier_computed == nullifier_arg
+    assert_fr_eq_hash32(&nf_computed_fr, &nullifier_arg);
 
     // Balance: input value must equal withdraw + sum(outputs)
     // CRITICAL: Use FIELD-LEVEL constraint, not runtime boolean comparison!
@@ -821,6 +875,9 @@ fn main() {
     let value_fr = Bn254Fr::from_u64(value);
     let withdraw_fr = Bn254Fr::from_u64(withdraw_amount);
     let out_sum_fr = Bn254Fr::from_u64(out_sum);
+
+    // Bind the public `withdraw_amount` into the statement.
+    Bn254Fr::assert_equal_u64(&withdraw_fr, withdraw_amount);
     
     // Compute RHS as field element: withdraw + sum(outputs)
     let mut rhs_fr = Bn254Fr::new();

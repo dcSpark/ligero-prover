@@ -121,6 +121,7 @@ impl VerifierPaths {
 
         // Common program names.
         let program_candidates = [
+            "note_deposit_guest.wasm",
             "note_spend_guest.wasm",
             "value_validator_rust.wasm",
             "value_validator.wasm", // legacy name
@@ -299,6 +300,20 @@ pub fn verify_proof_with_output_in_pool(
     })
 }
 
+fn parse_final_verify_result(stdout: &str) -> Option<bool> {
+    const MARKER: &str = "Final Verify Result:";
+    stdout.lines().rev().find_map(|line| {
+        let idx = line.find(MARKER)?;
+        let rest = line[idx + MARKER.len()..].trim();
+        let token = rest.split_whitespace().next()?;
+        match token {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    })
+}
+
 fn verify_proof_with_output_direct(
     paths: &VerifierPaths,
     proof_bytes: &[u8],
@@ -344,9 +359,7 @@ fn verify_proof_with_output_direct(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let success = output.status.success()
-        && stdout.contains("Final Verify Result:")
-        && stdout.contains("true");
+    let success = output.status.success() && matches!(parse_final_verify_result(&stdout), Some(true));
 
     Ok((success, stdout, stderr))
 }
