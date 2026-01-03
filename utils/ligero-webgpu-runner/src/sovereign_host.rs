@@ -8,6 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::LigeroRunner;
+use crate::LigeroProofPackage;
 
 /// Core host implementation for Ligero zkVM, suitable for wrapping by Sovereign adapters.
 #[derive(Clone, Debug)]
@@ -129,6 +130,16 @@ impl LigeroHostCore {
         &self.runner.paths().verifier_bin
     }
 
+    /// Return true if the discovered prover binary exists.
+    pub fn prover_available(&self) -> bool {
+        self.runner.paths().prover_bin.exists()
+    }
+
+    /// Return true if the discovered verifier binary exists.
+    pub fn verifier_available(&self) -> bool {
+        self.runner.paths().verifier_bin.exists()
+    }
+
     /// Verify a proof for the current config (smoke check).
     ///
     /// Returns `true` if the verifier prints a successful result.
@@ -146,7 +157,9 @@ impl LigeroHostCore {
 
     /// Compute the Ligero code commitment as `SHA-256(wasm_bytes || packing_u32_le)`.
     pub fn code_commitment_raw(&self) -> [u8; 32] {
-        let program_bytes = std::fs::read(&self.runner.config().program).unwrap_or_default();
+        let program_bytes = crate::resolve_program(&self.runner.config().program)
+            .and_then(|p| std::fs::read(p).map_err(anyhow::Error::from))
+            .unwrap_or_default();
 
         let mut hasher = Sha256::new();
         hasher.update(&program_bytes);
@@ -169,6 +182,32 @@ impl LigeroHostCore {
             .runner
             .run_prover_with_output(crate::ProverRunOptions::default())?;
         Ok((proof, stdout))
+    }
+
+    /// Produce a bincode-serialized [`LigeroProofPackage`] without running the prover.
+    ///
+    /// This is useful for tests that validate packaging/redaction behavior in environments where
+    /// WebGPU is unavailable.
+    pub fn run_simulation(&self) -> Result<Vec<u8>> {
+        let public_output = self.public_output.clone().unwrap_or_default();
+        let cfg = self.runner.config();
+        let args_json =
+            serde_json::to_vec(&cfg.args).context("Failed to serialize Ligero args as JSON")?;
+        let pkg = LigeroProofPackage::new(Vec::new(), public_output, args_json, cfg.private_indices.clone())?;
+        pkg.to_bytes()
+    }
+
+    /// Run the prover and return a bincode-serialized [`LigeroProofPackage`].
+    ///
+    /// NOTE: private arguments are redacted in the packaged args.
+    pub fn run_prover_as_package(&self) -> Result<Vec<u8>> {
+        let proof = self.run_prover()?;
+        let public_output = self.public_output.clone().unwrap_or_default();
+        let cfg = self.runner.config();
+        let args_json =
+            serde_json::to_vec(&cfg.args).context("Failed to serialize Ligero args as JSON")?;
+        let pkg = LigeroProofPackage::new(proof, public_output, args_json, cfg.private_indices.clone())?;
+        pkg.to_bytes()
     }
 
     /// Ensure public output has been set and clone it (for packaging outside this crate).

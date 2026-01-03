@@ -1,5 +1,5 @@
 [package]
-name = "ligero-webgpu-runner"
+name = "ligero-runner"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
@@ -14,4 +14,7 @@ tracing = "0.1"
 tempfile = "3"
 sha2 = "0.10"
 hex = "0.4"
+rand = "0.8"
+ligetron = { path = "../../sdk/rust", features = ["native"] }
 
+[dev-dependencies]

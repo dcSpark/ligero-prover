@@ -9,7 +9,7 @@ set -euo pipefail
 # - Clones and builds:
 #     - depot_tools + Dawn (pinned commit) via gclient sync + bundled clang
 #     - wabt
-#     - nicarq/ligero-prover (branch)
+#     - dcspark/ligero-prover (branch)
 # - Stages:
 #     ligero/
 #       bins/<arch>/{bin,lib}/
@@ -31,18 +31,20 @@ Options:
   --arch <arch>   linux-amd64 or linux-arm64 (required)
   --out <dir>     Output directory (default: /out if exists, else current directory)
   --no-tar        Only stage `ligero/bins/<arch>`; do not touch `ligero/shader` and do not create tarball
+  --use-local-ligero  Use this workspace's local `ligero-prover` checkout (mounted at /ligero-local) instead of cloning
 
 Environment:
   CMAKE_JOB_COUNT  Parallel build jobs
   DAWN_GIT_REF      Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
-  LIGERO_REPO       Ligero prover git URL (default: https://github.com/nicarq/ligero-prover.git)
-  LIGERO_BRANCH     Ligero prover git branch (default: nico/improvements)
+  LIGERO_REPO       Ligero prover git URL (default: https://github.com/dcspark/ligero-prover.git)
+  LIGERO_BRANCH     Ligero prover git branch (default: feature/ligero-runner)
 EOF
 }
 
 ARCH=""
 OUT_DIR=""
 NO_TAR=false
+USE_LOCAL_LIGERO=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -60,6 +62,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-tar)
       NO_TAR=true
+      shift
+      ;;
+    --use-local-ligero)
+      USE_LOCAL_LIGERO=1
       shift
       ;;
     -h|--help)
@@ -100,6 +106,10 @@ HOST_GID="${HOST_GID:-0}"
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Boost version to build from source (must match LIGERO_PORTABLE_ARCHIVE_VERSION expectation)
+BOOST_VERSION="${BOOST_VERSION:-1.89.0}"
+BOOST_VERSION_UNDERSCORE="${BOOST_VERSION//./_}"
+
 echo "==> [${ARCH}] Installing packages..."
 apt-get update
 apt-get install -y --no-install-recommends \
@@ -111,10 +121,11 @@ apt-get install -y --no-install-recommends \
   g++-13 \
   gcc-13 \
   git \
-  libboost-all-dev \
+  libbz2-dev \
   libgl1-mesa-dev \
   libglu1-mesa-dev \
   libgmp-dev \
+  liblzma-dev \
   libmpfr-dev \
   libssl-dev \
   libtbb-dev \
@@ -127,6 +138,7 @@ apt-get install -y --no-install-recommends \
   libxi-dev \
   libxinerama-dev \
   libxrandr-dev \
+  libzstd-dev \
   ninja-build \
   patchelf \
   pkg-config \
@@ -135,7 +147,9 @@ apt-get install -y --no-install-recommends \
   python3-jinja2 \
   python3-pip \
   unzip \
-  xz-utils
+  wget \
+  xz-utils \
+  zlib1g-dev
 rm -rf /var/lib/apt/lists/*
 
 JOBS="${CMAKE_JOB_COUNT:-}"
@@ -146,6 +160,34 @@ if [[ -z "$JOBS" ]]; then
     JOBS="4"
   fi
 fi
+
+# Build Boost from source to ensure consistent version across platforms
+echo "==> [${ARCH}] Building Boost ${BOOST_VERSION} from source (using $JOBS jobs)..."
+BOOST_SRC="/tmp/boost-src"
+BOOST_INSTALL="/tmp/boost-install"
+mkdir -p "$BOOST_SRC" "$BOOST_INSTALL"
+
+wget -q -O "$BOOST_SRC/boost.tar.gz" \
+  "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_VERSION_UNDERSCORE}.tar.gz"
+tar -xzf "$BOOST_SRC/boost.tar.gz" -C "$BOOST_SRC" --strip-components=1
+
+cd "$BOOST_SRC"
+./bootstrap.sh \
+  --prefix="$BOOST_INSTALL" \
+  --with-libraries=filesystem,iostreams,log,program_options,random,serialization,thread,exception,test
+
+./b2 install \
+  -j"$JOBS" \
+  variant=release \
+  link=shared \
+  threading=multi \
+  --prefix="$BOOST_INSTALL"
+
+# Make Boost discoverable by CMake
+export BOOST_ROOT="$BOOST_INSTALL"
+export Boost_DIR="$BOOST_INSTALL/lib/cmake/Boost-${BOOST_VERSION}"
+
+echo "==> [${ARCH}] Boost ${BOOST_VERSION} installed to $BOOST_INSTALL"
 
 SYSROOT="/tmp/sysroot-${ARCH}"
 TMP_ROOT="$(mktemp -d -t ligero-linux-build.XXXXXX)"
@@ -166,8 +208,8 @@ trap 'terminate 143' TERM
 trap cleanup EXIT
 
 DAWN_GIT_REF="${DAWN_GIT_REF:-cec4482eccee45696a7c0019e750c77f101ced04}"
-LIGERO_REPO="${LIGERO_REPO:-https://github.com/nicarq/ligero-prover.git}"
-LIGERO_BRANCH="${LIGERO_BRANCH:-nico/improvements}"
+LIGERO_REPO="${LIGERO_REPO:-https://github.com/dcspark/ligero-prover.git}"
+LIGERO_BRANCH="${LIGERO_BRANCH:-feature/ligero-runner}"
 
 DEPOT_TOOLS_DIR="$TMP_ROOT/depot_tools"
 DAWN_SRC="$TMP_ROOT/dawn"
@@ -259,7 +301,17 @@ cmake --install "$WABT_BUILD_DIR"
 echo "==> [${ARCH}] Building Dawn via depot_tools + gclient (this may take a while)..."
 
 echo "==> [${ARCH}] Cloning ligero-prover..."
-git clone "$LIGERO_REPO" -b "$LIGERO_BRANCH" "$LIGERO_SRC"
+if [[ "$USE_LOCAL_LIGERO" == "1" ]]; then
+  if [[ ! -d /ligero-local || ! -f /ligero-local/CMakeLists.txt ]]; then
+    echo "error: expected local ligero-prover to be mounted at /ligero-local" >&2
+    exit 1
+  fi
+  mkdir -p "$LIGERO_SRC"
+  # Copy workspace repo into temp dir without VCS metadata.
+  (cd /ligero-local && tar --exclude=.git -cf - .) | (cd "$LIGERO_SRC" && tar -xf -)
+else
+  git clone "$LIGERO_REPO" -b "$LIGERO_BRANCH" "$LIGERO_SRC"
+fi
 
 echo "==> [${ARCH}] Patching ligero-prover for wabt compatibility..."
 TRANSPILER_HPP="$LIGERO_SRC/include/transpiler.hpp"
@@ -273,12 +325,14 @@ cmake -S "$LIGERO_SRC" -B "$LIGERO_BUILD_DIR" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=gcc-13 \
   -DCMAKE_CXX_COMPILER=g++-13 \
-  -DCMAKE_PREFIX_PATH="$SYSROOT"
+  -DCMAKE_PREFIX_PATH="$SYSROOT;$BOOST_INSTALL" \
+  -DBOOST_ROOT="$BOOST_INSTALL" \
+  -DBoost_NO_SYSTEM_PATHS=ON
 cmake --build "$LIGERO_BUILD_DIR" --target webgpu_prover --parallel "$JOBS"
 cmake --build "$LIGERO_BUILD_DIR" --target webgpu_verifier --parallel "$JOBS"
 
-STAGE_ROOT="$OUT_DIR/ligero"
-BIN_STAGE="$STAGE_ROOT/bins/${ARCH}"
+STAGE_ROOT="$OUT_DIR"
+BIN_STAGE="$STAGE_ROOT/${ARCH}"
 mkdir -p "$BIN_STAGE/bin" "$BIN_STAGE/lib"
 
 install -m 0755 "$LIGERO_BUILD_DIR/webgpu_prover" "$BIN_STAGE/bin/webgpu_prover"
@@ -320,8 +374,23 @@ copy_needed_libs_linux() {
 }
 
 echo "==> [${ARCH}] Collecting shared libs..."
+
+# Include Boost install path so ldd can resolve Boost libraries
+export LD_LIBRARY_PATH="$BOOST_INSTALL/lib:${LD_LIBRARY_PATH:-}"
+
 copy_needed_libs_linux "$BIN_STAGE/bin/webgpu_prover"
 copy_needed_libs_linux "$BIN_STAGE/bin/webgpu_verifier"
+
+# Explicitly copy Boost libraries from our source build
+echo "==> [${ARCH}] Copying Boost libraries from $BOOST_INSTALL/lib..."
+for lib in "$BOOST_INSTALL/lib/"libboost_*.so*; do
+  [[ -f "$lib" ]] || continue
+  base="$(basename "$lib")"
+  if [[ ! -f "$BIN_STAGE/lib/$base" ]]; then
+    cp -L "$lib" "$BIN_STAGE/lib/$base"
+    chmod 0644 "$BIN_STAGE/lib/$base" || true
+  fi
+done
 
 # Also bring Dawn-provided shared libs from sysroot if any exist (best-effort).
 if [[ -d "$SYSROOT/lib" ]]; then
@@ -354,7 +423,7 @@ if command -v strip >/dev/null 2>&1; then
   strip --strip-unneeded "$BIN_STAGE/bin/webgpu_verifier" || true
 fi
 
-echo "==> [${ARCH}] Done staging to /stage/bins/${ARCH}"
+echo "==> [${ARCH}] Done staging to $BIN_STAGE"
 
 if [[ "$NO_TAR" == "false" ]]; then
   echo "==> [${ARCH}] Staging shader folder..."
@@ -364,7 +433,7 @@ if [[ "$NO_TAR" == "false" ]]; then
   TARBALL="$OUT_DIR/ligero-${ARCH}.tar.gz"
   rm -f "$TARBALL"
   echo "==> [${ARCH}] Creating tarball: $TARBALL"
-  (cd "$OUT_DIR" && tar -czf "$(basename "$TARBALL")" "ligero")
+  (cd "$OUT_DIR" && tar -czf "$(basename "$TARBALL")" "${ARCH}" "shader")
 fi
 
 chown -R "$HOST_UID:$HOST_GID" "$STAGE_ROOT" || true

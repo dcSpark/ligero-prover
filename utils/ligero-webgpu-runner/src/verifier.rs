@@ -1,10 +1,11 @@
 //! Utilities to run the Ligero WebGPU prover/verifier binaries.
 //!
 //! This crate is intentionally "just a runner": it shells out to `webgpu_prover` / `webgpu_verifier`,
-//! writes/reads expected artifacts (e.g. `proof_data.gz`) and provides light path-discovery with
+//! writes/reads expected artifacts (e.g. `proof_data.gz` or `proof_data.bin`) and provides light path-discovery with
 //! environment-variable overrides.
 
 use crate::config::{LigeroArg, LigeroConfig};
+use crate::redaction::redact_arg;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -12,6 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
+
+use crate::pool::default_verifier_pool;
+use crate::pool::BinaryWorkerPool;
 
 /// Resolved verifier inputs.
 #[derive(Debug, Clone)]
@@ -60,6 +64,11 @@ impl VerifierPaths {
             let program = std::env::var("LIGERO_PROGRAM_PATH").context(
                 "LIGERO_PROGRAM_PATH environment variable is required for Ligero verification",
             )?;
+
+            let program = crate::resolve_program(&program)
+                .with_context(|| format!("Failed to resolve program (path or name): {program}"))?
+                .to_string_lossy()
+                .to_string();
             // `LIGERO_SHADER_PATH` is optional: we can auto-discover the Ligero repo's `shader/`
             // directory in most setups (including when this crate is pulled via a git dependency).
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -80,6 +89,8 @@ impl VerifierPaths {
                 shader_path,
                 gpu_threads: None,
                 packing,
+                gzip_proof: true,
+                proof_path: None,
                 private_indices: Vec::new(),
                 args: Vec::new(),
             }
@@ -109,13 +120,18 @@ impl VerifierPaths {
             .unwrap_or(8192);
 
         // Common program names.
-        let program_candidates = ["note_spend_guest.wasm", "value_validator.wasm"];
+        let program_candidates = [
+            "note_spend_guest.wasm",
+            "value_validator_rust.wasm",
+            "value_validator.wasm", // legacy name
+        ];
 
         // Common base directories in Sovereign checkouts.
         let base_paths = [
-            current_dir.join("crates/adapters/ligero/guest/bins/programs"),
-            current_dir.join("../crates/adapters/ligero/guest/bins/programs"),
-            current_dir.join("../../crates/adapters/ligero/guest/bins/programs"),
+            // Ligero prover repo layout (this workspace)
+            current_dir.join("utils/circuits/bins"),
+            current_dir.join("../utils/circuits/bins"),
+            current_dir.join("../../utils/circuits/bins"),
         ];
 
         for base_path in &base_paths {
@@ -217,6 +233,8 @@ impl VerifierPaths {
             shader_path: self.shader_path.to_string_lossy().into_owned(),
             gpu_threads: None,
             packing: self.packing,
+            gzip_proof: true,
+            proof_path: None,
             private_indices,
             args,
         }
@@ -247,13 +265,41 @@ pub fn ensure_code_commitment(paths: &VerifierPaths, expected: &[u8; 32]) -> Res
     Ok(())
 }
 
-/// Verify a proof by writing `proof_data.gz` into a temp dir and invoking `webgpu_verifier`.
+/// Verify a proof by writing `proof_data.gz` (default) or `proof_data.bin` (when gzip is disabled)
+/// into a temp dir and invoking `webgpu_verifier`.
 ///
 /// Private arguments are redacted according to `private_indices` (1-based).
 /// Verify a proof and return `(success, stdout, stderr)` for debugging.
 ///
 /// This runs `webgpu_verifier` and captures its output even when verification fails.
+/// Verify a proof and return `(success, stdout, stderr)` for debugging.
+///
+/// This runs `webgpu_verifier` on an always-on worker pool sized to `available_parallelism()`.
 pub fn verify_proof_with_output(
+    paths: &VerifierPaths,
+    proof_bytes: &[u8],
+    args: Vec<LigeroArg>,
+    private_indices: Vec<usize>,
+) -> Result<(bool, String, String)> {
+    verify_proof_with_output_in_pool(default_verifier_pool(), paths, proof_bytes, args, private_indices)
+}
+
+/// Verify a proof and return `(success, stdout, stderr)` for debugging, running on a provided worker pool.
+pub fn verify_proof_with_output_in_pool(
+    pool: &BinaryWorkerPool,
+    paths: &VerifierPaths,
+    proof_bytes: &[u8],
+    args: Vec<LigeroArg>,
+    private_indices: Vec<usize>,
+) -> Result<(bool, String, String)> {
+    let paths = paths.clone();
+    let proof_bytes = proof_bytes.to_vec();
+    pool.execute(move || {
+        verify_proof_with_output_direct(&paths, &proof_bytes, args, private_indices)
+    })
+}
+
+fn verify_proof_with_output_direct(
     paths: &VerifierPaths,
     proof_bytes: &[u8],
     mut args: Vec<LigeroArg>,
@@ -261,20 +307,26 @@ pub fn verify_proof_with_output(
 ) -> Result<(bool, String, String)> {
     let temp_dir = tempdir().context("Failed to create temporary directory for Ligero verification")?;
 
-    // Write proof as proof_data.gz (the format verifier expects)
-    let proof_path = temp_dir.path().join("proof_data.gz");
+    // Write proof bytes for `webgpu_verifier`.
+    // If this is gzip (0x1f, 0x8b), keep the conventional name; otherwise write an uncompressed file.
+    let is_gzip = proof_bytes.len() >= 2 && proof_bytes[0] == 0x1f && proof_bytes[1] == 0x8b;
+    let proof_filename = if is_gzip { "proof_data.gz" } else { "proof_data.bin" };
+    let proof_path = temp_dir.path().join(proof_filename);
     fs::write(&proof_path, proof_bytes)
-        .context("Failed to write proof_data.gz for Ligero verification")?;
+        .with_context(|| format!("Failed to write {} for Ligero verification", proof_filename))?;
 
     // Redact private arguments (replace with dummy values) while preserving basic parseability.
     for &idx in &private_indices {
         if idx > 0 && idx <= args.len() {
             let arg_idx = idx - 1;
-            args[arg_idx] = redact(&args[arg_idx]);
+            args[arg_idx] = redact_arg(&args[arg_idx]);
         }
     }
 
-    let config = paths.to_config(args, private_indices);
+    let mut config = paths.to_config(args, private_indices);
+    // Ensure verifier reads the file we just wrote, and uses consistent decompression behavior.
+    config.proof_path = Some(proof_filename.to_string());
+    config.gzip_proof = is_gzip;
     let config_json = serde_json::to_string(&config)
         .context("Failed to serialize Ligero verifier config")?;
 
@@ -313,42 +365,6 @@ pub fn verify_proof(
     }
 
     Ok(())
-}
-
-fn redact(arg: &LigeroArg) -> LigeroArg {
-    match arg {
-        LigeroArg::String { str: s } => {
-            let trimmed = s.trim();
-            if trimmed.starts_with("0x") && trimmed.len() >= 2 {
-                let body = &trimmed[2..];
-                return LigeroArg::String {
-                    str: format!("0x{}", "0".repeat(body.len())),
-                };
-            }
-
-            let is_hex = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit());
-            if is_hex {
-                return LigeroArg::String {
-                    str: "0".repeat(trimmed.len()),
-                };
-            }
-
-            let is_dec = !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit());
-            if is_dec {
-                return LigeroArg::String {
-                    str: "0".repeat(trimmed.len().max(1)),
-                };
-            }
-
-            LigeroArg::String {
-                str: "x".repeat(trimmed.len().max(1)),
-            }
-        }
-        LigeroArg::I64 { .. } => LigeroArg::I64 { i64: 0 },
-        LigeroArg::Hex { hex: h } => LigeroArg::Hex {
-            hex: "0".repeat(h.len().max(1)),
-        },
-    }
 }
 
 fn canonicalize(path: &str) -> Result<PathBuf> {

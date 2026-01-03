@@ -7,7 +7,7 @@
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField, Field, Zero};
 use num_bigint::BigUint;
-use std::ffi::CStr;
+use std::ffi::{c_char, CStr};
 use std::str::FromStr;
 
 /// A BN254 scalar field element (native implementation)
@@ -34,7 +34,7 @@ impl Bn254Fr {
     }
 
     /// Construct field element from a C-style string (decimal or hex with 0x prefix)
-    pub fn from_c_str(str_ptr: *const i8) -> Self {
+    pub fn from_c_str(str_ptr: *const c_char) -> Self {
         let c_str = unsafe { CStr::from_ptr(str_ptr) };
         let s = c_str.to_str().expect("Invalid UTF-8");
         Self::from_str(s)

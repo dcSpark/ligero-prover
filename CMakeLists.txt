@@ -8,6 +8,12 @@ set(CMAKE_CXX_STANDARD 20)
 
 include(FetchContent)
 
+# Performance knobs (native builds)
+# - LTO can provide meaningful speedups for this codebase (at the cost of longer link times)
+# - -march=native is great for local benchmarks, but produces non-portable binaries
+option(LIGEROVM_ENABLE_LTO "Enable link-time optimization (native builds only)" ON)
+option(LIGEROVM_ENABLE_MARCH_NATIVE "Enable -march=native/-mtune=native (native builds only)" OFF)
+
 FetchContent_Declare(
   json
   URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
@@ -110,6 +116,22 @@ else()
   else()
     add_compile_definitions(NDEBUG)
     add_compile_options(-O3)
+
+    if(LIGEROVM_ENABLE_MARCH_NATIVE)
+      add_compile_options(-march=native -mtune=native)
+    endif()
+
+    if(LIGEROVM_ENABLE_LTO)
+      include(CheckIPOSupported)
+      check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error)
+      if(_ipo_supported)
+        # Enable IPO/LTO for all targets in Release builds.
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+      else()
+        message(WARNING "IPO/LTO not supported by this toolchain: ${_ipo_error}")
+      endif()
+    endif()
+
     # add_compile_options(-fopenmp)
     # add_link_options(-fopenmp)
   endif()

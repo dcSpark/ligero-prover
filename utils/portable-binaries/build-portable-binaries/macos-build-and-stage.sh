@@ -9,7 +9,7 @@ set -euo pipefail
 # - Clones and builds:
 #     - Dawn (pinned commit)
 #     - wabt
-#     - nicarq/ligero-prover (branch)
+#     - dcspark/ligero-prover (branch)
 # - Stages:
 #     ligero/
 #       bins/macos-arm64/{bin,lib}/
@@ -30,17 +30,19 @@ Usage: macos-build-and-stage.sh [--out <dir>] [--no-tar]
 Options:
   --out <dir>   Output directory (default: current directory)
   --no-tar      Only stage the `ligero/` directory; do not create tarball
+  --use-local-ligero  Use this local `ligero-prover` checkout instead of cloning
 
 Environment:
   CMAKE_JOB_COUNT   Parallel build jobs
   DAWN_GIT_REF      Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
-  LIGERO_REPO       Ligero prover git URL (default: https://github.com/nicarq/ligero-prover.git)
-  LIGERO_BRANCH     Ligero prover git branch (default: nico/improvements)
+  LIGERO_REPO       Ligero prover git URL (default: https://github.com/dcspark/ligero-prover.git)
+  LIGERO_BRANCH     Ligero prover git branch (default: feature/ligero-runner)
 EOF
 }
 
 OUT_DIR="$PWD"
 NO_TAR=false
+USE_LOCAL_LIGERO=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +54,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-tar)
       NO_TAR=true
+      shift
+      ;;
+    --use-local-ligero)
+      USE_LOCAL_LIGERO=1
       shift
       ;;
     -h|--help)
@@ -72,8 +78,11 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
 fi
 
 DAWN_GIT_REF="${DAWN_GIT_REF:-cec4482eccee45696a7c0019e750c77f101ced04}"
-LIGERO_REPO="${LIGERO_REPO:-https://github.com/nicarq/ligero-prover.git}"
-LIGERO_BRANCH="${LIGERO_BRANCH:-nico/improvements}"
+LIGERO_REPO="${LIGERO_REPO:-https://github.com/dcspark/ligero-prover.git}"
+LIGERO_BRANCH="${LIGERO_BRANCH:-feature/ligero-runner}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 JOBS="${CMAKE_JOB_COUNT:-}"
 if [[ -z "$JOBS" ]]; then
@@ -98,6 +107,20 @@ for f in "${REQUIRED_FORMULAE[@]}"; do
     brew install "$f"
   fi
 done
+
+# Verify Boost version is >= 1.84 (archive version 19)
+# This is required for cross-platform proof compatibility with Linux builds.
+BOOST_VERSION="$(brew info --json=v2 boost | python3 -c 'import sys,json; print(json.load(sys.stdin)["formulae"][0]["versions"]["stable"])' 2>/dev/null || echo "unknown")"
+echo "==> Homebrew Boost version: $BOOST_VERSION"
+# Extract major.minor version for comparison
+BOOST_MAJOR="${BOOST_VERSION%%.*}"
+BOOST_REST="${BOOST_VERSION#*.}"
+BOOST_MINOR="${BOOST_REST%%.*}"
+if [[ "$BOOST_MAJOR" -lt 1 ]] || { [[ "$BOOST_MAJOR" -eq 1 ]] && [[ "$BOOST_MINOR" -lt 84 ]]; }; then
+  echo "warning: Boost version $BOOST_VERSION is older than 1.84."
+  echo "         Cross-platform proof compatibility requires Boost >= 1.84 (archive version 19)."
+  echo "         Consider running: brew upgrade boost"
+fi
 
 # IMPORTANT:
 # Homebrew LLVM uses its own libc++ headers which can mismatch the system libc++ at link-time,
@@ -167,7 +190,16 @@ cmake --build "$WABT_BUILD" --parallel "$JOBS"
 cmake --install "$WABT_BUILD"
 
 echo "==> Cloning ligero-prover..."
-git clone "$LIGERO_REPO" -b "$LIGERO_BRANCH" "$LIGERO_SRC"
+if [[ "$USE_LOCAL_LIGERO" == "1" ]]; then
+  if [[ ! -f "$REPO_ROOT/CMakeLists.txt" ]]; then
+    echo "error: expected to be running inside a ligero-prover checkout (repo root: $REPO_ROOT)" >&2
+    exit 1
+  fi
+  mkdir -p "$LIGERO_SRC"
+  (cd "$REPO_ROOT" && tar --exclude=.git -cf - .) | (cd "$LIGERO_SRC" && tar -xf -)
+else
+  git clone "$LIGERO_REPO" -b "$LIGERO_BRANCH" "$LIGERO_SRC"
+fi
 
 echo "==> Patching ligero-prover for wabt compatibility..."
 TRANSPILER_HPP="$LIGERO_SRC/include/transpiler.hpp"
@@ -186,11 +218,11 @@ cmake -S "$LIGERO_SRC" -B "$LIGERO_BUILD" \
 cmake --build "$LIGERO_BUILD" --target webgpu_prover --parallel "$JOBS"
 cmake --build "$LIGERO_BUILD" --target webgpu_verifier --parallel "$JOBS"
 
-STAGE_ROOT="$OUT_DIR/ligero"
-BIN_STAGE="$STAGE_ROOT/bins/macos-arm64"
+STAGE_ROOT="$OUT_DIR"
+BIN_STAGE="$STAGE_ROOT/macos-arm64"
 
 # Do not delete the whole stage root, as this script may be used as part of a multi-arch build.
-mkdir -p "$STAGE_ROOT/bins" "$STAGE_ROOT/shader"
+mkdir -p "$STAGE_ROOT/shader"
 rm -rf "$BIN_STAGE"
 mkdir -p "$BIN_STAGE/bin" "$BIN_STAGE/lib"
 
@@ -272,7 +304,7 @@ if [[ "$NO_TAR" == "false" ]]; then
   TARBALL="$OUT_DIR/ligero-macos-arm64.tar.gz"
   rm -f "$TARBALL"
   echo "==> Creating tarball: $TARBALL"
-  (cd "$OUT_DIR" && tar -czf "$(basename "$TARBALL")" "ligero")
+  (cd "$OUT_DIR" && tar -czf "$(basename "$TARBALL")" "macos-arm64" "shader")
 fi
 
 echo "==> Done."

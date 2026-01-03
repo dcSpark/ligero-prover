@@ -190,7 +190,16 @@ WGPUDevice wgpuRequestDeviceSync(WGPUInstance instance, WGPUAdapter adapter) {
     WGPUUncapturedErrorCallbackInfo err {
         .callback = [](WGPUDevice const *, WGPUErrorType type, WGPUStringView msg, void* , void*) {
             LIGERO_LOG_ERROR << format_error(type, msg.data);
-            std::abort();
+            // IMPORTANT:
+            // Do not abort the entire process on uncaptured WebGPU errors.
+            //
+            // In daemon mode we want the worker to survive a single failing request
+            // (e.g. during negative tests or transient device errors) and return an
+            // error response instead of crashing and closing stdout unexpectedly.
+            //
+            // Note: the device may be in a bad state after an uncaptured error; callers
+            // should treat subsequent results as unreliable and may choose to restart
+            // the daemon if needed.
         }
     };
 

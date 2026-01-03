@@ -1,7 +1,7 @@
 //! Utilities to run the Ligero WebGPU prover/verifier binaries.
 //!
 //! This crate is intentionally "just a runner": it shells out to `webgpu_prover` / `webgpu_verifier`,
-//! writes/reads expected artifacts (e.g. `proof_data.gz`) and provides light path-discovery with
+//! writes/reads expected artifacts (e.g. `proof_data.gz` or `proof_data.bin`) and provides light path-discovery with
 //! environment-variable overrides.
 
 use std::path::{Path, PathBuf};
@@ -11,6 +11,9 @@ use anyhow::{Context, Result};
 
 use crate::config::LigeroConfig;
 use crate::paths::{discover_paths, fallback_paths, LigeroPaths};
+use crate::pool::default_prover_pool;
+use crate::pool::default_verifier_pool;
+use crate::pool::BinaryWorkerPool;
 use crate::LigeroArg;
 
 fn sh_single_quote(value: &str) -> String {
@@ -31,10 +34,13 @@ fn canonicalize_config_for_run(config: &LigeroConfig, caller_cwd: &Path) -> Resu
     }
 
     let mut cfg = config.clone();
-    cfg.program = resolve(caller_cwd, &cfg.program)
-        .with_context(|| format!("Failed to resolve Ligero program path: {}", cfg.program))?
-        .to_string_lossy()
-        .into_owned();
+    cfg.program = match resolve(caller_cwd, &cfg.program) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => crate::resolve_program(&cfg.program)
+            .with_context(|| format!("Failed to resolve Ligero program (path or name): {}", cfg.program))?
+            .to_string_lossy()
+            .into_owned(),
+    };
     cfg.shader_path = resolve(caller_cwd, &cfg.shader_path)
         .with_context(|| format!("Failed to resolve Ligero shader path: {}", cfg.shader_path))?
         .to_string_lossy()
@@ -99,6 +105,8 @@ impl LigeroRunner {
                 shader_path,
                 gpu_threads: None,
                 packing: 8192,
+                gzip_proof: true,
+                proof_path: None,
                 private_indices: vec![],
                 args: vec![],
             },
@@ -122,6 +130,8 @@ impl LigeroRunner {
                 shader_path,
                 gpu_threads: None,
                 packing: 8192,
+                gzip_proof: true,
+                proof_path: None,
                 private_indices: vec![],
                 args: vec![],
             },
@@ -190,7 +200,10 @@ impl LigeroRunner {
         self.config.args.push(LigeroArg::Hex { hex: value });
     }
 
-    /// Run the prover and return the compressed proof bytes (the contents of `proof_data.gz`).
+    /// Run the prover and return the proof bytes written by `webgpu_prover`.
+    ///
+    /// By default this is the compressed `proof_data.gz`. If `gzip-proof=false` is set in the
+    /// config, the prover writes an uncompressed proof file instead.
     ///
     /// The prover is executed in a per-run directory under `<cwd>/proof_outputs/` (unless overridden).
     pub fn run_prover(&self) -> Result<Vec<u8>> {
@@ -207,7 +220,26 @@ impl LigeroRunner {
     ///
     /// This is useful for tests/benchmarks that want to print prover output without re-implementing
     /// process management outside this crate.
+    ///
+    /// The prover execution is dispatched onto an always-on worker pool sized to `available_parallelism()`.
     pub fn run_prover_with_output(
+        &self,
+        options: ProverRunOptions,
+    ) -> Result<(Vec<u8>, String, String)> {
+        self.run_prover_with_output_in_pool(default_prover_pool(), options)
+    }
+
+    /// Run the prover on a specific worker pool (useful for tests/benchmarks).
+    pub fn run_prover_with_output_in_pool(
+        &self,
+        pool: &BinaryWorkerPool,
+        options: ProverRunOptions,
+    ) -> Result<(Vec<u8>, String, String)> {
+        let runner = self.clone();
+        pool.execute(move || runner.run_prover_with_output_direct(options))
+    }
+
+    fn run_prover_with_output_direct(
         &self,
         options: ProverRunOptions,
     ) -> Result<(Vec<u8>, String, String)> {
@@ -307,18 +339,26 @@ exec \"$PROVER_BIN\" \"$CONFIG_JSON\"
             );
         }
 
-        // Read the proof from proof_data.gz (compressed - this goes into the transaction).
-        let proof_path = unique_proof_dir.join("proof_data.gz");
+        // Read the proof file (compressed by default).
+        let proof_filename = if config.gzip_proof {
+            "proof_data.gz"
+        } else {
+            "proof_data.bin"
+        };
+        let proof_path = unique_proof_dir.join(proof_filename);
         if !proof_path.exists() {
             anyhow::bail!(
-                "Ligero prover did not produce proof_data.gz\nproof dir: {}\nNote: check prover.stdout.log / prover.stderr.log in that directory.",
+                "Ligero prover did not produce {}\nproof dir: {}\nNote: check prover.stdout.log / prover.stderr.log in that directory.",
+                proof_filename,
                 unique_proof_dir.display()
             );
         }
-        let proof = std::fs::read(&proof_path).context("Failed to read proof_data.gz")?;
+        let proof = std::fs::read(&proof_path)
+            .with_context(|| format!("Failed to read {}", proof_path.display()))?;
         if proof.is_empty() {
             anyhow::bail!(
-                "Ligero prover produced an empty proof_data.gz\nproof dir: {}",
+                "Ligero prover produced an empty proof file ({})\nproof dir: {}",
+                proof_filename,
                 unique_proof_dir.display()
             );
         }
@@ -340,7 +380,19 @@ exec \"$PROVER_BIN\" \"$CONFIG_JSON\"
     }
 
     /// Run the verifier binary for the current config and return true if it prints a successful result.
+    ///
+    /// The verifier execution is dispatched onto an always-on worker pool sized to `available_parallelism()`.
     pub fn verify_proof_smoke(&self) -> Result<bool> {
+        self.verify_proof_smoke_in_pool(default_verifier_pool())
+    }
+
+    /// Run the verifier smoke check on a specific worker pool (useful for tests/benchmarks).
+    pub fn verify_proof_smoke_in_pool(&self, pool: &BinaryWorkerPool) -> Result<bool> {
+        let runner = self.clone();
+        pool.execute(move || runner.verify_proof_smoke_direct())
+    }
+
+    fn verify_proof_smoke_direct(&self) -> Result<bool> {
         let caller_cwd = std::env::current_dir().context("Failed to get current directory")?;
         let config = canonicalize_config_for_run(&self.config, &caller_cwd)?;
         let config_json =

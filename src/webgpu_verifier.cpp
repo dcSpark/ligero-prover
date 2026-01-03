@@ -21,7 +21,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <memory>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 
 #include <transpiler.hpp>
@@ -57,7 +61,150 @@ using buffer_t = typename executor_t::buffer_type;
 
 constexpr bool enable_RAM = false;
 
-int main(int argc, const char *argv[]) {
+namespace {
+struct DaemonError final : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+[[noreturn]] void fail(bool daemon_mode, const std::string& msg) {
+    if (daemon_mode) {
+        throw DaemonError(msg);
+    }
+    std::cerr << msg << std::endl;
+    std::exit(EXIT_FAILURE);
+}
+
+struct NullBuffer final : public std::streambuf {
+    int overflow(int c) override { return c; }
+};
+
+struct VerifierDaemonCache {
+    // Cache WebGPU init across daemon requests.
+    std::unique_ptr<executor_t> executor;
+    size_t k = 0;
+    size_t l = 0;
+    size_t n = 0;
+    size_t gpu_threads = 0;
+    std::string shader_path;
+
+    // Cache parsed WASM module across daemon requests when `program` is unchanged.
+    std::unique_ptr<wabt::Module> module;
+    fs::path program_path;
+    std::optional<fs::file_time_type> program_mtime;
+};
+
+static std::unique_ptr<wabt::Module> parse_wasm_module_or_fail(const fs::path& program_name, bool daemon_mode) {
+    std::unique_ptr<wabt::Module> wabt_module{ new wabt::Module{} };
+
+    std::vector<uint8_t> program_data;
+    wabt::Result read_result = wabt::ReadFile(program_name.c_str(), &program_data);
+    if (wabt::Failed(read_result)) {
+        fail(daemon_mode,
+             std::format("Error: Could not read from file \"{}\"",
+                         program_name.c_str()));
+    }
+
+    wabt::Features wabt_features;
+    wabt::Result   parsing_result;
+    wabt::Errors   parsing_errors;
+    if (program_name.extension() == ".wat" || program_name.extension() == ".wast") {
+        std::unique_ptr<wabt::WastLexer> lexer = wabt::WastLexer::CreateBufferLexer(
+            program_name.c_str(),
+            program_data.data(),
+            program_data.size(),
+            &parsing_errors);
+
+        wabt::WastParseOptions parse_wast_options(wabt_features);
+        parsing_result = wabt::ParseWatModule(lexer.get(),
+                                              &wabt_module,
+                                              &parsing_errors,
+                                              &parse_wast_options);
+    } else {
+        parsing_result = wabt::ReadBinaryIr(program_name.c_str(),
+                                            program_data.data(),
+                                            program_data.size(),
+                                            wabt::ReadBinaryOptions{},
+                                            &parsing_errors,
+                                            wabt_module.get());
+    }
+
+    if (wabt::Failed(parsing_result)) {
+        auto err_msg = wabt::FormatErrorsToString(parsing_errors,
+                                                  wabt::Location::Type::Binary);
+        fail(daemon_mode,
+             std::format("wabt: {}Error: Failed to parse WASM module \"{}\"",
+                         err_msg, program_name.c_str()));
+    }
+
+    return wabt_module;
+}
+
+static void ensure_cached_module(VerifierDaemonCache& cache, const fs::path& program_name, bool daemon_mode) {
+    std::optional<fs::file_time_type> mt;
+    try {
+        mt = fs::last_write_time(program_name);
+    } catch (...) {
+        // Ignore mtime failures; we can still cache by path.
+    }
+
+    const bool same_path = (!cache.program_path.empty() && cache.program_path == program_name);
+    const bool same_mtime =
+        same_path && cache.program_mtime.has_value() && mt.has_value() &&
+        *cache.program_mtime == *mt;
+
+    if (cache.module && same_path && (same_mtime || !mt.has_value() || !cache.program_mtime.has_value())) {
+        return;
+    }
+
+    cache.module = parse_wasm_module_or_fail(program_name, daemon_mode);
+    cache.program_path = program_name;
+    cache.program_mtime = mt;
+    if (daemon_mode) {
+        std::cerr << "[daemon] cached wasm module: " << program_name << std::endl;
+    }
+}
+
+static void ensure_cached_executor(VerifierDaemonCache& cache,
+                                   size_t k,
+                                   size_t l,
+                                   size_t n,
+                                   size_t gpu_threads,
+                                   const std::string& shader_path,
+                                   bool daemon_mode) {
+    const bool can_reuse =
+        cache.executor &&
+        cache.k == k &&
+        cache.l == l &&
+        cache.n == n &&
+        cache.gpu_threads == gpu_threads &&
+        cache.shader_path == shader_path;
+
+    if (can_reuse) {
+        return;
+    }
+
+    auto [omega_k, omega_2k, omega_4k] = field_t::generate_omegas(k, n);
+
+    cache.executor = std::make_unique<executor_t>();
+    cache.executor->webgpu_init(gpu_threads, shader_path);
+    cache.executor->ntt_init(l, k, n,
+                             field_t::modulus, field_t::barrett_factor,
+                             omega_k, omega_2k, omega_4k);
+
+    cache.k = k;
+    cache.l = l;
+    cache.n = n;
+    cache.gpu_threads = gpu_threads;
+    cache.shader_path = shader_path;
+
+    if (daemon_mode) {
+        std::cerr << "[daemon] initialized webgpu executor (gpu_threads=" << gpu_threads
+                  << " k=" << k << " l=" << l << " n=" << n
+                  << " shader_path=" << shader_path << ")" << std::endl;
+    }
+}
+
+int run_verifier_from_config(const json& jconfig, bool daemon_mode, VerifierDaemonCache* daemon_cache) {
     const std::string ligero_version_string =
         std::format("ligero-prover v{}.{}.{}+{}.{}",
                     LIGETRON_VERSION_MAJOR,
@@ -65,26 +212,23 @@ int main(int argc, const char *argv[]) {
                     LIGETRON_VERSION_PATCH,
                     LIGETRON_GIT_BRANCH,
                     LIGETRON_GIT_COMMIT_HASH);
-    std::cout << ligero_version_string << std::endl;
-    
+    if (!daemon_mode) {
+        std::cout << ligero_version_string << std::endl;
+    }
+
     std::vector<std::vector<u8>> input_args;
     std::string shader_path;
-    std::string proof_name = "proof_data.gz";
 
-    if (argc < 2) {
-        std::cerr << "Error: No JSON input provided" << std::endl;
-        exit(EXIT_FAILURE);
+    bool gzip_proof = true;
+    bool gzip_proof_overridden = false;
+    if (jconfig.contains("gzip-proof")) {
+        gzip_proof = jconfig["gzip-proof"].template get<bool>();
+        gzip_proof_overridden = true;
     }
-    
-    std::string_view jstr = argv[1];
-    json jconfig;
 
-    try {
-        jconfig = json::parse(jstr);
-    }
-    catch (json::exception& e) {
-        std::cerr << e.what() << std::endl;
-        exit(EXIT_FAILURE);
+    std::string proof_name = gzip_proof ? "proof_data.gz" : "proof_data.bin";
+    if (jconfig.contains("proof-path")) {
+        proof_name = jconfig["proof-path"].template get<std::string>();
     }
 
     size_t k = params::default_row_size;
@@ -131,8 +275,7 @@ int main(int argc, const char *argv[]) {
 
                 // Ensure no embedded NULs (would truncate if guest uses C-string ops)
                 if (hex_str.find('\0') != std::string::npos) {
-                    std::cerr << "Error: hex arg contains embedded NUL byte" << std::endl;
-                    exit(EXIT_FAILURE);
+                    fail(daemon_mode, "Error: hex arg contains embedded NUL byte");
                 }
 
                 // Ensure 0x prefix (guest/SDK expects it for base-0 parsing)
@@ -152,8 +295,7 @@ int main(int argc, const char *argv[]) {
                 // Validate hex characters
                 auto is_hex_digit = [](unsigned char c) { return std::isxdigit(c) != 0; };
                 if (!std::all_of(hex_str.begin() + 2, hex_str.end(), is_hex_digit)) {
-                    std::cerr << "Error: invalid hex string: " << hex_str << std::endl;
-                    exit(EXIT_FAILURE);
+                    fail(daemon_mode, std::format("Error: invalid hex string: {}", hex_str));
                 }
 
                 // Pass as ASCII string with explicit NUL terminator
@@ -164,8 +306,7 @@ int main(int argc, const char *argv[]) {
                 input_args.emplace_back(std::move(buf));
             }
             else {
-                std::cerr << "Invalid args type: " << arg.dump() << std::endl;
-                exit(-1);
+                fail(daemon_mode, std::format("Invalid args type: {}", arg.dump()));
             }
         }
     }
@@ -180,63 +321,31 @@ int main(int argc, const char *argv[]) {
         program_name = jconfig["program"].template get<std::string>();
     }
     
-    // Reading and parsing the wasm file
-    // ------------------------------------------------------------
-    std::unique_ptr<wabt::Module> wabt_module{ new wabt::Module{} };
-    {
-        std::vector<uint8_t> program_data;
-        wabt::Result read_result = wabt::ReadFile(program_name.c_str(), &program_data);
+    // Reading / parsing the wasm and initializing WebGPU are expensive.
+    // In daemon mode, reuse both across requests when inputs match.
+    wabt::Module* wabt_module_ptr = nullptr;
+    executor_t* executor_ptr = nullptr;
+    std::unique_ptr<wabt::Module> wabt_module_local;
+    std::unique_ptr<executor_t> executor_local;
 
-        if (wabt::Failed(read_result)) {
-            std::cerr << std::format("Error: Could not read from file \"{}\"",
-                                     program_name.c_str())
-                      << std::endl;
-            exit(EXIT_FAILURE);
-        }
-
-        wabt::Features wabt_features;
-        wabt::Result   parsing_result;
-        wabt::Errors   parsing_errors;
-        if (program_name.extension() == ".wat" || program_name.extension() == ".wast") {
-            std::unique_ptr<wabt::WastLexer> lexer = wabt::WastLexer::CreateBufferLexer(
-                program_name.c_str(),
-                program_data.data(),
-                program_data.size(),
-                &parsing_errors);
-
-            wabt::WastParseOptions parse_wast_options(wabt_features);
-            parsing_result = wabt::ParseWatModule(lexer.get(),
-                                                  &wabt_module,
-                                                  &parsing_errors,
-                                                  &parse_wast_options);
-        }
-        else {
-            parsing_result = wabt::ReadBinaryIr(program_name.c_str(),
-                                                program_data.data(),
-                                                program_data.size(),
-                                                wabt::ReadBinaryOptions{},
-                                                &parsing_errors,
-                                                wabt_module.get());
-        }
-
-        if (wabt::Failed(parsing_result)) {
-            auto err_msg = wabt::FormatErrorsToString(parsing_errors,
-                                                      wabt::Location::Type::Binary);
-            std::cerr << std::format("wabt: {}", err_msg)
-                      << std::format("Error: Failed to parse WASM module \"{}\"",
-                                     program_name.c_str())
-                      << std::endl;
-            exit(EXIT_FAILURE);
-        }
+    if (daemon_mode && daemon_cache) {
+        ensure_cached_module(*daemon_cache, program_name, daemon_mode);
+        ensure_cached_executor(*daemon_cache, k, l, n, gpu_threads, shader_path, daemon_mode);
+        wabt_module_ptr = daemon_cache->module.get();
+        executor_ptr = daemon_cache->executor.get();
+    } else {
+        wabt_module_local = parse_wasm_module_or_fail(program_name, daemon_mode);
+        auto [omega_k, omega_2k, omega_4k] = field_t::generate_omegas(k, n);
+        executor_local = std::make_unique<executor_t>();
+        executor_local->webgpu_init(gpu_threads, shader_path);
+        executor_local->ntt_init(l, k, n,
+                                 field_t::modulus, field_t::barrett_factor,
+                                 omega_k, omega_2k, omega_4k);
+        wabt_module_ptr = wabt_module_local.get();
+        executor_ptr = executor_local.get();
     }
 
-    auto [omega_k, omega_2k, omega_4k] = field_t::generate_omegas(k, n);
-
-    executor_t executor;
-    executor.webgpu_init(gpu_threads, shader_path);
-    executor.ntt_init(l, k, n,
-                      field_t::modulus, field_t::barrett_factor,
-                      omega_k, omega_2k, omega_4k);
+    executor_t& executor = *executor_ptr;
 
     // ================================================================================
 
@@ -252,15 +361,25 @@ int main(int argc, const char *argv[]) {
         std::ifstream proof_file(proof_name, std::ios::in | std::ios::binary);
 
         if (!proof_file) {
-            std::cerr << std::format("Error: Could not read from file \"{}\"", proof_name)
-                      << std::endl;
-            exit(EXIT_FAILURE);
+            fail(daemon_mode,
+                 std::format("Error: Could not read from file \"{}\"", proof_name));
         }
 
         compressed_proof << proof_file.rdbuf();
         proof_file.close();
 
-        proof_stream.push(io::gzip_decompressor());
+        // If caller didn't specify gzip-proof, auto-detect gzip by magic bytes.
+        if (!gzip_proof_overridden) {
+            const std::string s = compressed_proof.str();
+            const bool is_gzip = s.size() >= 2 &&
+                                 (static_cast<unsigned char>(s[0]) == 0x1f) &&
+                                 (static_cast<unsigned char>(s[1]) == 0x8b);
+            gzip_proof = is_gzip;
+        }
+
+        if (gzip_proof) {
+            proof_stream.push(io::gzip_decompressor());
+        }
         proof_stream.push(compressed_proof);
 
         archive_ptr = std::make_unique<portable_binary_iarchive>(proof_stream);
@@ -285,11 +404,10 @@ int main(int argc, const char *argv[]) {
         }
 
         std::cerr << "Verification failed, exiting" << std::endl;
-        exit(EXIT_FAILURE);
+        fail(daemon_mode, "Verification failed (boost.archive exception)");
     }
     catch (const std::exception& ex) {
-        std::cerr << "Error: " << ex.what() << std::endl;
-        exit(EXIT_FAILURE);
+        fail(daemon_mode, std::string("Error: ") + ex.what());
     }
 
     std::cout << "=============== Start Verify ===============" << std::endl;
@@ -321,18 +439,14 @@ int main(int argc, const char *argv[]) {
     vctx-> init_witness_random(seed, params::any_iv);
 
     try {
-        run_program(*wabt_module, *vctx, input_args, indices_set);
+        run_program(*wabt_module_ptr, *vctx, input_args, indices_set);
 
         if (proof_stream.peek() != EOF) {
-            std::cerr << "Error: proof size is bigger than it should be" << std::endl;
-            std::cerr << "Verification failed, exiting" << std::endl;
-            exit(EXIT_FAILURE);
+            fail(daemon_mode, "Error: proof size is bigger than it should be");
         }
     }
     catch (const std::exception& e) {
-        std::cout << "Error: " << e.what() << std::endl;
-        std::cerr << "Verification failed, exiting" << std::endl;
-        exit(EXIT_FAILURE);
+        fail(daemon_mode, std::string("Error: ") + e.what());
     }
 
     vt.stop();
@@ -474,4 +588,69 @@ int main(int argc, const char *argv[]) {
 #endif
     
     return !verify_result;
+}
+
+} // namespace
+
+int main(int argc, const char *argv[]) {
+    const bool daemon_mode = (argc >= 2 && std::string_view(argv[1]) == "--daemon");
+
+    if (daemon_mode) {
+        // Protocol: one JSON request per line on stdin, one JSON response per line on stdout.
+        // stdout is reserved for the protocol, so silence normal informational logs while verifying.
+        NullBuffer null_buf;
+        std::ostream null_out(&null_buf);
+        auto* orig_cout_buf = std::cout.rdbuf();
+
+        VerifierDaemonCache cache;
+
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            json resp;
+            try {
+                json jconfig = json::parse(line);
+                if (jconfig.contains("id")) {
+                    resp["id"] = jconfig["id"];
+                }
+
+                std::cout.rdbuf(null_out.rdbuf());
+                int exit_code = run_verifier_from_config(jconfig, /*daemon_mode=*/true, &cache);
+                std::cout.rdbuf(orig_cout_buf);
+
+                resp["ok"] = (exit_code == 0);
+                resp["exit_code"] = exit_code;
+                resp["verify_ok"] = (exit_code == 0);
+            } catch (const json::exception& e) {
+                std::cout.rdbuf(orig_cout_buf);
+                resp["ok"] = false;
+                resp["error"] = std::string("json parse error: ") + e.what();
+            } catch (const DaemonError& e) {
+                std::cout.rdbuf(orig_cout_buf);
+                resp["ok"] = false;
+                resp["error"] = e.what();
+            } catch (const std::exception& e) {
+                std::cout.rdbuf(orig_cout_buf);
+                resp["ok"] = false;
+                resp["error"] = e.what();
+            }
+
+            std::cout << resp.dump() << "\n" << std::flush;
+        }
+        return 0;
+    }
+
+    if (argc < 2) {
+        std::cerr << "Error: No JSON input provided" << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    json jconfig;
+    try {
+        jconfig = json::parse(std::string_view(argv[1]));
+    } catch (json::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    return run_verifier_from_config(jconfig, /*daemon_mode=*/false, /*daemon_cache=*/nullptr);
 }
