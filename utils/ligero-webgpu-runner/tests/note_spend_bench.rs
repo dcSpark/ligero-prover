@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ligetron::poseidon2_hash_bytes;
+use ligetron::Bn254Fr;
 use sha2::{Digest, Sha256};
 
 use ligero_runner::{
-    daemon::DaemonPool, redact_arg, verifier, BinaryWorkerPool, LigeroArg, LigeroRunner,
-    ProverRunOptions,
+    daemon::DaemonPool, verifier, BinaryWorkerPool, LigeroArg, LigeroRunner, ProverRunOptions,
 };
 
 type Hash32 = [u8; 32];
@@ -165,11 +165,11 @@ fn print_summary_table() {
     }
 
     println!();
-    println!("╔════════════════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                                         BENCHMARK SUMMARY                                                  ║");
-    println!("╠════════════╦═══════════╦════════════╦════════════╦═══════════════╦════════════════════╦══════════╦══════════╣");
+    println!("╔═════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗");
+    println!("║                                         BENCHMARK SUMMARY                                                       ║");
+    println!("╠════════════╦═══════════╦════════════╦════════════╦═══════════════╦════════════════════╦════════════╦════════════╣");
     println!(
-        "║ {:^10} ║ {:^9} ║ {:^10} ║ {:^10} ║ {:^13} ║ {:^18} ║ {:^8} ║ {:^8} ║",
+        "║ {:^10} ║ {:^9} ║ {:^10} ║ {:^10} ║ {:^13} ║ {:^18} ║ {:^10} ║ {:^10} ║",
         "Use Case",
         "Prover",
         "Verifier",
@@ -179,7 +179,7 @@ fn print_summary_table() {
         "Prover OK",
         "Verify OK",
     );
-    println!("╠════════════╬═══════════╬════════════╬════════════╬═══════════════╬════════════════════╬══════════╬══════════╣");
+    println!("╠════════════╬═══════════╬════════════╬════════════╬═══════════════╬════════════════════╬════════════╬════════════╣");
 
     for r in results.iter() {
         let use_case = r.use_case.to_ascii_uppercase();
@@ -208,19 +208,12 @@ fn print_summary_table() {
         };
 
         println!(
-            "║ {:^10} ║ {:>6} ms ║ {:>7} ms ║ {:>7} KB ║ {:>13} ║ {:>18} ║ {:^8} ║ {:^8} ║",
-            use_case,
-            prover_ms,
-            verifier_ms,
-            proof_kb,
-            linear,
-            quad,
-            prover_ok,
-            verify_ok,
+            "║ {:^10} ║ {:>6} ms ║ {:>7} ms ║ {:>7} KB ║ {:>13} ║ {:>18} ║ {:^10} ║ {:^10} ║",
+            use_case, prover_ms, verifier_ms, proof_kb, linear, quad, prover_ok, verify_ok,
         );
     }
 
-    println!("╚════════════╩═══════════╩════════════╩════════════╩═══════════════╩════════════════════╩══════════╩══════════╝");
+    println!("╚════════════╩═══════════╩════════════╩════════════╩═══════════════╩════════════════════╩════════════╩════════════╝");
     println!();
 
     // Detailed timing breakdown
@@ -238,7 +231,10 @@ fn print_summary_table() {
         println!(
             "│ {:^10} │ {:>7} ms │ {:>7} ms │ {:>7} ms │ {:>7} ms             │",
             r.use_case.to_uppercase(),
-            s1, s2, s3, total
+            s1,
+            s2,
+            s3,
+            total
         );
     }
 
@@ -283,7 +279,8 @@ fn hx32_short(b: &Hash32) -> String {
 fn decode_hash32_hex(s: &str) -> Result<Hash32> {
     let s = s.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s).with_context(|| format!("Failed to hex-decode 32-byte value: {s}"))?;
+    let bytes =
+        hex::decode(s).with_context(|| format!("Failed to hex-decode 32-byte value: {s}"))?;
     anyhow::ensure!(
         bytes.len() == 32,
         "expected 32 bytes (64 hex chars), got {} bytes",
@@ -313,7 +310,10 @@ fn arg_hash32(args: &[LigeroArg], idx1: usize) -> Result<Hash32> {
     let arg0 = idx1
         .checked_sub(1)
         .context("arg_hash32 expects 1-based indices")?;
-    match args.get(arg0).with_context(|| format!("missing arg index {idx1}"))? {
+    match args
+        .get(arg0)
+        .with_context(|| format!("missing arg index {idx1}"))?
+    {
         LigeroArg::Hex { hex } => decode_hash32_hex(hex),
         LigeroArg::String { str } => decode_hash32_hex(str),
         LigeroArg::I64 { .. } => anyhow::bail!("expected hex/string at arg index {idx1}"),
@@ -369,105 +369,140 @@ fn read_num_runs() -> u8 {
         .unwrap_or(3)
 }
 
+fn enable_viewers() -> bool {
+    std::env::var("LIGERO_ENABLE_VIEWERS")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Generate labels for each argument position (1-indexed to match circuit docs).
-fn arg_labels(
-    depth: usize,
-    n_out: usize,
-    use_case: NoteSpendUseCase,
-) -> Vec<(&'static str, &'static str)> {
-    // Returns (name, visibility) tuples
+fn arg_labels(args: &[LigeroArg], use_case: NoteSpendUseCase) -> Vec<(&'static str, &'static str)> {
+    // Returns (name, visibility) tuples (1-based positions excluding argv[0]).
     let mut labels: Vec<(&'static str, &'static str)> = Vec::new();
 
     if matches!(use_case, NoteSpendUseCase::Deposit) {
         // Deposit circuit ABI:
-        // 1 domain (PUB), 2 value (PUB), 3 rho (PRIV), 4 recipient (PRIV), 5 cm_out (PUB)
+        // 1 domain (PUB), 2 value (PUB), 3 rho (PRIV), 4 pk_spend_recipient (PRIV),
+        // 5 pk_ivk_recipient (PRIV), 6 cm_out (PUB)
         labels.push(("domain", "PUBLIC"));
         labels.push(("value", "PUBLIC"));
         labels.push(("rho", "PRIVATE"));
-        labels.push(("recipient", "PRIVATE"));
+        labels.push(("pk_spend_recipient", "PRIVATE"));
+        labels.push(("pk_ivk_recipient", "PRIVATE"));
         labels.push(("cm_out", "PUBLIC"));
         return labels;
     }
 
-    // Fixed arguments [1..6]
+    // note-spend v2 ABI (transfer/withdraw).
+    //
+    // Header:
+    // 1 domain (PUB)
+    // 2 spend_sk (PRIV)
+    // 3 pk_ivk_owner (PRIV)
+    // 4 depth (PUB)
+    // 5 anchor (PUB)
+    // 6 n_in (PUB)
     labels.push(("domain", "PUBLIC"));
-    labels.push((
-        "value",
-        if matches!(use_case, NoteSpendUseCase::Deposit) {
-            "PUBLIC"
-        } else {
-            "PRIVATE"
-        },
-    ));
-    labels.push(("rho", "PRIVATE"));
-    labels.push(("recipient", "PRIVATE"));
     labels.push(("spend_sk", "PRIVATE"));
+    labels.push(("pk_ivk_owner", "PRIVATE"));
     labels.push(("depth", "PUBLIC"));
-
-    // pos_bits [7..7+depth)
-    for _ in 0..depth {
-        labels.push(("pos_bit", "PRIVATE"));
-    }
-
-    // siblings [7+depth..7+2*depth)
-    for _ in 0..depth {
-        labels.push(("sibling", "PRIVATE"));
-    }
-
-    // anchor, nullifier [7+2*depth, 8+2*depth]
     labels.push(("anchor", "PUBLIC"));
-    labels.push(("nullifier", "PUBLIC"));
+    labels.push(("n_in", "PUBLIC"));
 
-    // withdraw_amount, n_out [9+2*depth, 10+2*depth]
+    let depth = arg_u64(args, 4).ok().unwrap_or(0) as usize;
+    let n_in = arg_u64(args, 6).ok().unwrap_or(0) as usize;
+    let per_in = 4usize + 2usize * depth;
+    let withdraw_idx = 7usize + n_in * per_in;
+    let n_out = arg_u64(args, withdraw_idx + 1).ok().unwrap_or(0) as usize;
+
+    // Inputs.
+    for _i in 0..n_in {
+        labels.push(("value_in", "PRIVATE"));
+        labels.push(("rho_in", "PRIVATE"));
+        labels.push(("sender_id_in", "PRIVATE"));
+        for _ in 0..depth {
+            labels.push(("pos_bit", "PRIVATE"));
+        }
+        for _ in 0..depth {
+            labels.push(("sibling", "PRIVATE"));
+        }
+        labels.push(("nullifier", "PUBLIC"));
+    }
+
+    // Withdraw + n_out.
     labels.push(("withdraw_amount", "PUBLIC"));
     labels.push(("n_out", "PUBLIC"));
 
-    // outputs [11+2*depth + 4*j + 0..3]
-    for j in 0..n_out {
-        let _ = j; // suppress unused warning
+    // Outputs.
+    for _j in 0..n_out {
         labels.push(("value_out", "PRIVATE"));
         labels.push(("rho_out", "PRIVATE"));
-        labels.push(("pk_out", "PRIVATE"));
+        labels.push(("pk_spend_out", "PRIVATE"));
+        labels.push(("pk_ivk_out", "PRIVATE"));
         labels.push(("cm_out", "PUBLIC"));
+    }
+
+    // inv_enforce witness (PRIVATE) - present even when there are no viewers.
+    labels.push(("inv_enforce", "PRIVATE"));
+
+    // Optional viewer attestations (Level B).
+    if labels.len() < args.len() {
+        labels.push(("n_viewers", "PUBLIC"));
+        let n_viewers_idx1 = labels.len();
+        let n_viewers = arg_u64(args, n_viewers_idx1).ok().unwrap_or(0) as usize;
+        for _v in 0..n_viewers {
+            labels.push(("fvk_commit", "PUBLIC"));
+            labels.push(("fvk", "PRIVATE"));
+            for _j in 0..n_out {
+                labels.push(("ct_hash", "PUBLIC"));
+                labels.push(("mac", "PUBLIC"));
+            }
+        }
     }
 
     labels
 }
 
 /// Print arguments with labels when verbose mode is on.
-fn print_labeled_args(args: &[LigeroArg], depth: usize, n_out: usize, use_case: NoteSpendUseCase) {
-    let labels = arg_labels(depth, n_out, use_case);
+fn print_labeled_args(args: &[LigeroArg], use_case: NoteSpendUseCase) {
+    let labels = arg_labels(args, use_case);
     let title = format!("{} ARGUMENTS", use_case.label().to_uppercase());
     println!();
-    println!("┌────────────────────────────────────────────────────────────────────────────────────┐");
+    println!(
+        "┌────────────────────────────────────────────────────────────────────────────────────┐"
+    );
     println!("│ {:<82} │", title);
-    println!("├─────┬──────────────────┬─────────┬─────────────────────────────────────────────────┤");
-    println!("│ Idx │ Name             │ Visible │ Value                                           │");
-    println!("├─────┼──────────────────┼─────────┼─────────────────────────────────────────────────┤");
+    println!(
+        "├─────┬──────────────────┬─────────┬─────────────────────────────────────────────────┤"
+    );
+    println!(
+        "│ Idx │ Name             │ Visible │ Value                                           │"
+    );
+    println!(
+        "├─────┼──────────────────┼─────────┼─────────────────────────────────────────────────┤"
+    );
 
     for (i, arg) in args.iter().enumerate() {
         let (name, vis) = labels.get(i).copied().unwrap_or(("unknown", "?"));
-        // Display PRIVATE values in redacted form so logs/tables match what the verifier sees.
-        let display_arg = if vis == "PRIVATE" {
-            redact_arg(arg)
+        let value_str = if vis == "PRIVATE" {
+            "<redacted>".to_string()
         } else {
-            arg.clone()
-        };
-
-        let value_str = match display_arg {
-            LigeroArg::Hex { hex } => {
-                if hex.len() > 20 {
-                    format!("0x{}...{}", &hex[..8], &hex[hex.len()-8..])
-                } else {
-                    format!("0x{}", hex)
+            match arg.clone() {
+                LigeroArg::Hex { hex } => {
+                    if hex.len() > 20 {
+                        format!("0x{}...{}", &hex[..8], &hex[hex.len() - 8..])
+                    } else {
+                        format!("0x{}", hex)
+                    }
                 }
-            }
-            LigeroArg::I64 { i64: v } => format!("{}", v),
-            LigeroArg::String { str: s } => {
-                if s.len() > 24 {
-                    format!("{}...{}", &s[..12], &s[s.len()-8..])
-                } else {
-                    s.clone()
+                LigeroArg::I64 { i64: v } => format!("{}", v),
+                LigeroArg::String { str: s } => {
+                    if s.len() > 24 {
+                        format!("{}...{}", &s[..12], &s[s.len() - 8..])
+                    } else {
+                        s.clone()
+                    }
                 }
             }
         };
@@ -481,7 +516,9 @@ fn print_labeled_args(args: &[LigeroArg], depth: usize, n_out: usize, use_case: 
         );
     }
 
-    println!("└─────┴──────────────────┴─────────┴─────────────────────────────────────────────────┘");
+    println!(
+        "└─────┴──────────────────┴─────────┴─────────────────────────────────────────────────┘"
+    );
     println!();
 }
 
@@ -503,23 +540,31 @@ fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"MT_NODE_V1", &[&lvl, left, right])
 }
 
-fn note_commitment(domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash32) -> Hash32 {
+fn note_commitment(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> Hash32 {
     // Guest encodes value as 16-byte LE (u64 zero-extended to 16 bytes).
     let mut v16 = [0u8; 16];
     v16[..8].copy_from_slice(&value.to_le_bytes());
-    poseidon2_hash_domain(b"NOTE_V1", &[domain, &v16, rho, recipient])
+    poseidon2_hash_domain(b"NOTE_V2", &[domain, &v16, rho, recipient, sender_id])
 }
 
 fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PK_V1", &[spend_sk])
 }
 
-fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
-    poseidon2_hash_domain(b"ADDR_V1", &[domain, pk])
+fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"ADDR_V2", &[domain, pk_spend, pk_ivk])
 }
 
-fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    recipient_from_pk(domain, &pk_from_sk(spend_sk))
+fn ivk_seed(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    // Wallet-side this would be clamped and base-multiplied (X25519) to get a real pk_ivk,
+    // but the circuit treats `pk_ivk` as an opaque 32-byte value and only binds it into ADDR_V2.
+    poseidon2_hash_domain(b"IVK_SEED_V1", &[domain, spend_sk])
 }
 
 fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
@@ -528,6 +573,108 @@ fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
 
 fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PRF_NF_V1", &[domain, nf_key, rho])
+}
+
+fn fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
+    let mut fr = Bn254Fr::new();
+    fr.set_bytes_big(h);
+    fr
+}
+
+fn compute_inv_enforce(
+    in_values: &[u64],
+    in_rhos: &[Hash32],
+    out_values: &[u64],
+    out_rhos: &[Hash32],
+) -> Result<Hash32> {
+    let mut prod = Bn254Fr::from_u32(1);
+
+    for &v in in_values {
+        prod.mulmod_checked(&Bn254Fr::from_u64(v));
+    }
+    for &v in out_values {
+        prod.mulmod_checked(&Bn254Fr::from_u64(v));
+    }
+
+    // Π(rho_out - rho_in)
+    for out_rho in out_rhos {
+        let out_fr = fr_from_hash32_be(out_rho);
+        for in_rho in in_rhos {
+            let in_fr = fr_from_hash32_be(in_rho);
+            let mut delta = out_fr.clone();
+            delta.submod_checked(&in_fr);
+            prod.mulmod_checked(&delta);
+        }
+    }
+
+    // (rho_out0 - rho_out1) when n_out == 2.
+    if out_rhos.len() == 2 {
+        let out0 = fr_from_hash32_be(&out_rhos[0]);
+        let out1 = fr_from_hash32_be(&out_rhos[1]);
+        let mut delta = out0.clone();
+        delta.submod_checked(&out1);
+        prod.mulmod_checked(&delta);
+    }
+
+    anyhow::ensure!(
+        !prod.is_zero(),
+        "inv_enforce undefined: enforce product is zero (zero value or rho reuse)"
+    );
+    let mut inv = prod.clone();
+    inv.inverse();
+    Ok(inv.to_bytes_be())
+}
+
+// === Viewer attestation helpers (must match the guest program) ===
+
+fn fvk_commit(fvk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"FVK_COMMIT_V1", &[fvk])
+}
+
+fn view_kdf(fvk: &Hash32, cm: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_KDF_V1", &[fvk, cm])
+}
+
+fn stream_block(k: &Hash32, ctr: u32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_STREAM_V1", &[k, &ctr.to_le_bytes()])
+}
+
+fn stream_xor_encrypt_144(k: &Hash32, pt: &[u8; 144]) -> [u8; 144] {
+    let mut ct = [0u8; 144];
+    for ctr in 0u32..5u32 {
+        let ks = stream_block(k, ctr);
+        let off = (ctr as usize) * 32;
+        let take = core::cmp::min(32, 144 - off);
+        for i in 0..take {
+            ct[off + i] = pt[off + i] ^ ks[i];
+        }
+    }
+    ct
+}
+
+fn ct_hash(ct: &[u8; 144]) -> Hash32 {
+    poseidon2_hash_domain(b"CT_HASH_V1", &[ct])
+}
+
+fn view_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_MAC_V1", &[k, cm, ct_h])
+}
+
+fn encode_note_plain(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> [u8; 144] {
+    let mut out = [0u8; 144];
+    out[0..32].copy_from_slice(domain);
+    out[32..40].copy_from_slice(&value.to_le_bytes());
+    // out[40..48] is already zero (u64 zero-extended to 16 bytes).
+    out[48..80].copy_from_slice(rho);
+    out[80..112].copy_from_slice(recipient);
+    out[112..144].copy_from_slice(sender_id);
+    out
 }
 
 struct MerkleTree {
@@ -579,53 +726,78 @@ impl MerkleTree {
     }
 }
 
-fn private_indices_note_spend(depth: usize, use_case: NoteSpendUseCase) -> Vec<usize> {
+fn private_indices_note_spend(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
     // NOTE: `private-indices` are 1-based indices into the args list (excluding argv[0]).
     //
-    // This matches the guest's documented layout in:
-    // `utils/circuits/note-spend/src/main.rs` (see top-of-file comment).
-    //
-    // Private (witness), by use case:
-    // - Deposit: rho, recipient, spend_sk, path, outputs (value/rho/pk)
-    // - Transfer: value, rho, recipient, spend_sk, path, outputs (value/rho/pk)
-    // - Withdraw: value, rho, recipient, spend_sk, path, change output (value/rho/pk)
-    let n_out = use_case.n_out();
+    // This matches `utils/circuits/note-spend/src/main.rs` v2 ABI:
+    //   [1] domain (PUB)
+    //   [2] spend_sk (PRIV)
+    //   [3] pk_ivk_owner (PRIV)
+    //   [4] depth (PUB)
+    //   [5] anchor (PUB)
+    //   [6] n_in (PUB)
+    //   For each input i:
+    //     value_in_i     (PRIV)
+    //     rho_in_i       (PRIV)
+    //     sender_id_in_i (PRIV)
+    //     pos_bits       (PRIV) × depth
+    //     siblings       (PRIV) × depth
+    //     nullifier_i    (PUB)
+    //   withdraw_amount (PUB)
+    //   n_out           (PUB)
+    //   For each output j:
+    //     value_out_j    (PRIV)
+    //     rho_out_j      (PRIV)
+    //     pk_spend_out_j (PRIV)
+    //     pk_ivk_out_j   (PRIV)
+    //     cm_out_j       (PUB)
+    //   inv_enforce     (PRIV)
     let mut idx = Vec::new();
+    idx.push(2); // spend_sk
+    idx.push(3); // pk_ivk_owner
 
-    // value is private for transfer/withdraw, public for deposit.
-    if matches!(use_case, NoteSpendUseCase::Transfer | NoteSpendUseCase::Withdraw) {
-        idx.push(2); // value
+    let per_in = 4 + 2 * depth; // value + rho + sender_id + pos_bits[depth] + siblings[depth] + nullifier
+    for i in 0..n_in {
+        let base = 7 + i * per_in;
+        idx.push(base); // value_in_i
+        idx.push(base + 1); // rho_in_i
+        idx.push(base + 2); // sender_id_in_i
+
+        // pos_bits_i
+        for k in 0..depth {
+            idx.push(base + 3 + k);
+        }
+
+        // siblings_i
+        for k in 0..depth {
+            idx.push(base + 3 + depth + k);
+        }
+
+        // nullifier_i is public (base + 3 + 2*depth)
     }
 
-    idx.push(3); // rho
-    idx.push(4); // recipient
-    idx.push(5); // spend_sk
-
-    // pos_bits
-    for i in 0..depth {
-        idx.push(7 + i);
-    }
-    // siblings
-    for i in 0..depth {
-        idx.push(7 + depth + i);
-    }
-
-    // outputs
-    let outs_base = 11 + 2 * depth; // index of value_out_0
+    // Outputs start after withdraw_amount + n_out.
+    let withdraw_idx = 7 + n_in * per_in;
+    let outs_base = withdraw_idx + 2;
     for j in 0..n_out {
-        idx.push(outs_base + 4 * j + 0); // value_out_j
-        idx.push(outs_base + 4 * j + 1); // rho_out_j
-        idx.push(outs_base + 4 * j + 2); // pk_out_j
-        // cm_out_j is public (outs_base + 4*j + 3)
+        idx.push(outs_base + 5 * j + 0); // value_out_j
+        idx.push(outs_base + 5 * j + 1); // rho_out_j
+        idx.push(outs_base + 5 * j + 2); // pk_spend_out_j
+        idx.push(outs_base + 5 * j + 3); // pk_ivk_out_j
+                                         // cm_out_j is public (outs_base + 5*j + 4)
     }
+
+    // inv_enforce comes right after the outputs.
+    idx.push(outs_base + 5 * n_out);
 
     idx
 }
 
 fn private_indices_note_deposit() -> Vec<usize> {
     // Deposit circuit ABI:
-    // 1 domain (PUB), 2 value (PUB), 3 rho (PRIV), 4 recipient (PRIV), 5 cm_out (PUB)
-    vec![3, 4]
+    // 1 domain (PUB), 2 value (PUB), 3 rho (PRIV),
+    // 4 pk_spend_recipient (PRIV), 5 pk_ivk_recipient (PRIV), 6 cm_out (PUB)
+    vec![3, 4, 5]
 }
 
 fn maybe_build_note_spend_guest(repo: &Path) -> Result<()> {
@@ -693,19 +865,31 @@ fn build_deposit_statement(run: u8, domain: Hash32, value: u64) -> Result<Vec<Li
 
     let mut spend_sk: Hash32 = [4u8; 32];
     spend_sk[0] = spend_sk[0].wrapping_add(run);
-    let recipient = recipient_from_sk(&domain, &spend_sk);
+    let pk_spend = pk_from_sk(&spend_sk);
+    let pk_ivk = ivk_seed(&domain, &spend_sk);
+    let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
 
-    let cm_out = note_commitment(&domain, value, &rho, &recipient);
+    let sender_id = [0u8; 32];
+    let cm_out = note_commitment(&domain, value, &rho, &recipient, &sender_id);
 
     Ok(vec![
         LigeroArg::Hex { hex: hx32(&domain) },
         LigeroArg::I64 { i64: value as i64 },
         LigeroArg::Hex { hex: hx32(&rho) },
-        LigeroArg::Hex {
-            hex: hx32(&recipient),
-        },
+        LigeroArg::Hex { hex: hx32(&pk_spend) },
+        LigeroArg::Hex { hex: hx32(&pk_ivk) },
         LigeroArg::Hex { hex: hx32(&cm_out) },
     ])
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NoteSpendPublicSummary {
+    anchor: Hash32,
+    nullifiers: Vec<Hash32>,
+    cm_outs: Vec<Hash32>,
+    withdraw_amount: u64,
+    n_in: usize,
+    n_out: usize,
 }
 
 /// Build one statement (args) plus a small public summary for sanity checks.
@@ -716,19 +900,32 @@ fn build_statement(
     value: u64,
     pos: u64,
     use_case: NoteSpendUseCase,
-) -> Result<(Vec<LigeroArg>, (Hash32, Hash32, Vec<Hash32>, u64, usize))> {
-    // Vary public rho (arg[3]) so the statement differs even if you ignore private witness.
+    include_viewers: bool,
+) -> Result<(Vec<LigeroArg>, NoteSpendPublicSummary, Vec<usize>)> {
+    anyhow::ensure!(
+        !matches!(use_case, NoteSpendUseCase::Deposit),
+        "deposit uses note-deposit guest; build_statement is for spend (transfer/withdraw)"
+    );
+
+    // Keep `n_in` and `n_out` constant across runs so the `private-indices` layout is identical.
+    let n_in: usize = 1;
+    let n_out: usize = use_case.n_out();
+
+    // Vary private rho/spend_sk per run so the public statement differs (anchor/nf/cm_outs).
     let mut rho: Hash32 = [2u8; 32];
     rho[0] = rho[0].wrapping_add(run);
 
-    // Vary private spend_sk (arg[5]) so witness differs too.
     let mut spend_sk: Hash32 = [4u8; 32];
     spend_sk[0] = spend_sk[0].wrapping_add(run);
 
-    // Keep `n_out` constant across runs so `private-indices` layout is identical.
-    let n_out: usize = use_case.n_out();
+    let pk_ivk_owner = ivk_seed(&domain, &spend_sk);
+    let pk_spend_owner = pk_from_sk(&spend_sk);
+    let recipient_owner = recipient_from_pk(&domain, &pk_spend_owner, &pk_ivk_owner);
+    let sender_id = recipient_owner;
+    let mut sender_id_in: Hash32 = [6u8; 32];
+    sender_id_in[0] = sender_id_in[0].wrapping_add(run);
+
     let (withdraw_amount, out_values): (u64, Vec<u64>) = match use_case {
-        NoteSpendUseCase::Deposit => (0, vec![value]),
         NoteSpendUseCase::Transfer => {
             let out0 = (value / 3).max(1);
             let out1 = value
@@ -743,78 +940,157 @@ fn build_statement(
                 .context("value must be >= withdraw_amount")?;
             (withdraw_amount, vec![change_value])
         }
+        NoteSpendUseCase::Deposit => unreachable!("guarded above"),
     };
 
-    let recipient = recipient_from_sk(&domain, &spend_sk);
+    // Input note (single-input spend for the bench).
     let nf_key = nf_key_from_sk(&domain, &spend_sk);
-
-    let cm_in = note_commitment(&domain, value, &rho, &recipient);
+    let cm_in = note_commitment(&domain, value, &rho, &recipient_owner, &sender_id_in);
     let mut tree = MerkleTree::new(depth);
     tree.set_leaf(pos as usize, cm_in);
     let anchor = tree.root();
     let siblings = tree.open(pos as usize);
     let nf = nullifier(&domain, &nf_key, &rho);
 
-    // Outputs: value/rho/pk are private; cm_out is public.
+    // Outputs: (value, rho, pk_spend, pk_ivk) are private; cm_out is public.
     let mut cm_outs: Vec<Hash32> = Vec::with_capacity(n_out);
-    let mut out_triples: Vec<(u64, Hash32, Hash32, Hash32)> = Vec::with_capacity(n_out);
-    for (j, out_value) in out_values.into_iter().enumerate() {
+    let mut out_rhos: Vec<Hash32> = Vec::with_capacity(n_out);
+    let mut out_triples: Vec<(u64, Hash32, Hash32, Hash32, Hash32, Hash32)> =
+        Vec::with_capacity(n_out);
+    for (j, out_value) in out_values.iter().copied().enumerate() {
         let mut out_rho: Hash32 = [7u8; 32];
         out_rho[0] = out_rho[0].wrapping_add(run);
         out_rho[1] = out_rho[1].wrapping_add(j as u8);
 
-        let mut out_spend_sk: Hash32 = [8u8; 32];
-        out_spend_sk[0] = out_spend_sk[0].wrapping_add(run);
-        out_spend_sk[1] = out_spend_sk[1].wrapping_add(j as u8);
+        let (out_pk_spend, out_pk_ivk, out_recipient) = match use_case {
+            // Change outputs go back to the spender (self).
+            NoteSpendUseCase::Withdraw => (pk_spend_owner, pk_ivk_owner, recipient_owner),
+            NoteSpendUseCase::Transfer if j == 1 => (pk_spend_owner, pk_ivk_owner, recipient_owner),
+            _ => {
+                let mut out_spend_sk: Hash32 = [8u8; 32];
+                out_spend_sk[0] = out_spend_sk[0].wrapping_add(run);
+                out_spend_sk[1] = out_spend_sk[1].wrapping_add(j as u8);
 
-        let out_pk = pk_from_sk(&out_spend_sk);
-        let out_recipient = recipient_from_pk(&domain, &out_pk);
-        let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
+                let pk_spend = pk_from_sk(&out_spend_sk);
+                let pk_ivk = ivk_seed(&domain, &out_spend_sk);
+                let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
+                (pk_spend, pk_ivk, recipient)
+            }
+        };
+        let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient, &sender_id);
+
         cm_outs.push(cm_out);
-        out_triples.push((out_value, out_rho, out_pk, cm_out));
+        out_rhos.push(out_rho);
+        out_triples.push((out_value, out_rho, out_pk_spend, out_pk_ivk, out_recipient, cm_out));
     }
 
-    let mut args: Vec<LigeroArg> = Vec::new();
-    args.push(LigeroArg::Hex { hex: hx32(&domain) });
-    args.push(LigeroArg::I64 { i64: value as i64 });
-    args.push(LigeroArg::Hex { hex: hx32(&rho) });
-    args.push(LigeroArg::Hex { hex: hx32(&recipient) });
-    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) });
-    args.push(LigeroArg::I64 { i64: depth as i64 });
+    let in_rhos = [rho];
+    let inv_enforce = compute_inv_enforce(&[value], &in_rhos, &out_values, &out_rhos)?;
 
+    // --- Build args for note_spend_guest v2 layout ---
+    let mut args: Vec<LigeroArg> = Vec::new();
+    args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1 domain (PUB)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&spend_sk),
+    }); // 2 spend_sk (PRIV)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 pk_ivk_owner (PRIV)
+    args.push(LigeroArg::I64 { i64: depth as i64 }); // 4 depth (PUB)
+    args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 anchor (PUB)
+    args.push(LigeroArg::I64 { i64: n_in as i64 }); // 6 n_in (PUB)
+
+    // Input 0 (value, rho, sender_id_in, pos_bits[depth], siblings[depth], nullifier)
+    args.push(LigeroArg::I64 { i64: value as i64 }); // value_in_0 (PRIV)
+    args.push(LigeroArg::Hex { hex: hx32(&rho) }); // rho_in_0 (PRIV)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&sender_id_in),
+    }); // sender_id_in_0 (PRIV)
     for lvl in 0..depth {
         let bit = ((pos >> lvl) & 1) as u8;
         let mut bit_bytes = [0u8; 32];
         bit_bytes[31] = bit;
-        args.push(LigeroArg::Hex { hex: hx32(&bit_bytes) });
+        args.push(LigeroArg::Hex {
+            hex: hx32(&bit_bytes),
+        }); // pos_bit_0_l
     }
-
     for s in &siblings {
-        args.push(LigeroArg::Hex { hex: hx32(s) });
+        args.push(LigeroArg::Hex { hex: hx32(s) }); // sibling_0_l
     }
+    args.push(LigeroArg::Hex { hex: hx32(&nf) }); // nullifier_0 (PUB)
 
-    args.push(LigeroArg::String {
-        str: format!("0x{}", hx32(&anchor)),
-    });
-    args.push(LigeroArg::String {
-        str: format!("0x{}", hx32(&nf)),
-    });
-
+    // Withdraw + outputs.
     args.push(LigeroArg::I64 {
         i64: withdraw_amount as i64,
     });
     args.push(LigeroArg::I64 { i64: n_out as i64 });
 
-    for (out_value, out_rho, out_pk, cm_out) in out_triples {
+    for (out_value, out_rho, out_pk_spend, out_pk_ivk, _out_recipient, cm_out) in out_triples.iter()
+    {
         args.push(LigeroArg::I64 {
-            i64: out_value as i64,
+            i64: *out_value as i64,
         });
-        args.push(LigeroArg::Hex { hex: hx32(&out_rho) });
-        args.push(LigeroArg::Hex { hex: hx32(&out_pk) });
-        args.push(LigeroArg::Hex { hex: hx32(&cm_out) });
+        args.push(LigeroArg::Hex {
+            hex: hx32(out_rho),
+        });
+        args.push(LigeroArg::Hex {
+            hex: hx32(out_pk_spend),
+        });
+        args.push(LigeroArg::Hex {
+            hex: hx32(out_pk_ivk),
+        });
+        args.push(LigeroArg::Hex { hex: hx32(cm_out) });
     }
 
-    Ok((args, (anchor, nf, cm_outs, withdraw_amount, n_out)))
+    // inv_enforce (PRIVATE) - witness that enforces nonzero values + rho uniqueness constraints.
+    args.push(LigeroArg::Hex {
+        hex: hx32(&inv_enforce),
+    });
+
+    let mut keep_private_indices: Vec<usize> = Vec::new();
+    if include_viewers {
+        // Add 1 viewer attestation (fvk is private; digests are public).
+        let n_viewers: u64 = 1;
+        let mut fvk: Hash32 = [11u8; 32];
+        fvk[0] = fvk[0].wrapping_add(run);
+        let fvk_commitment = fvk_commit(&fvk);
+
+        args.push(LigeroArg::I64 {
+            i64: n_viewers as i64,
+        }); // n_viewers (pub)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&fvk_commitment),
+        }); // fvk_commit (pub)
+
+        let fvk_idx1 = args.len() + 1;
+        args.push(LigeroArg::Hex { hex: hx32(&fvk) }); // fvk (priv)
+        keep_private_indices.push(fvk_idx1);
+
+        for (out_value, out_rho, _out_pk_spend, _out_pk_ivk, out_recipient, cm_out) in out_triples
+        {
+            let k = view_kdf(&fvk, &cm_out);
+            let pt = encode_note_plain(&domain, out_value, &out_rho, &out_recipient, &sender_id);
+            let ct = stream_xor_encrypt_144(&k, &pt);
+            let ct_h = ct_hash(&ct);
+            let mac = view_mac(&k, &cm_out, &ct_h);
+
+            args.push(LigeroArg::Hex { hex: hx32(&ct_h) }); // ct_hash (pub)
+            args.push(LigeroArg::Hex { hex: hx32(&mac) }); // mac (pub)
+        }
+    }
+
+    Ok((
+        args,
+        NoteSpendPublicSummary {
+            anchor,
+            nullifiers: vec![nf],
+            cm_outs,
+            withdraw_amount,
+            n_in,
+            n_out,
+        },
+        keep_private_indices,
+    ))
 }
 
 #[test]
@@ -860,12 +1136,18 @@ fn test_note_spend_daemon_bench() -> Result<()> {
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
     println!("[daemon] Prover:   {}", runner.paths().prover_bin.display());
-    println!("[daemon] Verifier: {}", runner.paths().verifier_bin.display());
+    println!(
+        "[daemon] Verifier: {}",
+        runner.paths().verifier_bin.display()
+    );
     println!("[daemon] Shaders:  {}", shader_dir.display());
     println!("[daemon] Program:  {}", program.display());
     println!("[daemon] Packing:  {}", packing);
@@ -878,11 +1160,13 @@ fn test_note_spend_daemon_bench() -> Result<()> {
     let use_case = NoteSpendUseCase::Transfer;
 
     let mut configs: Vec<serde_json::Value> = Vec::new();
-    let mut public_summaries: Vec<(Hash32, Hash32, Vec<Hash32>, u64, usize)> = Vec::new();
+    let mut public_summaries: Vec<NoteSpendPublicSummary> = Vec::new();
 
     for run in 0..3u8 {
-        let (args, summary) = build_statement(run, depth, domain, value, pos, use_case)?;
-        runner.config_mut().private_indices = private_indices_note_spend(depth, use_case);
+        let (args, summary, _keep_priv_idx) =
+            build_statement(run, depth, domain, value, pos, use_case, false)?;
+        runner.config_mut().private_indices =
+            private_indices_note_spend(depth, summary.n_in, summary.n_out);
         runner.config_mut().args = args;
         let cfg_val = serde_json::to_value(runner.config()).context("Failed to to_value config")?;
         configs.push(cfg_val);
@@ -1074,23 +1358,34 @@ fn run_note_spend_direct_bench(
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
     let label = use_case.label();
-    let n_out = use_case.n_out();
     let num_runs = read_num_runs();
 
     // Preview run0 statement so the banner can show the exact values used by this test.
-    let (run0_args, run0_priv_idx, run0_summary) = match use_case {
+    let include_viewers =
+        enable_viewers() && matches!(use_case, NoteSpendUseCase::Transfer | NoteSpendUseCase::Withdraw);
+
+    let (run0_args, run0_priv_idx, run0_keep_priv_idx, run0_summary) = match use_case {
         NoteSpendUseCase::Deposit => {
             let args = build_deposit_statement(0, domain, value)?;
-            (args, private_indices_note_deposit(), None)
+            (args, private_indices_note_deposit(), Vec::new(), None)
         }
         NoteSpendUseCase::Transfer | NoteSpendUseCase::Withdraw => {
-            let (args, summary) = build_statement(0, depth, domain, value, pos, use_case)?;
-            (args, private_indices_note_spend(depth, use_case), Some(summary))
+            let (args, summary, keep_priv_idx) =
+                build_statement(0, depth, domain, value, pos, use_case, include_viewers)?;
+            (
+                args,
+                private_indices_note_spend(depth, summary.n_in, summary.n_out),
+                keep_priv_idx,
+                Some(summary),
+            )
         }
     };
 
@@ -1100,56 +1395,115 @@ fn run_note_spend_direct_bench(
     match use_case {
         NoteSpendUseCase::Deposit => {
             let rho = arg_hash32(&run0_args, 3)?;
-            let recipient = arg_hash32(&run0_args, 4)?;
-            let cm_out = arg_hash32(&run0_args, 5)?;
+            let pk_spend_recipient = arg_hash32(&run0_args, 4)?;
+            let pk_ivk_recipient = arg_hash32(&run0_args, 5)?;
+            let recipient = recipient_from_pk(&domain, &pk_spend_recipient, &pk_ivk_recipient);
+            let cm_out = arg_hash32(&run0_args, 6)?;
 
             banner_lines.push(format!(
                 "Run0: domain={}, value(pub)={}",
                 hx32_short(&domain),
                 value
             ));
-            banner_lines.push(format!("Run0 destination(priv): recipient={}", hx32_short(&recipient)));
+            banner_lines.push(format!(
+                "Run0 destination(priv): recipient={}",
+                hx32_short(&recipient),
+            ));
+            banner_lines.push(format!(
+                "Run0 recipient keys(priv): pk_spend={}, pk_ivk={}",
+                hx32_short(&pk_spend_recipient),
+                hx32_short(&pk_ivk_recipient),
+            ));
             banner_lines.push(format!("Run0 private rho={}", hx32_short(&rho)));
             banner_lines.push(format!("Public: cm_out={}", hx32_short(&cm_out)));
             banner_lines.push("Note: transparent origin is outside this proof".to_string());
+            banner_lines.push("Note: sender_id is fixed to 0x00..00".to_string());
 
             print_box("💰 DEPOSIT - Enter the privacy pool", &banner_lines);
         }
         NoteSpendUseCase::Transfer => {
-            let (anchor, nf, cm_outs, withdraw_amount, n_out) = run0_summary
+            let summary = run0_summary
                 .clone()
                 .context("missing run0 summary for transfer")?;
 
-            let sender = arg_hash32(&run0_args, 4)?;
-            let out_base = 11 + 2 * depth;
+            let spend_sk = arg_hash32(&run0_args, 2)?;
+            let pk_ivk_owner = arg_hash32(&run0_args, 3)?;
+            let sender = recipient_from_pk(&domain, &pk_from_sk(&spend_sk), &pk_ivk_owner);
+
+            let per_in = 4 + 2 * depth;
+            let withdraw_idx = 7 + summary.n_in * per_in;
+            let out_base = withdraw_idx + 2;
+
             let out0_value = arg_u64(&run0_args, out_base)?;
-            let out0_pk = arg_hash32(&run0_args, out_base + 2)?;
-            let out0_recipient = recipient_from_pk(&domain, &out0_pk);
-            let out1_value = arg_u64(&run0_args, out_base + 4)?;
-            let out1_pk = arg_hash32(&run0_args, out_base + 6)?;
-            let out1_recipient = recipient_from_pk(&domain, &out1_pk);
+            let out0_pk_spend = arg_hash32(&run0_args, out_base + 2)?;
+            let out0_pk_ivk = arg_hash32(&run0_args, out_base + 3)?;
+            let out0_recipient = recipient_from_pk(&domain, &out0_pk_spend, &out0_pk_ivk);
+
+            let out1_value = arg_u64(&run0_args, out_base + 5)?;
+            let out1_pk_spend = arg_hash32(&run0_args, out_base + 7)?;
+            let out1_pk_ivk = arg_hash32(&run0_args, out_base + 8)?;
+            let out1_recipient = recipient_from_pk(&domain, &out1_pk_spend, &out1_pk_ivk);
 
             banner_lines.push(format!(
-                "Run0: domain={}, depth(pub)={depth}, pos(priv)={pos}, in_value(priv)={value}",
-                hx32_short(&domain)
+                "Run0: domain={}, depth(pub)={depth}, n_in(pub)={}, pos0(priv)={pos}, in0_value(priv)={value}",
+                hx32_short(&domain),
+                summary.n_in
             ));
+            banner_lines.push(
+                "Note: PRIVATE args are redacted in the args table and verifier output".to_string(),
+            );
             banner_lines.push(format!("Run0 origin(priv): sender={}", hx32_short(&sender)));
-            banner_lines.push(format!(
-                "Run0 destinations(priv): {out0_value}→{}, {out1_value}→{}",
-                hx32_short(&out0_recipient),
-                hx32_short(&out1_recipient)
-            ));
-            banner_lines.push(format!("Public: withdraw_amount(pub)={withdraw_amount}, n_out(pub)={n_out}"));
-            banner_lines.push(format!(
-                "Public: anchor={}, nf={}",
-                hx32_short(&anchor),
-                hx32_short(&nf)
-            ));
-            if cm_outs.len() == 2 {
+
+            if out1_recipient == sender {
                 banner_lines.push(format!(
-                    "Public: cm_out0={}, cm_out1={}",
-                    hx32_short(&cm_outs[0]),
-                    hx32_short(&cm_outs[1])
+                    "Run0 destinations(priv): pay {out0_value}→{}, change {out1_value}→self({})",
+                    hx32_short(&out0_recipient),
+                    hx32_short(&sender),
+                ));
+            } else {
+                banner_lines.push(format!(
+                    "Run0 destinations(priv): pay {out0_value}→{}, change {out1_value}→{}",
+                    hx32_short(&out0_recipient),
+                    hx32_short(&out1_recipient),
+                ));
+            }
+
+            banner_lines.push(format!(
+                "Public: withdraw_amount(pub)={}, n_out(pub)={}",
+                summary.withdraw_amount, summary.n_out
+            ));
+            banner_lines.push(format!(
+                "Public: anchor={}, nf0={}",
+                hx32_short(&summary.anchor),
+                hx32_short(
+                    summary
+                        .nullifiers
+                        .first()
+                        .context("missing nullifier in summary")?
+                )
+            ));
+            banner_lines.push(format!(
+                "Public: cm_out0={}, cm_out1={}",
+                hx32_short(
+                    summary
+                        .cm_outs
+                        .first()
+                        .context("missing cm_out0 in summary")?
+                ),
+                hx32_short(
+                    summary
+                        .cm_outs
+                        .get(1)
+                        .context("missing cm_out1 in summary")?
+                )
+            ));
+            if include_viewers {
+                let idx_n_viewers = out_base + 5 * summary.n_out + 1; // skip inv_enforce
+                let n_viewers = arg_u64(&run0_args, idx_n_viewers)?;
+                let fvk_commit = arg_hash32(&run0_args, idx_n_viewers + 1)?;
+                banner_lines.push(format!(
+                    "Viewer(pub): n_viewers={n_viewers}, fvk_commit={}",
+                    hx32_short(&fvk_commit)
                 ));
             }
             if num_runs > 1 {
@@ -1159,36 +1513,78 @@ fn run_note_spend_direct_bench(
             print_box("🔒 TRANSFER - Fully private transaction", &banner_lines);
         }
         NoteSpendUseCase::Withdraw => {
-            let (anchor, nf, cm_outs, withdraw_amount, n_out) = run0_summary
+            let summary = run0_summary
                 .clone()
                 .context("missing run0 summary for withdraw")?;
 
-            let sender = arg_hash32(&run0_args, 4)?;
-            let out_base = 11 + 2 * depth;
+            let spend_sk = arg_hash32(&run0_args, 2)?;
+            let pk_ivk_owner = arg_hash32(&run0_args, 3)?;
+            let sender = recipient_from_pk(&domain, &pk_from_sk(&spend_sk), &pk_ivk_owner);
+
+            let per_in = 4 + 2 * depth;
+            let withdraw_idx = 7 + summary.n_in * per_in;
+            let out_base = withdraw_idx + 2;
+
             let change_value = arg_u64(&run0_args, out_base)?;
-            let change_pk = arg_hash32(&run0_args, out_base + 2)?;
-            let change_recipient = recipient_from_pk(&domain, &change_pk);
+            let change_pk_spend = arg_hash32(&run0_args, out_base + 2)?;
+            let change_pk_ivk = arg_hash32(&run0_args, out_base + 3)?;
+            let change_recipient = recipient_from_pk(&domain, &change_pk_spend, &change_pk_ivk);
 
             banner_lines.push(format!(
-                "Run0: domain={}, depth(pub)={depth}, pos(priv)={pos}",
-                hx32_short(&domain)
+                "Run0: domain={}, depth(pub)={depth}, n_in(pub)={}, pos0(priv)={pos}",
+                hx32_short(&domain),
+                summary.n_in
             ));
+            banner_lines.push(
+                "Note: PRIVATE args are redacted in the args table and verifier output".to_string(),
+            );
             banner_lines.push(format!(
-                "Run0: in(priv)={value}, withdraw(pub)={withdraw_amount}, change(priv)={change_value}"
+                "Run0: in0(priv)={value}, withdraw(pub)={}, change(priv)={change_value}",
+                summary.withdraw_amount
             ));
             banner_lines.push(format!("Run0 origin(priv): sender={}", hx32_short(&sender)));
+
+            if change_recipient == sender {
+                banner_lines.push(format!(
+                    "Run0 change destination(priv): {change_value}→self({})",
+                    hx32_short(&sender),
+                ));
+            } else {
+                banner_lines.push(format!(
+                    "Run0 change destination(priv): {change_value}→{}",
+                    hx32_short(&change_recipient)
+                ));
+            }
+            banner_lines
+                .push("Note: transparent withdraw recipient is outside this proof".to_string());
             banner_lines.push(format!(
-                "Run0 change destination(priv): {change_value}→{}",
-                hx32_short(&change_recipient)
+                "Public: anchor={}, nf0={}, n_out(pub)={}",
+                hx32_short(&summary.anchor),
+                hx32_short(
+                    summary
+                        .nullifiers
+                        .first()
+                        .context("missing nullifier in summary")?
+                ),
+                summary.n_out
             ));
-            banner_lines.push("Note: transparent withdraw recipient is outside this proof".to_string());
             banner_lines.push(format!(
-                "Public: anchor={}, nf={}, n_out(pub)={n_out}",
-                hx32_short(&anchor),
-                hx32_short(&nf)
+                "Public: cm_out0={}",
+                hx32_short(
+                    summary
+                        .cm_outs
+                        .first()
+                        .context("missing cm_out0 in summary")?
+                )
             ));
-            if cm_outs.len() == 1 {
-                banner_lines.push(format!("Public: cm_out0={}", hx32_short(&cm_outs[0])));
+            if include_viewers {
+                let idx_n_viewers = out_base + 5 * summary.n_out + 1; // skip inv_enforce
+                let n_viewers = arg_u64(&run0_args, idx_n_viewers)?;
+                let fvk_commit = arg_hash32(&run0_args, idx_n_viewers + 1)?;
+                banner_lines.push(format!(
+                    "Viewer(pub): n_viewers={n_viewers}, fvk_commit={}",
+                    hx32_short(&fvk_commit)
+                ));
             }
             if num_runs > 1 {
                 banner_lines.push("Other runs vary secrets for binding test".to_string());
@@ -1199,8 +1595,14 @@ fn run_note_spend_direct_bench(
     }
     println!();
 
-    println!("[{label}] Prover:   {}", runner.paths().prover_bin.display());
-    println!("[{label}] Verifier: {}", runner.paths().verifier_bin.display());
+    println!(
+        "[{label}] Prover:   {}",
+        runner.paths().prover_bin.display()
+    );
+    println!(
+        "[{label}] Verifier: {}",
+        runner.paths().verifier_bin.display()
+    );
     println!("[{label}] Shaders:  {}", shader_dir.display());
     println!("[{label}] Program:  {}", program.display());
     println!("[{label}] Packing:  {}", packing);
@@ -1211,33 +1613,45 @@ fn run_note_spend_direct_bench(
     let mut proofs: Vec<Vec<u8>> = Vec::new();
     let mut configs: Vec<Vec<LigeroArg>> = Vec::new();
     let mut all_priv_idx: Vec<Vec<usize>> = Vec::new();
+    let mut all_keep_priv_idx: Vec<Vec<usize>> = Vec::new();
     let mut last_prover_stdout = String::new();
     let mut last_prover_time = Duration::default();
     let mut last_proof_size = 0usize;
 
     for run in 0..num_runs {
-        let (args, priv_idx) = if run == 0 {
-            (run0_args.clone(), run0_priv_idx.clone())
+        let (args, mut priv_idx, keep_priv_idx) = if run == 0 {
+            (
+                run0_args.clone(),
+                run0_priv_idx.clone(),
+                run0_keep_priv_idx.clone(),
+            )
         } else {
             match use_case {
                 NoteSpendUseCase::Deposit => {
                     let args = build_deposit_statement(run, domain, value)?;
                     let priv_idx = private_indices_note_deposit();
-                    (args, priv_idx)
+                    (args, priv_idx, Vec::new())
                 }
                 NoteSpendUseCase::Transfer | NoteSpendUseCase::Withdraw => {
-                    let (args, _summary) = build_statement(run, depth, domain, value, pos, use_case)?;
-                    let priv_idx = private_indices_note_spend(depth, use_case);
-                    (args, priv_idx)
+                    let (args, summary, keep_priv_idx) =
+                        build_statement(run, depth, domain, value, pos, use_case, include_viewers)?;
+                    let priv_idx = private_indices_note_spend(depth, summary.n_in, summary.n_out);
+                    (args, priv_idx, keep_priv_idx)
                 }
             }
         };
+
+        // Some circuit extensions require a subset of private inputs to be present for the verifier
+        // binary (e.g. viewer attestations need `fvk` to reconstruct the same instance).
+        priv_idx.extend_from_slice(&keep_priv_idx);
+        priv_idx.sort_unstable();
+        priv_idx.dedup();
         runner.config_mut().private_indices = priv_idx.clone();
         runner.config_mut().args = args.clone();
 
         // Print labeled arguments for first run when verbose
         if run == 0 && is_verbose() {
-            print_labeled_args(&args, depth, n_out, use_case);
+            print_labeled_args(&args, use_case);
         }
 
         let t = Instant::now();
@@ -1272,6 +1686,7 @@ fn run_note_spend_direct_bench(
         proofs.push(proof);
         configs.push(args);
         all_priv_idx.push(priv_idx);
+        all_keep_priv_idx.push(keep_priv_idx);
     }
 
     // Verify the proofs (timed).
@@ -1285,19 +1700,21 @@ fn run_note_spend_direct_bench(
     let mut last_verifier_stdout = String::new();
     let mut last_verifier_time = Duration::default();
 
-    for (i, ((proof, args), priv_idx)) in proofs
+    for (i, (((proof, args), priv_idx), keep_priv_idx)) in proofs
         .iter()
         .zip(configs.iter())
         .zip(all_priv_idx.iter())
+        .zip(all_keep_priv_idx.iter())
         .enumerate()
     {
         let tv = Instant::now();
-        let (ok, vs, ve) = verifier::verify_proof_with_output_in_pool(
+        let (ok, vs, ve) = verifier::verify_proof_with_output_keep_private_args_in_pool(
             &verifier_pool,
             &vpaths,
             proof,
             args.clone(),
             priv_idx.clone(),
+            keep_priv_idx.clone(),
         )?;
         let vd = tv.elapsed();
         last_verifier_time = vd;
@@ -1328,9 +1745,7 @@ fn run_note_spend_direct_bench(
     {
         println!(
             "[{label}] Parsed prover stages: s1={:?}ms s2={:?}ms s3={:?}ms",
-            prover_metrics.stage1_ms,
-            prover_metrics.stage2_ms,
-            prover_metrics.stage3_ms
+            prover_metrics.stage1_ms, prover_metrics.stage2_ms, prover_metrics.stage3_ms
         );
     }
 
@@ -1350,12 +1765,13 @@ fn run_note_spend_direct_bench(
                 if i == j {
                     continue;
                 }
-                match verifier::verify_proof_with_output_in_pool(
+                match verifier::verify_proof_with_output_keep_private_args_in_pool(
                     &verifier_pool,
                     &vpaths,
                     &proofs[i],
                     configs[j].clone(),
                     all_priv_idx[j].clone(),
+                    all_keep_priv_idx[j].clone(),
                 ) {
                     Ok((ok, _vs, _ve)) => {
                         anyhow::ensure!(

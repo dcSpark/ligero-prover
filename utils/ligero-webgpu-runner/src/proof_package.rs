@@ -122,5 +122,3 @@ fn redact_arg_value(v: &mut serde_json::Value) {
     // Unknown structure; set to null
     *v = serde_json::Value::Null;
 }
-
-

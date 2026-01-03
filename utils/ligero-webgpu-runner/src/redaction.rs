@@ -70,5 +70,3 @@ pub fn redacted_args(args: &[LigeroArg], private_indices_1based: &[usize]) -> Ve
     redact_private_args(&mut out, private_indices_1based);
     out
 }
-
-

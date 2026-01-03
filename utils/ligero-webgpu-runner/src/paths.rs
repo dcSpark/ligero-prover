@@ -37,8 +37,8 @@ impl LigeroPaths {
 
 pub(crate) fn discover_paths() -> Result<LigeroPaths> {
     // 1) explicit prover binary override
-    if let Some(prover) = env_path("LIGERO_PROVER_BIN")
-        .or_else(|| env_path("LIGERO_PROVER_BINARY_PATH"))
+    if let Some(prover) =
+        env_path("LIGERO_PROVER_BIN").or_else(|| env_path("LIGERO_PROVER_BINARY_PATH"))
     {
         return Ok(paths_from_prover_bin(&prover));
     }

@@ -7,8 +7,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::LigeroRunner;
 use crate::LigeroProofPackage;
+use crate::LigeroRunner;
 
 /// Core host implementation for Ligero zkVM, suitable for wrapping by Sovereign adapters.
 #[derive(Clone, Debug)]
@@ -63,8 +63,8 @@ impl LigeroHostCore {
     ///
     /// The value is serialized using `bincode` so the verifier can recover it.
     pub fn set_public_output<T: Serialize>(&mut self, value: &T) -> Result<()> {
-        let bytes =
-            bincode::serialize(value).context("Failed to serialize Ligero public output with bincode")?;
+        let bytes = bincode::serialize(value)
+            .context("Failed to serialize Ligero public output with bincode")?;
         self.public_output = Some(bytes);
         Ok(())
     }
@@ -154,7 +154,6 @@ impl LigeroHostCore {
         self.verify_proof_smoke()
     }
 
-
     /// Compute the Ligero code commitment as `SHA-256(wasm_bytes || packing_u32_le)`.
     pub fn code_commitment_raw(&self) -> [u8; 32] {
         let program_bytes = crate::resolve_program(&self.runner.config().program)
@@ -193,7 +192,12 @@ impl LigeroHostCore {
         let cfg = self.runner.config();
         let args_json =
             serde_json::to_vec(&cfg.args).context("Failed to serialize Ligero args as JSON")?;
-        let pkg = LigeroProofPackage::new(Vec::new(), public_output, args_json, cfg.private_indices.clone())?;
+        let pkg = LigeroProofPackage::new(
+            Vec::new(),
+            public_output,
+            args_json,
+            cfg.private_indices.clone(),
+        )?;
         pkg.to_bytes()
     }
 
@@ -206,16 +210,17 @@ impl LigeroHostCore {
         let cfg = self.runner.config();
         let args_json =
             serde_json::to_vec(&cfg.args).context("Failed to serialize Ligero args as JSON")?;
-        let pkg = LigeroProofPackage::new(proof, public_output, args_json, cfg.private_indices.clone())?;
+        let pkg =
+            LigeroProofPackage::new(proof, public_output, args_json, cfg.private_indices.clone())?;
         pkg.to_bytes()
     }
 
     /// Ensure public output has been set and clone it (for packaging outside this crate).
     pub fn require_public_output(&self) -> Result<Vec<u8>> {
         self.public_output.clone().ok_or_else(|| {
-            anyhow!("Ligero public output not set; call set_public_output before generating a proof")
+            anyhow!(
+                "Ligero public output not set; call set_public_output before generating a proof"
+            )
         })
     }
 }
-
-

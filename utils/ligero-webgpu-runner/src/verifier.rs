@@ -96,10 +96,15 @@ impl VerifierPaths {
             }
         };
 
-        let program = canonicalize(&config.program)
-            .with_context(|| format!("Failed to resolve Ligero program path: {}", config.program))?;
-        let shader_path = canonicalize(&config.shader_path)
-            .with_context(|| format!("Failed to resolve Ligero shader path: {}", config.shader_path))?;
+        let program = canonicalize(&config.program).with_context(|| {
+            format!("Failed to resolve Ligero program path: {}", config.program)
+        })?;
+        let shader_path = canonicalize(&config.shader_path).with_context(|| {
+            format!(
+                "Failed to resolve Ligero shader path: {}",
+                config.shader_path
+            )
+        })?;
 
         let verifier_bin = locate_verifier_binary(program.parent())
             .context("Failed to locate webgpu_verifier binary")?;
@@ -282,7 +287,34 @@ pub fn verify_proof_with_output(
     args: Vec<LigeroArg>,
     private_indices: Vec<usize>,
 ) -> Result<(bool, String, String)> {
-    verify_proof_with_output_in_pool(default_verifier_pool(), paths, proof_bytes, args, private_indices)
+    verify_proof_with_output_in_pool(
+        default_verifier_pool(),
+        paths,
+        proof_bytes,
+        args,
+        private_indices,
+    )
+}
+
+/// Verify a proof while redacting *all* private args except the indices in `keep_private_indices`.
+///
+/// Some circuits (e.g. viewer-attestation extensions) require a subset of private inputs to be
+/// present at verification time so the verifier binary can reconstruct the same circuit instance.
+pub fn verify_proof_with_output_keep_private_args(
+    paths: &VerifierPaths,
+    proof_bytes: &[u8],
+    args: Vec<LigeroArg>,
+    private_indices: Vec<usize>,
+    keep_private_indices: Vec<usize>,
+) -> Result<(bool, String, String)> {
+    verify_proof_with_output_keep_private_args_in_pool(
+        default_verifier_pool(),
+        paths,
+        proof_bytes,
+        args,
+        private_indices,
+        keep_private_indices,
+    )
 }
 
 /// Verify a proof and return `(success, stdout, stderr)` for debugging, running on a provided worker pool.
@@ -296,7 +328,32 @@ pub fn verify_proof_with_output_in_pool(
     let paths = paths.clone();
     let proof_bytes = proof_bytes.to_vec();
     pool.execute(move || {
-        verify_proof_with_output_direct(&paths, &proof_bytes, args, private_indices)
+        verify_proof_with_output_direct(&paths, &proof_bytes, args, private_indices, Vec::new())
+    })
+}
+
+/// Verify a proof and return `(success, stdout, stderr)` for debugging, running on a provided worker pool.
+///
+/// Private arguments are redacted according to `private_indices` except for indices listed in
+/// `keep_private_indices` (1-based).
+pub fn verify_proof_with_output_keep_private_args_in_pool(
+    pool: &BinaryWorkerPool,
+    paths: &VerifierPaths,
+    proof_bytes: &[u8],
+    args: Vec<LigeroArg>,
+    private_indices: Vec<usize>,
+    keep_private_indices: Vec<usize>,
+) -> Result<(bool, String, String)> {
+    let paths = paths.clone();
+    let proof_bytes = proof_bytes.to_vec();
+    pool.execute(move || {
+        verify_proof_with_output_direct(
+            &paths,
+            &proof_bytes,
+            args,
+            private_indices,
+            keep_private_indices,
+        )
     })
 }
 
@@ -319,19 +376,28 @@ fn verify_proof_with_output_direct(
     proof_bytes: &[u8],
     mut args: Vec<LigeroArg>,
     private_indices: Vec<usize>,
+    keep_private_indices: Vec<usize>,
 ) -> Result<(bool, String, String)> {
-    let temp_dir = tempdir().context("Failed to create temporary directory for Ligero verification")?;
+    let temp_dir =
+        tempdir().context("Failed to create temporary directory for Ligero verification")?;
 
     // Write proof bytes for `webgpu_verifier`.
     // If this is gzip (0x1f, 0x8b), keep the conventional name; otherwise write an uncompressed file.
     let is_gzip = proof_bytes.len() >= 2 && proof_bytes[0] == 0x1f && proof_bytes[1] == 0x8b;
-    let proof_filename = if is_gzip { "proof_data.gz" } else { "proof_data.bin" };
+    let proof_filename = if is_gzip {
+        "proof_data.gz"
+    } else {
+        "proof_data.bin"
+    };
     let proof_path = temp_dir.path().join(proof_filename);
     fs::write(&proof_path, proof_bytes)
         .with_context(|| format!("Failed to write {} for Ligero verification", proof_filename))?;
 
     // Redact private arguments (replace with dummy values) while preserving basic parseability.
     for &idx in &private_indices {
+        if keep_private_indices.contains(&idx) {
+            continue;
+        }
         if idx > 0 && idx <= args.len() {
             let arg_idx = idx - 1;
             args[arg_idx] = redact_arg(&args[arg_idx]);
@@ -342,8 +408,8 @@ fn verify_proof_with_output_direct(
     // Ensure verifier reads the file we just wrote, and uses consistent decompression behavior.
     config.proof_path = Some(proof_filename.to_string());
     config.gzip_proof = is_gzip;
-    let config_json = serde_json::to_string(&config)
-        .context("Failed to serialize Ligero verifier config")?;
+    let config_json =
+        serde_json::to_string(&config).context("Failed to serialize Ligero verifier config")?;
 
     let output = Command::new(&paths.verifier_bin)
         .arg(&config_json)
@@ -359,7 +425,8 @@ fn verify_proof_with_output_direct(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let success = output.status.success() && matches!(parse_final_verify_result(&stdout), Some(true));
+    let success =
+        output.status.success() && matches!(parse_final_verify_result(&stdout), Some(true));
 
     Ok((success, stdout, stderr))
 }
@@ -370,7 +437,8 @@ pub fn verify_proof(
     args: Vec<LigeroArg>,
     private_indices: Vec<usize>,
 ) -> Result<()> {
-    let (success, stdout, stderr) = verify_proof_with_output(paths, proof_bytes, args, private_indices)?;
+    let (success, stdout, stderr) =
+        verify_proof_with_output(paths, proof_bytes, args, private_indices)?;
 
     if !success {
         tracing::error!("Ligero verifier did not report success: stdout={stdout}, stderr={stderr}");
@@ -387,7 +455,8 @@ fn canonicalize(path: &str) -> Result<PathBuf> {
             if path.is_absolute() {
                 Err(anyhow::anyhow!("Path does not exist: {}", path.display()))
             } else {
-                let current_dir = std::env::current_dir().context("Failed to get current directory")?;
+                let current_dir =
+                    std::env::current_dir().context("Failed to get current directory")?;
                 let joined = current_dir.join(path);
                 Ok(fs::canonicalize(&joined)?)
             }
@@ -451,12 +520,11 @@ fn locate_verifier_binary(program_parent: Option<&Path>) -> Result<PathBuf> {
         }
         for c in candidates {
             if c.exists() {
-                return fs::canonicalize(c).context("Failed to resolve verifier binary under LIGERO_ROOT");
+                return fs::canonicalize(c)
+                    .context("Failed to resolve verifier binary under LIGERO_ROOT");
             }
         }
     }
-
-
 
     // Final fallback: try to locate the verifier binary inside the Ligero repo checkout that
     // this crate is built from (works for git/path dependencies).

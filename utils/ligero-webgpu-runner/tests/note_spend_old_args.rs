@@ -10,6 +10,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use ligero_runner::{daemon::DaemonPool, LigeroArg, LigeroRunner};
 use ligetron::poseidon2_hash_bytes;
+use ligetron::Bn254Fr;
 
 type Hash32 = [u8; 32];
 
@@ -44,23 +45,35 @@ fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"MT_NODE_V1", &[&lvl, left, right])
 }
 
-fn note_commitment(domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash32) -> Hash32 {
+fn note_commitment(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> Hash32 {
     // Guest encodes value as 16-byte LE (u64 zero-extended to 16 bytes).
     let mut v16 = [0u8; 16];
     v16[..8].copy_from_slice(&value.to_le_bytes());
-    poseidon2_hash_domain(b"NOTE_V1", &[domain, &v16, rho, recipient])
+    poseidon2_hash_domain(b"NOTE_V2", &[domain, &v16, rho, recipient, sender_id])
 }
 
 fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PK_V1", &[spend_sk])
 }
 
-fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
-    poseidon2_hash_domain(b"ADDR_V1", &[domain, pk])
+fn ivk_seed(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    // Wallet-side this would be clamped and base-multiplied (X25519) to get a real pk_ivk,
+    // but the circuit treats `pk_ivk` as an opaque 32-byte value and only binds it into ADDR_V2.
+    poseidon2_hash_domain(b"IVK_SEED_V1", &[domain, spend_sk])
 }
 
-fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    recipient_from_pk(domain, &pk_from_sk(spend_sk))
+fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"ADDR_V2", &[domain, pk_spend, pk_ivk])
+}
+
+fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    recipient_from_pk(domain, &pk_from_sk(spend_sk), pk_ivk)
 }
 
 fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
@@ -69,6 +82,56 @@ fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
 
 fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PRF_NF_V1", &[domain, nf_key, rho])
+}
+
+fn fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
+    let mut fr = Bn254Fr::new();
+    fr.set_bytes_big(h);
+    fr
+}
+
+fn compute_inv_enforce(
+    in_values: &[u64],
+    in_rhos: &[Hash32],
+    out_values: &[u64],
+    out_rhos: &[Hash32],
+) -> Result<Hash32> {
+    let mut prod = Bn254Fr::from_u32(1);
+
+    for &v in in_values {
+        prod.mulmod_checked(&Bn254Fr::from_u64(v));
+    }
+    for &v in out_values {
+        prod.mulmod_checked(&Bn254Fr::from_u64(v));
+    }
+
+    // Π(rho_out - rho_in)
+    for out_rho in out_rhos {
+        let out_fr = fr_from_hash32_be(out_rho);
+        for in_rho in in_rhos {
+            let in_fr = fr_from_hash32_be(in_rho);
+            let mut delta = out_fr.clone();
+            delta.submod_checked(&in_fr);
+            prod.mulmod_checked(&delta);
+        }
+    }
+
+    // (rho_out0 - rho_out1) when n_out == 2.
+    if out_rhos.len() == 2 {
+        let out0 = fr_from_hash32_be(&out_rhos[0]);
+        let out1 = fr_from_hash32_be(&out_rhos[1]);
+        let mut delta = out0.clone();
+        delta.submod_checked(&out1);
+        prod.mulmod_checked(&delta);
+    }
+
+    anyhow::ensure!(
+        !prod.is_zero(),
+        "inv_enforce undefined: enforce product is zero (zero value or rho reuse)"
+    );
+    let mut inv = prod.clone();
+    inv.inverse();
+    Ok(inv.to_bytes_be())
 }
 
 struct MerkleTree {
@@ -120,45 +183,43 @@ impl MerkleTree {
     }
 }
 
-fn private_indices(depth: usize, n_out: usize) -> Vec<usize> {
-    // Indices are 1-based for the guest:
-    // args:
-    // 0: domain
-    // 1: value
-    // 2: rho
-    // 3: recipient
-    // 4: spend_sk                    (private)
-    // 5: depth
-    // 6..(6+depth-1): path bits
-    // then siblings (depth items)
-    // then anchor, nf
-    // then withdraw_amount, n_out
-    // then outputs: value, rho, pk, cm (4*n_out)
+fn private_indices(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
+    // Mirrors the guest layout described in utils/circuits/note-spend/src/main.rs (v2 ABI).
     //
-    // For this test we mark spend_sk and output secret rho as private.
-    let mut idx = Vec::new();
-    idx.push(5); // spend_sk (argv[5] because argv[0] is program name in C++)
+    // Private:
+    // - spend_sk, pk_ivk_owner
+    // - per-input: value_in, rho_in, sender_id_in, pos_bits, siblings
+    // - per-output: value_out, rho_out, pk_spend_out, pk_ivk_out
+    // - inv_enforce witness
+    let mut idx = vec![2usize, 3usize]; // spend_sk, pk_ivk_owner
 
-    // out_rho starts after:
-    // domain,value,rho,recipient,spend_sk,depth => 6
-    // path bits => depth
-    // siblings => depth
-    // anchor,nf => 2
-    // withdraw_amount,n_out,out_value => 3
-    // out_rho is next => 1
-    let out_rho_pos = 1 + (6 + depth + depth + 2 + 3) as usize; // 1-based argv index
-    // Actually argv indices are 1-based but include program name at argv[0], so:
-    // In LigeroConfig private-indices expects 1-based indices for the args array (excluding argv[0]).
-    // This helper matches prior tests' convention.
-    // We'll just reuse the same indices generator as the non-daemon benchmark:
-    // spend_sk and out_rho.
-    idx.push(out_rho_pos);
-
-    // If multiple outputs exist, mark each out_rho private too.
-    // outputs are 4 fields each: value,rho,pk,cm
-    for o in 1..n_out {
-        idx.push(out_rho_pos + o * 4);
+    let per_in = 4usize + 2usize * depth; // value + rho + sender_id_in + pos_bits[depth] + siblings[depth] + nullifier
+    for i in 0..n_in {
+        let base = 7 + i * per_in;
+        idx.push(base); // value_in
+        idx.push(base + 1); // rho_in
+        idx.push(base + 2); // sender_id_in
+        for k in 0..depth {
+            idx.push(base + 3 + k); // pos_bit
+        }
+        for k in 0..depth {
+            idx.push(base + 3 + depth + k); // sibling
+        }
+        // nullifier is public
     }
+
+    let withdraw_idx = 7 + n_in * per_in;
+    let outs_base = withdraw_idx + 2; // skip withdraw_amount + n_out
+    for j in 0..n_out {
+        idx.push(outs_base + 5 * j + 0); // value_out
+        idx.push(outs_base + 5 * j + 1); // rho_out
+        idx.push(outs_base + 5 * j + 2); // pk_spend_out
+        idx.push(outs_base + 5 * j + 3); // pk_ivk_out
+                                         // cm_out is public
+    }
+
+    idx.push(outs_base + 5 * n_out); // inv_enforce
+
     idx
 }
 
@@ -223,29 +284,31 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
     let prover_pool = match DaemonPool::new_prover(runner.paths(), 1) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
-                "Skipping: prover binary does not appear to support --daemon yet: {e:#}"
-            );
+            eprintln!("Skipping: prover binary does not appear to support --daemon yet: {e:#}");
             return Ok(());
         }
     };
     let verifier_pool = match DaemonPool::new_verifier(runner.paths(), 1) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
-                "Skipping: verifier binary does not appear to support --daemon yet: {e:#}"
-            );
+            eprintln!("Skipping: verifier binary does not appear to support --daemon yet: {e:#}");
             return Ok(());
         }
     };
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
-    println!("[daemon_two_pass] Prover:   {}", runner.paths().prover_bin.display());
+    println!(
+        "[daemon_two_pass] Prover:   {}",
+        runner.paths().prover_bin.display()
+    );
     println!(
         "[daemon_two_pass] Verifier: {}",
         runner.paths().verifier_bin.display()
@@ -260,67 +323,100 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
     let rho: Hash32 = [2u8; 32];
     let spend_sk: Hash32 = [4u8; 32];
 
-    let recipient = recipient_from_sk(&domain, &spend_sk);
+    let pk_ivk_owner = ivk_seed(&domain, &spend_sk);
+    let recipient = recipient_from_sk(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id_current = recipient;
     let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
     let value: u64 = 42;
     let pos: u64 = 0;
 
-    let cm_in = note_commitment(&domain, value, &rho, &recipient);
+    let sender_id_in: Hash32 = [6u8; 32];
+    let cm_in = note_commitment(&domain, value, &rho, &recipient, &sender_id_in);
     let mut tree = MerkleTree::new(depth);
     tree.set_leaf(pos as usize, cm_in);
     let anchor = tree.root();
     let siblings = tree.open(pos as usize);
     let nf = nullifier(&domain, &nf_key, &rho);
 
+    let n_in: u64 = 1;
     let withdraw_amount: u64 = 0;
     let n_out: u64 = 1;
 
     let out_value: u64 = value;
     let out_rho: Hash32 = [7u8; 32];
     let out_spend_sk: Hash32 = [8u8; 32];
-    let out_pk = pk_from_sk(&out_spend_sk);
-    let out_recipient = recipient_from_pk(&domain, &out_pk);
-    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
+    let out_pk_spend = pk_from_sk(&out_spend_sk);
+    let out_pk_ivk = ivk_seed(&domain, &out_spend_sk);
+    let out_recipient = recipient_from_pk(&domain, &out_pk_spend, &out_pk_ivk);
+    let cm_out = note_commitment(
+        &domain,
+        out_value,
+        &out_rho,
+        &out_recipient,
+        &sender_id_current,
+    );
+
+    let inv_enforce = compute_inv_enforce(&[value], &[rho], &[out_value], &[out_rho])?;
 
     let mut args: Vec<LigeroArg> = Vec::new();
-    args.push(LigeroArg::Hex { hex: hx32(&domain) });
-    args.push(LigeroArg::I64 { i64: value as i64 });
-    args.push(LigeroArg::Hex { hex: hx32(&rho) });
+    // Header (v2 ABI)
+    args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1 domain (public)
     args.push(LigeroArg::Hex {
-        hex: hx32(&recipient),
-    });
-    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) });
-    args.push(LigeroArg::I64 { i64: depth as i64 });
+        hex: hx32(&spend_sk),
+    }); // 2 spend_sk (private)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 pk_ivk_owner (private)
+    args.push(LigeroArg::I64 { i64: depth as i64 }); // 4 depth (public)
+    args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 anchor (public)
+    args.push(LigeroArg::I64 { i64: n_in as i64 }); // 6 n_in (public)
+
+    // Input 0 (value, rho, sender_id_in, pos_bits[depth], siblings[depth], nullifier)
+    args.push(LigeroArg::I64 { i64: value as i64 }); // 7 value_in_0 (private)
+    args.push(LigeroArg::Hex { hex: hx32(&rho) }); // 8 rho_in_0 (private)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&sender_id_in),
+    }); // sender_id_in_0 (private)
 
     for lvl in 0..depth {
         let bit = ((pos >> lvl) & 1) as u8;
         let mut bit_bytes = [0u8; 32];
         bit_bytes[31] = bit;
-        args.push(LigeroArg::Hex { hex: hx32(&bit_bytes) });
+        args.push(LigeroArg::Hex {
+            hex: hx32(&bit_bytes),
+        });
     }
 
     for s in &siblings {
         args.push(LigeroArg::Hex { hex: hx32(s) });
     }
 
-    args.push(LigeroArg::String {
-        str: format!("0x{}", hx32(&anchor)),
-    });
-    args.push(LigeroArg::String {
-        str: format!("0x{}", hx32(&nf)),
-    });
+    // Input nullifier (public).
+    args.push(LigeroArg::Hex { hex: hx32(&nf) });
 
     args.push(LigeroArg::I64 {
         i64: withdraw_amount as i64,
     });
     args.push(LigeroArg::I64 { i64: n_out as i64 });
-    args.push(LigeroArg::I64 { i64: out_value as i64 });
-    args.push(LigeroArg::Hex { hex: hx32(&out_rho) });
-    args.push(LigeroArg::Hex { hex: hx32(&out_pk) });
+    args.push(LigeroArg::I64 {
+        i64: out_value as i64,
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_rho),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_spend),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_ivk),
+    });
     args.push(LigeroArg::Hex { hex: hx32(&cm_out) });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&inv_enforce),
+    });
 
-    let priv_idx = private_indices(depth, 1);
+    let priv_idx = private_indices(depth, 1, 1);
     runner.config_mut().private_indices = priv_idx;
     runner.config_mut().args = args;
 
@@ -345,11 +441,21 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
         .clone()
         .context("prover pass2 did not return proof_path")?;
 
-    let size1 = std::fs::metadata(&proof_path_1).map(|m| m.len()).unwrap_or(0);
-    let size2 = std::fs::metadata(&proof_path_2).map(|m| m.len()).unwrap_or(0);
+    let size1 = std::fs::metadata(&proof_path_1)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let size2 = std::fs::metadata(&proof_path_2)
+        .map(|m| m.len())
+        .unwrap_or(0);
 
-    println!("[daemon_two_pass] Prover pass1: {:?} ({} bytes) -> {}", d1, size1, proof_path_1);
-    println!("[daemon_two_pass] Prover pass2: {:?} ({} bytes) -> {}", d2, size2, proof_path_2);
+    println!(
+        "[daemon_two_pass] Prover pass1: {:?} ({} bytes) -> {}",
+        d1, size1, proof_path_1
+    );
+    println!(
+        "[daemon_two_pass] Prover pass2: {:?} ({} bytes) -> {}",
+        d2, size2, proof_path_2
+    );
 
     // --- Verifier two-pass timing (verify proof1 twice) ---
     let tv0 = Instant::now();
@@ -367,4 +473,3 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
 
     Ok(())
 }
-
