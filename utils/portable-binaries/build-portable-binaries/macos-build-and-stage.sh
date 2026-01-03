@@ -108,6 +108,20 @@ for f in "${REQUIRED_FORMULAE[@]}"; do
   fi
 done
 
+# Verify Boost version is >= 1.84 (archive version 19)
+# This is required for cross-platform proof compatibility with Linux builds.
+BOOST_VERSION="$(brew info --json=v2 boost | python3 -c 'import sys,json; print(json.load(sys.stdin)["formulae"][0]["versions"]["stable"])' 2>/dev/null || echo "unknown")"
+echo "==> Homebrew Boost version: $BOOST_VERSION"
+# Extract major.minor version for comparison
+BOOST_MAJOR="${BOOST_VERSION%%.*}"
+BOOST_REST="${BOOST_VERSION#*.}"
+BOOST_MINOR="${BOOST_REST%%.*}"
+if [[ "$BOOST_MAJOR" -lt 1 ]] || { [[ "$BOOST_MAJOR" -eq 1 ]] && [[ "$BOOST_MINOR" -lt 84 ]]; }; then
+  echo "warning: Boost version $BOOST_VERSION is older than 1.84."
+  echo "         Cross-platform proof compatibility requires Boost >= 1.84 (archive version 19)."
+  echo "         Consider running: brew upgrade boost"
+fi
+
 # IMPORTANT:
 # Homebrew LLVM uses its own libc++ headers which can mismatch the system libc++ at link-time,
 # causing errors like: `Undefined symbols ... std::__1::__hash_memory`.
