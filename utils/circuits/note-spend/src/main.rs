@@ -253,17 +253,14 @@ fn assert_fr_eq_hash32(computed: &Bn254Fr, expected_be: &Hash32) {
 /// to be boolean, a malicious prover could use other field values to
 /// manipulate the Merkle path computation.
 #[inline(always)]
-fn assert_bit(cond: &Bn254Fr) {
-    // Create constant 1
-    let one = Bn254Fr::from_u32(1);
+fn assert_bit(cond: &Bn254Fr, one: &Bn254Fr) {
     // t = cond - 1
     let mut t = Bn254Fr::new();
     submod_checked(&mut t, cond, &one);
     // t = cond * (cond - 1)
     t.mulmod_checked(cond);
     // Assert t == 0 (only true if cond is 0 or 1)
-    let zero = Bn254Fr::new();
-    Bn254Fr::assert_equal(&t, &zero);
+    Bn254Fr::assert_equal_u64(&t, 0);
 }
 
 /// Read a position bit from a 32-byte hex argument.
@@ -703,6 +700,10 @@ fn main() {
 
     // Create single hasher instance, reuse for all hashes.
     let h = Poseidon2Core::new();
+    // A real 1 value for boolean constraints.
+    // We set the witness value and also bind it as a constant to avoid relying on backend semantics.
+    let one = Bn254Fr::from_u32(1);
+    Bn254Fr::assert_equal_u64(&one, 1);
 
     // Header:
     // [1] domain (PUBLIC)
@@ -764,7 +765,7 @@ fn main() {
         let mut pos_bits: Vec<Bn254Fr> = Vec::with_capacity(depth);
         for _lvl in 0..depth {
             let bit = read_position_bit(&args, arg_idx);
-            assert_bit(&bit);
+            assert_bit(&bit, &one);
             pos_bits.push(bit);
             arg_idx += 1;
         }
@@ -941,8 +942,7 @@ fn main() {
     arg_idx += 1;
     let inv_enforce_fr = bn254fr_from_hash32_be(&inv_enforce_bytes);
     enforce_prod.mulmod_checked(&inv_enforce_fr);
-    let one = Bn254Fr::from_u32(1);
-    Bn254Fr::assert_equal(&enforce_prod, &one);
+    Bn254Fr::assert_equal_u64(&enforce_prod, 1);
 
     // --- Level B: Viewer Attestations ---
     let base_after_outs = arg_idx;

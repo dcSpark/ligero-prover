@@ -229,7 +229,7 @@ fn print_summary_table() {
         let s3 = r.prover_metrics.stage3_ms.unwrap_or(0);
         let total = s1 + s2 + s3;
         println!(
-            "│ {:^10} │ {:>7} ms │ {:>7} ms │ {:>7} ms │ {:>7} ms             │",
+            "│ {:^10} │ {:>7} ms │ {:>7} ms │ {:>7} ms │ {:>6} ms             │",
             r.use_case.to_uppercase(),
             s1,
             s2,
