@@ -14,6 +14,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use ligero_runner::{verifier, LigeroArg, LigeroRunner};
 use ligetron::poseidon2_hash_bytes;
+use ligetron::Bn254Fr;
 
 type Hash32 = [u8; 32];
 
@@ -65,7 +66,10 @@ fn maybe_build_note_spend_guest(repo: &Path) -> Result<()> {
         );
     }
 
-    println!("[note_spend_roundtrip] Built note_spend_guest.wasm at {}", out.display());
+    println!(
+        "[note_spend_roundtrip] Built note_spend_guest.wasm at {}",
+        out.display()
+    );
 
     Ok(())
 }
@@ -101,23 +105,35 @@ fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"MT_NODE_V1", &[&lvl, left, right])
 }
 
-fn note_commitment(domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash32) -> Hash32 {
+fn note_commitment(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> Hash32 {
     // Guest encodes value as 16-byte LE (u64 zero-extended to 16 bytes).
     let mut v16 = [0u8; 16];
     v16[..8].copy_from_slice(&value.to_le_bytes());
-    poseidon2_hash_domain(b"NOTE_V1", &[domain, &v16, rho, recipient])
+    poseidon2_hash_domain(b"NOTE_V2", &[domain, &v16, rho, recipient, sender_id])
 }
 
 fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PK_V1", &[spend_sk])
 }
 
-fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
-    poseidon2_hash_domain(b"ADDR_V1", &[domain, pk])
+fn ivk_seed(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    // Wallet-side this would be clamped and base-multiplied (X25519) to get a real pk_ivk,
+    // but the circuit treats `pk_ivk` as an opaque 32-byte value and only binds it into ADDR_V2.
+    poseidon2_hash_domain(b"IVK_SEED_V1", &[domain, spend_sk])
 }
 
-fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    recipient_from_pk(domain, &pk_from_sk(spend_sk))
+fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"ADDR_V2", &[domain, pk_spend, pk_ivk])
+}
+
+fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    recipient_from_pk(domain, &pk_from_sk(spend_sk), pk_ivk)
 }
 
 fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
@@ -126,6 +142,108 @@ fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
 
 fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PRF_NF_V1", &[domain, nf_key, rho])
+}
+
+fn fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
+    let mut fr = Bn254Fr::new();
+    fr.set_bytes_big(h);
+    fr
+}
+
+fn compute_inv_enforce(
+    in_values: &[u64],
+    in_rhos: &[Hash32],
+    out_values: &[u64],
+    out_rhos: &[Hash32],
+) -> Result<Hash32> {
+    let mut prod = Bn254Fr::from_u32(1);
+
+    for &v in in_values {
+        prod.mulmod_checked(&Bn254Fr::from_u64(v));
+    }
+    for &v in out_values {
+        prod.mulmod_checked(&Bn254Fr::from_u64(v));
+    }
+
+    // Π(rho_out - rho_in)
+    for out_rho in out_rhos {
+        let out_fr = fr_from_hash32_be(out_rho);
+        for in_rho in in_rhos {
+            let in_fr = fr_from_hash32_be(in_rho);
+            let mut delta = out_fr.clone();
+            delta.submod_checked(&in_fr);
+            prod.mulmod_checked(&delta);
+        }
+    }
+
+    // (rho_out0 - rho_out1) when n_out == 2.
+    if out_rhos.len() == 2 {
+        let out0 = fr_from_hash32_be(&out_rhos[0]);
+        let out1 = fr_from_hash32_be(&out_rhos[1]);
+        let mut delta = out0.clone();
+        delta.submod_checked(&out1);
+        prod.mulmod_checked(&delta);
+    }
+
+    anyhow::ensure!(
+        !prod.is_zero(),
+        "inv_enforce undefined: enforce product is zero (zero value or rho reuse)"
+    );
+    let mut inv = prod.clone();
+    inv.inverse();
+    Ok(inv.to_bytes_be())
+}
+
+// === Viewer attestation helpers (must match the guest program) ===
+
+fn fvk_commit(fvk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"FVK_COMMIT_V1", &[fvk])
+}
+
+fn view_kdf(fvk: &Hash32, cm: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_KDF_V1", &[fvk, cm])
+}
+
+fn stream_block(k: &Hash32, ctr: u32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_STREAM_V1", &[k, &ctr.to_le_bytes()])
+}
+
+fn stream_xor_encrypt_144(k: &Hash32, pt: &[u8; 144]) -> [u8; 144] {
+    let mut ct = [0u8; 144];
+    for ctr in 0u32..5u32 {
+        let ks = stream_block(k, ctr);
+        let off = (ctr as usize) * 32;
+        let take = core::cmp::min(32, 144 - off);
+        for i in 0..take {
+            ct[off + i] = pt[off + i] ^ ks[i];
+        }
+    }
+    ct
+}
+
+fn ct_hash(ct: &[u8; 144]) -> Hash32 {
+    poseidon2_hash_domain(b"CT_HASH_V1", &[ct])
+}
+
+fn view_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_MAC_V1", &[k, cm, ct_h])
+}
+
+fn encode_note_plain(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> [u8; 144] {
+    let mut out = [0u8; 144];
+    out[0..32].copy_from_slice(domain);
+    out[32..40].copy_from_slice(&value.to_le_bytes());
+    // out[40..48] is already zero (u64 zero-extended to 16 bytes).
+    out[48..80].copy_from_slice(rho);
+    out[80..112].copy_from_slice(recipient);
+    out[112..144].copy_from_slice(sender_id);
+    out
 }
 
 fn merkle_root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32]) -> Hash32 {
@@ -196,22 +314,65 @@ impl MerkleTree {
     }
 }
 
-fn private_indices(depth: usize, n_out: usize) -> Vec<usize> {
-    // Mirrors the guest layout described in utils/circuits/note-spend/src/main.rs.
-    let mut v = vec![3usize, 4usize, 5usize]; // rho, recipient, spend_sk
-    for i in 0..depth {
-        v.push(7 + i); // pos_bits
+fn private_indices(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
+    // Mirrors the guest layout described in utils/circuits/note-spend/src/main.rs (v2 ABI).
+    //
+    // Private:
+    // - spend_sk, pk_ivk_owner
+    // - per-input: value_in, rho_in, sender_id_in, pos_bits, siblings
+    // - per-output: value_out, rho_out, pk_spend_out, pk_ivk_out
+    // - inv_enforce (enforcement inverse witness)
+    let mut idx = vec![2usize, 3usize]; // spend_sk, pk_ivk_owner
+
+    let per_in = 4usize + 2usize * depth; // value + rho + sender_id_in + pos_bits[depth] + siblings[depth] + nullifier
+    for i in 0..n_in {
+        let base = 7 + i * per_in;
+        idx.push(base); // value_in
+        idx.push(base + 1); // rho_in
+        idx.push(base + 2); // sender_id_in
+        for k in 0..depth {
+            idx.push(base + 3 + k); // pos_bit
+        }
+        for k in 0..depth {
+            idx.push(base + 3 + depth + k); // sibling
+        }
+        // nullifier is public
     }
-    for i in 0..depth {
-        v.push(7 + depth + i); // siblings
-    }
-    let out_base = 11 + 2 * depth;
+
+    let withdraw_idx = 7 + n_in * per_in;
+    let outs_base = withdraw_idx + 2; // skip withdraw_amount + n_out
     for j in 0..n_out {
-        v.push(out_base + 4 * j + 0); // value_out
-        v.push(out_base + 4 * j + 1); // rho_out
-        v.push(out_base + 4 * j + 2); // pk_out
+        idx.push(outs_base + 5 * j + 0); // value_out
+        idx.push(outs_base + 5 * j + 1); // rho_out
+        idx.push(outs_base + 5 * j + 2); // pk_spend_out
+        idx.push(outs_base + 5 * j + 3); // pk_ivk_out
+                                         // cm_out is public
     }
-    v
+
+    // inv_enforce is always present right after outputs.
+    idx.push(outs_base + 5 * n_out);
+
+    idx
+}
+
+fn verify_expect_fail(
+    vpaths: &verifier::VerifierPaths,
+    proof_bytes: &[u8],
+    args: Vec<LigeroArg>,
+    priv_idx: Vec<usize>,
+) -> Result<()> {
+    match verifier::verify_proof_with_output(vpaths, proof_bytes, args, priv_idx) {
+        Ok((ok, stdout, stderr)) => {
+            anyhow::ensure!(
+                !ok,
+                "expected verification to fail, but it succeeded\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+        Err(_e) => {
+            // Any error is also an acceptable failure signal for a bad statement.
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -219,7 +380,9 @@ fn test_note_spend_proof_roundtrip_one_output() -> Result<()> {
     let repo = repo_root()?;
     maybe_build_note_spend_guest(&repo)?;
 
-    let program = note_spend_program_path(&repo)?.canonicalize().context("Failed to canonicalize note_spend_guest.wasm")?;
+    let program = note_spend_program_path(&repo)?
+        .canonicalize()
+        .context("Failed to canonicalize note_spend_guest.wasm")?;
 
     let packing: u32 = std::env::var("LIGERO_PACKING")
         .ok()
@@ -241,13 +404,22 @@ fn test_note_spend_proof_roundtrip_one_output() -> Result<()> {
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
     println!("[note_spend_roundtrip] Program: {}", program.display());
-    println!("[note_spend_roundtrip] Prover:   {}", runner.paths().prover_bin.display());
-    println!("[note_spend_roundtrip] Verifier: {}", runner.paths().verifier_bin.display());
+    println!(
+        "[note_spend_roundtrip] Prover:   {}",
+        runner.paths().prover_bin.display()
+    );
+    println!(
+        "[note_spend_roundtrip] Verifier: {}",
+        runner.paths().verifier_bin.display()
+    );
     println!("[note_spend_roundtrip] Shaders:  {}", shader_dir.display());
     println!("[note_spend_roundtrip] Packing:  {}", packing);
 
@@ -257,13 +429,16 @@ fn test_note_spend_proof_roundtrip_one_output() -> Result<()> {
     let rho: Hash32 = [2u8; 32];
     let spend_sk: Hash32 = [4u8; 32];
 
-    let recipient = recipient_from_sk(&domain, &spend_sk);
+    let pk_ivk_owner = ivk_seed(&domain, &spend_sk);
+    let recipient = recipient_from_sk(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id_current = recipient;
     let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
     let value: u64 = 42;
     let pos: u64 = 0;
 
-    let cm_in = note_commitment(&domain, value, &rho, &recipient);
+    let sender_id_in: Hash32 = [6u8; 32];
+    let cm_in = note_commitment(&domain, value, &rho, &recipient, &sender_id_in);
 
     // Build a small tree and open a Merkle path consistent with the guest program.
     let mut tree = MerkleTree::new(depth);
@@ -279,23 +454,45 @@ fn test_note_spend_proof_roundtrip_one_output() -> Result<()> {
     let nf = nullifier(&domain, &nf_key, &rho);
 
     // === One-output transfer: withdraw=0, out_value=value ===
+    let n_in: u64 = 1;
     let withdraw_amount: u64 = 0;
     let n_out: u64 = 1;
 
     let out_value: u64 = value;
     let out_rho: Hash32 = [7u8; 32];
     let out_spend_sk: Hash32 = [8u8; 32];
-    let out_pk = pk_from_sk(&out_spend_sk);
-    let out_recipient = recipient_from_pk(&domain, &out_pk);
-    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
+    let out_pk_spend = pk_from_sk(&out_spend_sk);
+    let out_pk_ivk = ivk_seed(&domain, &out_spend_sk);
+    let out_recipient = recipient_from_pk(&domain, &out_pk_spend, &out_pk_ivk);
+    let cm_out = note_commitment(
+        &domain,
+        out_value,
+        &out_rho,
+        &out_recipient,
+        &sender_id_current,
+    );
+
+    let inv_enforce = compute_inv_enforce(&[value], &[rho], &[out_value], &[out_rho])?;
 
     let mut args: Vec<LigeroArg> = Vec::new();
-    args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1
-    args.push(LigeroArg::I64 { i64: value as i64 }); // 2
-    args.push(LigeroArg::Hex { hex: hx32(&rho) }); // 3 (private)
-    args.push(LigeroArg::Hex { hex: hx32(&recipient) }); // 4 (private)
-    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) }); // 5 (private)
-    args.push(LigeroArg::I64 { i64: depth as i64 }); // 6
+    // Header (v2 ABI)
+    args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1 domain (public)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&spend_sk),
+    }); // 2 spend_sk (private)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 pk_ivk_owner (private)
+    args.push(LigeroArg::I64 { i64: depth as i64 }); // 4 depth (public)
+    args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 anchor (public)
+    args.push(LigeroArg::I64 { i64: n_in as i64 }); // 6 n_in (public)
+
+    // Input 0 (value, rho, sender_id_in, pos_bits[depth], siblings[depth], nullifier)
+    args.push(LigeroArg::I64 { i64: value as i64 }); // 7 value_in_0 (private)
+    args.push(LigeroArg::Hex { hex: hx32(&rho) }); // 8 rho_in_0 (private)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&sender_id_in),
+    }); // sender_id_in_0 (private)
 
     // Position bits (LSB-first), encoded as 32-byte big-endian field elements (0 or 1).
     // This matches the guest's `read_position_bit` / `bn254fr_from_hash32_be`.
@@ -303,7 +500,9 @@ fn test_note_spend_proof_roundtrip_one_output() -> Result<()> {
         let bit = ((pos >> lvl) & 1) as u8;
         let mut bit_bytes = [0u8; 32];
         bit_bytes[31] = bit;
-        args.push(LigeroArg::Hex { hex: hx32(&bit_bytes) });
+        args.push(LigeroArg::Hex {
+            hex: hx32(&bit_bytes),
+        });
     }
 
     // Siblings.
@@ -311,49 +510,69 @@ fn test_note_spend_proof_roundtrip_one_output() -> Result<()> {
         args.push(LigeroArg::Hex { hex: hx32(s) });
     }
 
-    // Anchor + nullifier as public field elements.
-    args.push(LigeroArg::String { str: format!("0x{}", hx32(&anchor)) });
-    args.push(LigeroArg::String { str: format!("0x{}", hx32(&nf)) });
+    // Input nullifier (public).
+    args.push(LigeroArg::Hex { hex: hx32(&nf) });
 
     // Withdraw + outputs.
-    args.push(LigeroArg::I64 { i64: withdraw_amount as i64 });
+    args.push(LigeroArg::I64 {
+        i64: withdraw_amount as i64,
+    });
     args.push(LigeroArg::I64 { i64: n_out as i64 });
-    args.push(LigeroArg::I64 { i64: out_value as i64 });
-    args.push(LigeroArg::Hex { hex: hx32(&out_rho) });
-    args.push(LigeroArg::Hex { hex: hx32(&out_pk) });
+    args.push(LigeroArg::I64 {
+        i64: out_value as i64,
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_rho),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_spend),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_ivk),
+    });
     args.push(LigeroArg::Hex { hex: hx32(&cm_out) });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&inv_enforce),
+    });
 
-    let priv_idx = private_indices(depth, 1);
+    let priv_idx = private_indices(depth, 1, 1);
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
 
-    let (proof_bytes, prover_stdout, prover_stderr) = match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
-        keep_proof_dir: false,
-        proof_outputs_base: None,
-        write_replay_script: true,
-    }) {
-        Ok((proof, stdout, stderr)) => (proof, stdout, stderr),
-        Err(err) => {
-            // If the prover ran but the witness is invalid, this is a real test failure (not an env issue).
-            let msg = format!("{err:#}");
-            if msg.contains("Validation of linear constraints:")
-                || msg.contains("Validation of quadratic constraints:")
-                || msg.contains("Final prove result:")
-            {
-                return Err(err);
-            }
+    let (proof_bytes, prover_stdout, prover_stderr) =
+        match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+            keep_proof_dir: false,
+            proof_outputs_base: None,
+            write_replay_script: true,
+        }) {
+            Ok((proof, stdout, stderr)) => (proof, stdout, stderr),
+            Err(err) => {
+                // If the prover ran but the witness is invalid, this is a real test failure (not an env issue).
+                let msg = format!("{err:#}");
+                if msg.contains("Validation of linear constraints:")
+                    || msg.contains("Validation of quadratic constraints:")
+                    || msg.contains("Final prove result:")
+                {
+                    return Err(err);
+                }
 
-            // Otherwise, treat it as an environmental failure (GPU/WebGPU / driver / missing runtime deps).
-            eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
-            return Ok(());
-        }
-    };
+                // Otherwise, treat it as an environmental failure (GPU/WebGPU / driver / missing runtime deps).
+                eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+                return Ok(());
+            }
+        };
 
     assert!(!proof_bytes.is_empty(), "proof should not be empty");
 
-    println!("[note_spend_roundtrip] OK: proof generated ({} bytes)", proof_bytes.len());
-    if let Some(line) = prover_stdout.lines().find(|l| l.contains("Final prove result:")) {
+    println!(
+        "[note_spend_roundtrip] OK: proof generated ({} bytes)",
+        proof_bytes.len()
+    );
+    if let Some(line) = prover_stdout
+        .lines()
+        .find(|l| l.contains("Final prove result:"))
+    {
         println!("[note_spend_roundtrip] Prover:   {line}");
     }
     if !prover_stderr.trim().is_empty() {
@@ -368,20 +587,1012 @@ fn test_note_spend_proof_roundtrip_one_output() -> Result<()> {
         packing,
     );
 
-    let (ok, v_stdout, v_stderr) = verifier::verify_proof_with_output(&vpaths, &proof_bytes, args, priv_idx)
-        .context("Failed to run verifier")?;
+    let (ok, v_stdout, v_stderr) =
+        verifier::verify_proof_with_output(&vpaths, &proof_bytes, args, priv_idx)
+            .context("Failed to run verifier")?;
 
     if !ok {
         anyhow::bail!("verifier did not report success\nstdout: {v_stdout}\nstderr: {v_stderr}");
     }
 
     println!("[note_spend_roundtrip] OK: proof verified");
-    if let Some(line) = v_stdout.lines().find(|l| l.contains("Final Verify Result:")) {
+    if let Some(line) = v_stdout
+        .lines()
+        .find(|l| l.contains("Final Verify Result:"))
+    {
         println!("[note_spend_roundtrip] Verifier: {line}");
     }
     if !v_stderr.trim().is_empty() {
         println!("[note_spend_roundtrip] Verifier stderr:\n{v_stderr}");
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_note_spend_red_team_rejects_mutated_public_inputs_and_wrong_private_indices() -> Result<()> {
+    let repo = repo_root()?;
+    maybe_build_note_spend_guest(&repo)?;
+
+    let program = note_spend_program_path(&repo)?
+        .canonicalize()
+        .context("Failed to canonicalize note_spend_guest.wasm")?;
+
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+
+    let mut runner = LigeroRunner::new(&program.to_string_lossy());
+    runner.config_mut().packing = packing;
+
+    if !runner.paths().prover_bin.exists() || !runner.paths().verifier_bin.exists() {
+        eprintln!(
+            "Skipping: Ligero binaries not found (prover={}, verifier={})",
+            runner.paths().prover_bin.display(),
+            runner.paths().verifier_bin.display()
+        );
+        return Ok(());
+    }
+
+    let shader_dir = PathBuf::from(&runner.config().shader_path);
+    if !shader_dir.exists() {
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
+        return Ok(());
+    }
+
+    // Small depth to keep runtime reasonable.
+    let depth: usize = 4;
+    let n_in: usize = 1;
+    let n_out: usize = 2;
+
+    let domain: Hash32 = [42u8; 32];
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_ivk_owner = ivk_seed(&domain, &spend_sk);
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id_current = recipient_owner;
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+
+    // One input note.
+    let value_in: u64 = 200;
+    let pos: u64 = 1;
+    let rho_in: Hash32 = [2u8; 32];
+    let sender_id_in: Hash32 = [6u8; 32];
+    let cm_in = note_commitment(
+        &domain,
+        value_in,
+        &rho_in,
+        &recipient_owner,
+        &sender_id_in,
+    );
+    let mut tree = MerkleTree::new(depth);
+    tree.set_leaf(pos as usize, cm_in);
+    let anchor = tree.root();
+    let siblings = tree.open(pos as usize);
+    let nf0 = nullifier(&domain, &nf_key, &rho_in);
+
+    // Two outputs: payment + change back to self.
+    let out0_value: u64 = 66;
+    let out1_value: u64 = value_in
+        .checked_sub(out0_value)
+        .context("value_in must be >= out0_value")?;
+
+    let out0_rho: Hash32 = [7u8; 32];
+    let out1_rho: Hash32 = [8u8; 32];
+
+    let out0_spend_sk: Hash32 = [9u8; 32];
+    let out0_pk_spend = pk_from_sk(&out0_spend_sk);
+    let out0_pk_ivk = ivk_seed(&domain, &out0_spend_sk);
+    let out0_recipient = recipient_from_pk(&domain, &out0_pk_spend, &out0_pk_ivk);
+    let cm_out0 = note_commitment(
+        &domain,
+        out0_value,
+        &out0_rho,
+        &out0_recipient,
+        &sender_id_current,
+    );
+
+    let out1_pk_spend = pk_from_sk(&spend_sk);
+    let out1_pk_ivk = pk_ivk_owner;
+    let cm_out1 = note_commitment(
+        &domain,
+        out1_value,
+        &out1_rho,
+        &recipient_owner,
+        &sender_id_current,
+    );
+
+    let inv_enforce = compute_inv_enforce(
+        &[value_in],
+        &[rho_in],
+        &[out0_value, out1_value],
+        &[out0_rho, out1_rho],
+    )?;
+
+    // Build args (v2 ABI).
+    let mut args: Vec<LigeroArg> = Vec::new();
+    args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1 domain (pub)
+    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) }); // 2 spend_sk (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 pk_ivk_owner (priv)
+    args.push(LigeroArg::I64 { i64: depth as i64 }); // 4 depth (pub)
+    args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 anchor (pub)
+    args.push(LigeroArg::I64 { i64: n_in as i64 }); // 6 n_in (pub)
+
+    // Input 0.
+    args.push(LigeroArg::I64 {
+        i64: value_in as i64,
+    }); // value_in_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&rho_in) }); // rho_in_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&sender_id_in),
+    }); // sender_id_in_0 (priv)
+
+    for lvl in 0..depth {
+        let bit = ((pos >> lvl) & 1) as u8;
+        let mut bit_bytes = [0u8; 32];
+        bit_bytes[31] = bit;
+        args.push(LigeroArg::Hex {
+            hex: hx32(&bit_bytes),
+        });
+    }
+    for s in &siblings {
+        args.push(LigeroArg::Hex { hex: hx32(s) });
+    }
+
+    // nullifier_0 (pub)
+    args.push(LigeroArg::Hex { hex: hx32(&nf0) });
+
+    // withdraw_amount (pub), n_out (pub)
+    let withdraw_amount: u64 = 0;
+    args.push(LigeroArg::I64 {
+        i64: withdraw_amount as i64,
+    });
+    args.push(LigeroArg::I64 { i64: n_out as i64 });
+
+    // Output 0 (payment)
+    args.push(LigeroArg::I64 {
+        i64: out0_value as i64,
+    }); // value_out_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&out0_rho) }); // rho_out_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out0_pk_spend),
+    }); // pk_spend_out_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out0_pk_ivk),
+    }); // pk_ivk_out_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&cm_out0) }); // cm_out_0 (pub)
+
+    // Output 1 (change to self)
+    args.push(LigeroArg::I64 {
+        i64: out1_value as i64,
+    }); // value_out_1 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&out1_rho) }); // rho_out_1 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out1_pk_spend),
+    }); // pk_spend_out_1 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out1_pk_ivk),
+    }); // pk_ivk_out_1 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&cm_out1) }); // cm_out_1 (pub)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&inv_enforce),
+    }); // inv_enforce (priv)
+
+    let priv_idx = private_indices(depth, n_in, n_out);
+    runner.config_mut().private_indices = priv_idx.clone();
+    runner.config_mut().args = args.clone();
+
+    let (proof_bytes, _p_stdout, _p_stderr) =
+        match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+            keep_proof_dir: false,
+            proof_outputs_base: None,
+            write_replay_script: true,
+        }) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+                return Ok(());
+            }
+        };
+
+    anyhow::ensure!(!proof_bytes.is_empty(), "proof should not be empty");
+
+    let vpaths = verifier::VerifierPaths::from_explicit(
+        program.clone(),
+        shader_dir,
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
+
+    // Sanity: verifies with the original statement.
+    let (ok, v_stdout, v_stderr) =
+        verifier::verify_proof_with_output(&vpaths, &proof_bytes, args.clone(), priv_idx.clone())
+            .context("Failed to run verifier")?;
+    if !ok {
+        anyhow::bail!("verifier did not report success\nstdout: {v_stdout}\nstderr: {v_stderr}");
+    }
+
+    // --- Red team: mutate PUBLIC inputs and ensure verification fails ---
+    let per_in = 4 + 2 * depth;
+    let idx_anchor: usize = 5;
+    let idx_nullifier0: usize = 7 + 0 * per_in + 3 + 2 * depth;
+    let idx_withdraw: usize = 7 + n_in * per_in;
+    let idx_n_out: usize = idx_withdraw + 1;
+    let idx_cm_out0: usize = idx_withdraw + 2 + 5 * 0 + 4;
+    let idx_cm_out1: usize = idx_withdraw + 2 + 5 * 1 + 4;
+
+    let mut bad_anchor = anchor;
+    bad_anchor[0] ^= 1;
+    let mut bad_args = args.clone();
+    bad_args[idx_anchor - 1] = LigeroArg::Hex {
+        hex: hx32(&bad_anchor),
+    };
+    verify_expect_fail(&vpaths, &proof_bytes, bad_args, priv_idx.clone())?;
+
+    let mut bad_nf0 = nf0;
+    bad_nf0[0] ^= 1;
+    let mut bad_args = args.clone();
+    bad_args[idx_nullifier0 - 1] = LigeroArg::Hex { hex: hx32(&bad_nf0) };
+    verify_expect_fail(&vpaths, &proof_bytes, bad_args, priv_idx.clone())?;
+
+    let mut bad_args = args.clone();
+    bad_args[idx_withdraw - 1] = LigeroArg::I64 {
+        i64: (withdraw_amount as i64) + 1,
+    };
+    verify_expect_fail(&vpaths, &proof_bytes, bad_args, priv_idx.clone())?;
+
+    let mut bad_args = args.clone();
+    bad_args[idx_n_out - 1] = LigeroArg::I64 { i64: 1 };
+    verify_expect_fail(&vpaths, &proof_bytes, bad_args, priv_idx.clone())?;
+
+    let mut bad_cm = cm_out0;
+    bad_cm[0] ^= 1;
+    let mut bad_args = args.clone();
+    bad_args[idx_cm_out0 - 1] = LigeroArg::Hex { hex: hx32(&bad_cm) };
+    verify_expect_fail(&vpaths, &proof_bytes, bad_args, priv_idx.clone())?;
+
+    let mut bad_cm = cm_out1;
+    bad_cm[0] ^= 1;
+    let mut bad_args = args.clone();
+    bad_args[idx_cm_out1 - 1] = LigeroArg::Hex { hex: hx32(&bad_cm) };
+    verify_expect_fail(&vpaths, &proof_bytes, bad_args, priv_idx.clone())?;
+
+    // --- Red team: misconfigured private indices must be rejected ---
+    let mut bad_priv_idx = priv_idx.clone();
+    bad_priv_idx.push(idx_anchor); // incorrectly treat anchor as private
+    verify_expect_fail(&vpaths, &proof_bytes, args, bad_priv_idx)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_note_spend_viewer_attestation_roundtrip_and_rejects_mutation() -> Result<()> {
+    let repo = repo_root()?;
+    maybe_build_note_spend_guest(&repo)?;
+
+    let program = note_spend_program_path(&repo)?
+        .canonicalize()
+        .context("Failed to canonicalize note_spend_guest.wasm")?;
+
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+
+    let mut runner = LigeroRunner::new(&program.to_string_lossy());
+    runner.config_mut().packing = packing;
+
+    if !runner.paths().prover_bin.exists() || !runner.paths().verifier_bin.exists() {
+        eprintln!(
+            "Skipping: Ligero binaries not found (prover={}, verifier={})",
+            runner.paths().prover_bin.display(),
+            runner.paths().verifier_bin.display()
+        );
+        return Ok(());
+    }
+
+    let shader_dir = PathBuf::from(&runner.config().shader_path);
+    if !shader_dir.exists() {
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
+        return Ok(());
+    }
+
+    let depth: usize = 4;
+    let n_in: usize = 1;
+    let n_out: usize = 1;
+
+    let domain: Hash32 = [77u8; 32];
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_ivk_owner = ivk_seed(&domain, &spend_sk);
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id = recipient_owner;
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+
+    // One input note.
+    let value_in: u64 = 123;
+    let pos: u64 = 0;
+    let rho_in: Hash32 = [2u8; 32];
+    let sender_id_in: Hash32 = [6u8; 32];
+    let cm_in = note_commitment(
+        &domain,
+        value_in,
+        &rho_in,
+        &recipient_owner,
+        &sender_id_in,
+    );
+    let mut tree = MerkleTree::new(depth);
+    tree.set_leaf(pos as usize, cm_in);
+    let anchor = tree.root();
+    let siblings = tree.open(pos as usize);
+    let nf0 = nullifier(&domain, &nf_key, &rho_in);
+
+    // One output.
+    let withdraw_amount: u64 = 0;
+    let out_value: u64 = value_in;
+    let out_rho: Hash32 = [7u8; 32];
+    let out_spend_sk: Hash32 = [9u8; 32];
+    let out_pk_spend = pk_from_sk(&out_spend_sk);
+    let out_pk_ivk = ivk_seed(&domain, &out_spend_sk);
+    let out_recipient = recipient_from_pk(&domain, &out_pk_spend, &out_pk_ivk);
+    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient, &sender_id);
+
+    let inv_enforce =
+        compute_inv_enforce(&[value_in], &[rho_in], &[out_value], &[out_rho])?;
+
+    // Viewer attestation (1 viewer).
+    let n_viewers: u64 = 1;
+    let fvk: Hash32 = [11u8; 32];
+    let fvk_commitment = fvk_commit(&fvk);
+    let k = view_kdf(&fvk, &cm_out);
+    let pt = encode_note_plain(&domain, out_value, &out_rho, &out_recipient, &sender_id);
+    let ct = stream_xor_encrypt_144(&k, &pt);
+    let ct_h = ct_hash(&ct);
+    let mac = view_mac(&k, &cm_out, &ct_h);
+
+    // Build args (v2 ABI).
+    let mut args: Vec<LigeroArg> = Vec::new();
+    args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1
+    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) }); // 2 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 (priv)
+    args.push(LigeroArg::I64 { i64: depth as i64 }); // 4
+    args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5
+    args.push(LigeroArg::I64 { i64: n_in as i64 }); // 6
+
+    // Input 0.
+    args.push(LigeroArg::I64 {
+        i64: value_in as i64,
+    }); // value_in_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&rho_in) }); // rho_in_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&sender_id_in),
+    }); // sender_id_in_0 (priv)
+    for lvl in 0..depth {
+        let bit = ((pos >> lvl) & 1) as u8;
+        let mut bit_bytes = [0u8; 32];
+        bit_bytes[31] = bit;
+        args.push(LigeroArg::Hex {
+            hex: hx32(&bit_bytes),
+        });
+    }
+    for s in &siblings {
+        args.push(LigeroArg::Hex { hex: hx32(s) });
+    }
+    args.push(LigeroArg::Hex { hex: hx32(&nf0) }); // nullifier_0 (pub)
+
+    // withdraw + n_out.
+    args.push(LigeroArg::I64 {
+        i64: withdraw_amount as i64,
+    });
+    args.push(LigeroArg::I64 { i64: n_out as i64 });
+
+    // Output 0.
+    args.push(LigeroArg::I64 {
+        i64: out_value as i64,
+    }); // value_out_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&out_rho) }); // rho_out_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_spend),
+    }); // pk_spend_out_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_ivk),
+    }); // pk_ivk_out_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&cm_out) }); // cm_out_0 (pub)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&inv_enforce),
+    }); // inv_enforce (priv)
+
+    // Viewer section.
+    args.push(LigeroArg::I64 {
+        i64: n_viewers as i64,
+    }); // n_viewers (pub)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&fvk_commitment),
+    }); // fvk_commit (pub)
+    let fvk_idx1 = args.len() + 1; // 1-based index of the next arg (fvk)
+    args.push(LigeroArg::Hex { hex: hx32(&fvk) }); // fvk (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&ct_h) }); // ct_hash_0 (pub)
+    args.push(LigeroArg::Hex { hex: hx32(&mac) }); // mac_0 (pub)
+
+    let mut priv_idx = private_indices(depth, n_in, n_out);
+    priv_idx.push(fvk_idx1);
+    let keep_private_indices = vec![fvk_idx1];
+
+    runner.config_mut().private_indices = priv_idx.clone();
+    runner.config_mut().args = args.clone();
+
+    let (proof_bytes, _p_stdout, _p_stderr) =
+        match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+            keep_proof_dir: false,
+            proof_outputs_base: None,
+            write_replay_script: true,
+        }) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+                return Ok(());
+            }
+        };
+
+    anyhow::ensure!(!proof_bytes.is_empty(), "proof should not be empty");
+
+    let vpaths = verifier::VerifierPaths::from_explicit(
+        program.clone(),
+        shader_dir,
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
+
+    // Sanity: verifies with the original statement.
+    let (ok, v_stdout, v_stderr) = verifier::verify_proof_with_output_keep_private_args(
+        &vpaths,
+        &proof_bytes,
+        args.clone(),
+        priv_idx.clone(),
+        keep_private_indices.clone(),
+    )
+    .context("Failed to run verifier")?;
+    if !ok {
+        anyhow::bail!("verifier did not report success\nstdout: {v_stdout}\nstderr: {v_stderr}");
+    }
+
+    // IMPORTANT: when viewer attestations are present, the verifier binary currently needs access
+    // to the viewer key (`fvk`) to reconstruct the same circuit instance as the prover.
+    // Redacting *all* private args should therefore fail verification.
+    verify_expect_fail(&vpaths, &proof_bytes, args.clone(), priv_idx.clone())?;
+
+    let verify_expect_fail_keep_private = |bad_args: Vec<LigeroArg>| -> Result<()> {
+        match verifier::verify_proof_with_output_keep_private_args(
+            &vpaths,
+            &proof_bytes,
+            bad_args,
+            priv_idx.clone(),
+            keep_private_indices.clone(),
+        ) {
+            Ok((ok, stdout, stderr)) => {
+                anyhow::ensure!(
+                    !ok,
+                    "expected verification to fail, but it succeeded\nstdout: {stdout}\nstderr: {stderr}"
+                );
+            }
+            Err(_e) => {}
+        }
+        Ok(())
+    };
+
+    // --- Red team: viewer data must be bound ---
+    let per_in = 4 + 2 * depth;
+    let idx_withdraw: usize = 7 + n_in * per_in;
+    let idx_out_base: usize = idx_withdraw + 2;
+    let idx_n_viewers: usize = idx_out_base + 5 * n_out + 1; // skip inv_enforce
+    let idx_fvk_commit: usize = idx_n_viewers + 1;
+    let idx_ct_hash: usize = idx_n_viewers + 3;
+    let idx_mac: usize = idx_n_viewers + 4;
+
+    let mut bad_commit = fvk_commitment;
+    bad_commit[0] ^= 1;
+    let mut bad_args = args.clone();
+    bad_args[idx_fvk_commit - 1] = LigeroArg::Hex {
+        hex: hx32(&bad_commit),
+    };
+    verify_expect_fail_keep_private(bad_args)?;
+
+    let mut bad_ct = ct_h;
+    bad_ct[0] ^= 1;
+    let mut bad_args = args.clone();
+    bad_args[idx_ct_hash - 1] = LigeroArg::Hex { hex: hx32(&bad_ct) };
+    verify_expect_fail_keep_private(bad_args)?;
+
+    let mut bad_mac = mac;
+    bad_mac[0] ^= 1;
+    let mut bad_args = args;
+    bad_args[idx_mac - 1] = LigeroArg::Hex { hex: hx32(&bad_mac) };
+    verify_expect_fail_keep_private(bad_args)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_note_spend_proof_roundtrip_four_inputs_merge_one_output() -> Result<()> {
+    let repo = repo_root()?;
+    maybe_build_note_spend_guest(&repo)?;
+
+    let program = note_spend_program_path(&repo)?
+        .canonicalize()
+        .context("Failed to canonicalize note_spend_guest.wasm")?;
+
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+
+    let mut runner = LigeroRunner::new(&program.to_string_lossy());
+    runner.config_mut().packing = packing;
+
+    if !runner.paths().prover_bin.exists() || !runner.paths().verifier_bin.exists() {
+        eprintln!(
+            "Skipping: Ligero binaries not found (prover={}, verifier={})",
+            runner.paths().prover_bin.display(),
+            runner.paths().verifier_bin.display()
+        );
+        return Ok(());
+    }
+
+    let shader_dir = PathBuf::from(&runner.config().shader_path);
+    if !shader_dir.exists() {
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
+        return Ok(());
+    }
+
+    println!("[note_spend_roundtrip_4in] Program: {}", program.display());
+    println!(
+        "[note_spend_roundtrip_4in] Prover:   {}",
+        runner.paths().prover_bin.display()
+    );
+    println!(
+        "[note_spend_roundtrip_4in] Verifier: {}",
+        runner.paths().verifier_bin.display()
+    );
+    println!(
+        "[note_spend_roundtrip_4in] Shaders:  {}",
+        shader_dir.display()
+    );
+    println!("[note_spend_roundtrip_4in] Packing:  {}", packing);
+
+    // Small depth to keep runtime reasonable while exercising n_in=4 logic.
+    let depth: usize = 4;
+    let n_in: u64 = 4;
+    let withdraw_amount: u64 = 0;
+    let n_out: u64 = 1;
+
+    let domain: Hash32 = [9u8; 32];
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_ivk_owner = ivk_seed(&domain, &spend_sk);
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id_current = recipient_owner;
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+
+    // 4 inputs at distinct positions, all owned by the same key.
+    let positions: [u64; 4] = [0, 1, 2, 3];
+    let values: [u64; 4] = [10, 20, 30, 40];
+
+    let mut rhos: [Hash32; 4] = [[0u8; 32]; 4];
+    for (i, rho_i) in rhos.iter_mut().enumerate() {
+        *rho_i = [2u8; 32];
+        rho_i[0] = rho_i[0].wrapping_add(i as u8);
+    }
+
+    let mut sender_ids_in: [Hash32; 4] = [[6u8; 32]; 4];
+    for (i, sid) in sender_ids_in.iter_mut().enumerate() {
+        sid[0] = sid[0].wrapping_add(i as u8);
+    }
+
+    let mut tree = MerkleTree::new(depth);
+    for i in 0..4 {
+        let cm_i = note_commitment(
+            &domain,
+            values[i],
+            &rhos[i],
+            &recipient_owner,
+            &sender_ids_in[i],
+        );
+        tree.set_leaf(positions[i] as usize, cm_i);
+    }
+    let anchor = tree.root();
+
+    let mut siblings_vec: Vec<Vec<Hash32>> = Vec::with_capacity(4);
+    let mut nfs: Vec<Hash32> = Vec::with_capacity(4);
+    for i in 0..4 {
+        let siblings = tree.open(positions[i] as usize);
+        anyhow::ensure!(siblings.len() == depth, "unexpected siblings length");
+        siblings_vec.push(siblings);
+
+        let nf_i = nullifier(&domain, &nf_key, &rhos[i]);
+        nfs.push(nf_i);
+    }
+
+    // Output merges all inputs back to self.
+    let sum_in: u64 = values.iter().copied().sum();
+    let out_value: u64 = sum_in;
+    let out_rho: Hash32 = [7u8; 32];
+    let pk_spend_owner = pk_from_sk(&spend_sk);
+    let out_pk_spend = pk_spend_owner;
+    let out_pk_ivk = pk_ivk_owner;
+    let cm_out = note_commitment(
+        &domain,
+        out_value,
+        &out_rho,
+        &recipient_owner,
+        &sender_id_current,
+    );
+
+    let inv_enforce = compute_inv_enforce(&values, &rhos, &[out_value], &[out_rho])?;
+
+    // Build args (v2 ABI).
+    let mut args: Vec<LigeroArg> = Vec::new();
+    args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1
+    args.push(LigeroArg::Hex {
+        hex: hx32(&spend_sk),
+    }); // 2 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 (priv)
+    args.push(LigeroArg::I64 { i64: depth as i64 }); // 4
+    args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5
+    args.push(LigeroArg::I64 { i64: n_in as i64 }); // 6
+
+    for i in 0..4 {
+        args.push(LigeroArg::I64 {
+            i64: values[i] as i64,
+        }); // value_in_i (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&rhos[i]),
+        }); // rho_in_i (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&sender_ids_in[i]),
+        }); // sender_id_in_i (priv)
+
+        let pos = positions[i];
+        for lvl in 0..depth {
+            let bit = ((pos >> lvl) & 1) as u8;
+            let mut bit_bytes = [0u8; 32];
+            bit_bytes[31] = bit;
+            args.push(LigeroArg::Hex {
+                hex: hx32(&bit_bytes),
+            });
+        }
+
+        for s in &siblings_vec[i] {
+            args.push(LigeroArg::Hex { hex: hx32(s) });
+        }
+
+        // nullifier_i (public)
+        args.push(LigeroArg::Hex { hex: hx32(&nfs[i]) });
+    }
+
+    args.push(LigeroArg::I64 {
+        i64: withdraw_amount as i64,
+    });
+    args.push(LigeroArg::I64 { i64: n_out as i64 });
+
+    // Output 0
+    args.push(LigeroArg::I64 {
+        i64: out_value as i64,
+    }); // value_out_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_rho),
+    }); // rho_out_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_spend),
+    }); // pk_spend_out_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_ivk),
+    }); // pk_ivk_out_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&cm_out) }); // cm_out_0 (pub)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&inv_enforce),
+    }); // inv_enforce (priv)
+
+    let priv_idx = private_indices(depth, 4, 1);
+    runner.config_mut().private_indices = priv_idx.clone();
+    runner.config_mut().args = args.clone();
+
+    let (proof_bytes, _p_stdout, _p_stderr) =
+        match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+            keep_proof_dir: false,
+            proof_outputs_base: None,
+            write_replay_script: true,
+        }) {
+            Ok(v) => v,
+            Err(err) => {
+                // Treat GPU/WebGPU/runtime issues as a skip, but surface real constraint failures.
+                let msg = format!("{err:#}");
+                if msg.contains("Validation of linear constraints:")
+                    || msg.contains("Validation of quadratic constraints:")
+                    || msg.contains("Final prove result:")
+                {
+                    return Err(err);
+                }
+                eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+                return Ok(());
+            }
+        };
+
+    anyhow::ensure!(!proof_bytes.is_empty(), "proof should not be empty");
+
+    let vpaths = verifier::VerifierPaths::from_explicit(
+        program.clone(),
+        shader_dir,
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
+
+    // Sanity: verifies with the original statement.
+    let (ok, v_stdout, v_stderr) =
+        verifier::verify_proof_with_output(&vpaths, &proof_bytes, args.clone(), priv_idx.clone())
+            .context("Failed to run verifier")?;
+
+    if !ok {
+        anyhow::bail!("verifier did not report success\nstdout: {v_stdout}\nstderr: {v_stderr}");
+    }
+
+    // --- Red team: mutate a public input nullifier and ensure verification fails ---
+    let per_in = 4 + 2 * depth;
+    let idx_nullifier2: usize = 7 + 2 * per_in + 3 + 2 * depth; // input i=2
+    let mut bad_nf = nfs[2];
+    bad_nf[0] ^= 1;
+    let mut bad_args = args.clone();
+    bad_args[idx_nullifier2 - 1] = LigeroArg::Hex { hex: hx32(&bad_nf) };
+    verify_expect_fail(&vpaths, &proof_bytes, bad_args, priv_idx.clone())?;
+
+    // Mutate anchor.
+    let idx_anchor: usize = 5;
+    let mut bad_anchor = anchor;
+    bad_anchor[0] ^= 1;
+    let mut bad_args = args.clone();
+    bad_args[idx_anchor - 1] = LigeroArg::Hex {
+        hex: hx32(&bad_anchor),
+    };
+    verify_expect_fail(&vpaths, &proof_bytes, bad_args, priv_idx.clone())?;
+
+    // Misconfigured private indices must be rejected.
+    let mut bad_priv_idx = priv_idx;
+    bad_priv_idx.push(idx_anchor);
+    verify_expect_fail(&vpaths, &proof_bytes, args, bad_priv_idx)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_note_spend_rejects_invalid_shapes_and_non_boolean_pos_bits() -> Result<()> {
+    let repo = repo_root()?;
+    maybe_build_note_spend_guest(&repo)?;
+
+    let program = note_spend_program_path(&repo)?
+        .canonicalize()
+        .context("Failed to canonicalize note_spend_guest.wasm")?;
+
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+
+    let mut runner = LigeroRunner::new(&program.to_string_lossy());
+    runner.config_mut().packing = packing;
+
+    if !runner.paths().prover_bin.exists() || !runner.paths().verifier_bin.exists() {
+        eprintln!(
+            "Skipping: Ligero binaries not found (prover={}, verifier={})",
+            runner.paths().prover_bin.display(),
+            runner.paths().verifier_bin.display()
+        );
+        return Ok(());
+    }
+
+    let shader_dir = PathBuf::from(&runner.config().shader_path);
+    if !shader_dir.exists() {
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
+        return Ok(());
+    }
+
+    let vpaths = verifier::VerifierPaths::from_explicit(
+        program.clone(),
+        shader_dir,
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
+
+    // Keep the circuit small but exercise all early checks.
+    let depth: usize = 4;
+    let n_in: u64 = 1;
+    let n_out: u64 = 1;
+
+    let domain: Hash32 = [1u8; 32];
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_ivk_owner = ivk_seed(&domain, &spend_sk);
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id_current = recipient_owner;
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+
+    // One input note in a small tree.
+    let value_in: u64 = 123;
+    let pos: u64 = 0;
+    let rho_in: Hash32 = [2u8; 32];
+    let sender_id_in: Hash32 = [6u8; 32];
+    let cm_in = note_commitment(
+        &domain,
+        value_in,
+        &rho_in,
+        &recipient_owner,
+        &sender_id_in,
+    );
+    let mut tree = MerkleTree::new(depth);
+    tree.set_leaf(pos as usize, cm_in);
+    let anchor = tree.root();
+    let siblings = tree.open(pos as usize);
+    let nf0 = nullifier(&domain, &nf_key, &rho_in);
+
+    // One output (transfer to self for simplicity).
+    let withdraw_amount: u64 = 0;
+    let out_value: u64 = value_in;
+    let out_rho: Hash32 = [7u8; 32];
+    let out_pk_spend = pk_from_sk(&spend_sk);
+    let out_pk_ivk = pk_ivk_owner;
+    let cm_out = note_commitment(
+        &domain,
+        out_value,
+        &out_rho,
+        &recipient_owner,
+        &sender_id_current,
+    );
+
+    let inv_enforce =
+        compute_inv_enforce(&[value_in], &[rho_in], &[out_value], &[out_rho])?;
+
+    // Build a valid statement (baseline).
+    let mut args: Vec<LigeroArg> = Vec::new();
+    args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1
+    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) }); // 2 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 (priv)
+    args.push(LigeroArg::I64 { i64: depth as i64 }); // 4
+    args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5
+    args.push(LigeroArg::I64 { i64: n_in as i64 }); // 6
+
+    // Input 0.
+    args.push(LigeroArg::I64 {
+        i64: value_in as i64,
+    }); // 7 value_in_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&rho_in) }); // 8 rho_in_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&sender_id_in),
+    }); // sender_id_in_0 (priv)
+    for lvl in 0..depth {
+        let bit = ((pos >> lvl) & 1) as u8;
+        let mut bit_bytes = [0u8; 32];
+        bit_bytes[31] = bit;
+        args.push(LigeroArg::Hex {
+            hex: hx32(&bit_bytes),
+        });
+    }
+    for s in &siblings {
+        args.push(LigeroArg::Hex { hex: hx32(s) });
+    }
+    args.push(LigeroArg::Hex { hex: hx32(&nf0) }); // nullifier_0 (pub)
+
+    // withdraw + n_out.
+    args.push(LigeroArg::I64 {
+        i64: withdraw_amount as i64,
+    });
+    args.push(LigeroArg::I64 { i64: n_out as i64 });
+
+    // Output 0.
+    args.push(LigeroArg::I64 {
+        i64: out_value as i64,
+    }); // value_out_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&out_rho) }); // rho_out_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_spend),
+    }); // pk_spend_out_0 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_ivk),
+    }); // pk_ivk_out_0 (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&cm_out) }); // cm_out_0 (pub)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&inv_enforce),
+    }); // inv_enforce (priv)
+
+    let priv_idx = private_indices(depth, 1, 1);
+
+    // First ensure the prover/verifier are working in this environment.
+    runner.config_mut().private_indices = priv_idx.clone();
+    runner.config_mut().args = args.clone();
+    let (baseline_proof, _p_stdout, _p_stderr) =
+        match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+            keep_proof_dir: false,
+            proof_outputs_base: None,
+            write_replay_script: false,
+        }) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+                return Ok(());
+            }
+        };
+
+    let (ok, v_stdout, v_stderr) =
+        verifier::verify_proof_with_output(&vpaths, &baseline_proof, args.clone(), priv_idx.clone())
+            .context("Failed to run verifier")?;
+    if !ok {
+        anyhow::bail!("baseline proof did not verify\nstdout: {v_stdout}\nstderr: {v_stderr}");
+    }
+
+    let mut run_expect_reject = |bad_args: Vec<LigeroArg>| -> Result<()> {
+        runner.config_mut().private_indices = priv_idx.clone();
+        runner.config_mut().args = bad_args.clone();
+        match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+            keep_proof_dir: false,
+            proof_outputs_base: None,
+            write_replay_script: false,
+        }) {
+            Ok((proof_bytes, _stdout, _stderr)) => {
+                let (ok, stdout, stderr) =
+                    verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone())
+                        .context("Failed to run verifier")?;
+                anyhow::ensure!(
+                    !ok,
+                    "expected verification to fail, but it succeeded\nstdout: {stdout}\nstderr: {stderr}"
+                );
+            }
+            Err(_e) => {
+                // Expected: invalid witness/shape triggers UNSAT and the prover exits non-zero.
+            }
+        }
+        Ok(())
+    };
+
+    // Invalid: n_in == 0 must be rejected (regression test for failure-path soundness).
+    let mut bad_args = args.clone();
+    bad_args[5] = LigeroArg::I64 { i64: 0 };
+    run_expect_reject(bad_args)?;
+
+    // Invalid: withdraw_amount == 0 implies n_out must be 1 or 2 (n_out == 0 is forbidden).
+    let mut bad_args = args.clone();
+    let per_in = 4 + 2 * depth;
+    let idx_withdraw_1based: usize = 7 + (n_in as usize) * per_in;
+    let idx_n_out_1based: usize = idx_withdraw_1based + 1;
+    bad_args[idx_n_out_1based - 1] = LigeroArg::I64 { i64: 0 };
+    run_expect_reject(bad_args)?;
+
+    // Invalid: withdraw_amount > 0 implies n_out <= 1 (n_out == 2 is forbidden).
+    let mut bad_args = args.clone();
+    bad_args[idx_withdraw_1based - 1] = LigeroArg::I64 { i64: 1 };
+    bad_args[idx_n_out_1based - 1] = LigeroArg::I64 { i64: 2 };
+    run_expect_reject(bad_args)?;
+
+    // Invalid: position bits must be boolean (0 or 1).
+    let mut bad_args = args;
+    let idx_first_pos_bit_1based: usize = 7 + 3; // header(6) + value + rho + sender_id_in + first pos_bit
+    let mut non_bool = [0u8; 32];
+    non_bool[31] = 2;
+    bad_args[idx_first_pos_bit_1based - 1] = LigeroArg::Hex { hex: hx32(&non_bool) };
+    run_expect_reject(bad_args)?;
 
     Ok(())
 }

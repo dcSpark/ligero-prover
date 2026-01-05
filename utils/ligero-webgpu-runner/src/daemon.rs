@@ -141,8 +141,14 @@ impl DaemonWorker {
             });
         }
 
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("failed to open stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("failed to open stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("failed to open stdout"))?;
 
         Ok(Self {
             io: Mutex::new(DaemonIo {
@@ -174,8 +180,8 @@ impl DaemonWorker {
             return Err(anyhow!("daemon stdout closed unexpectedly"));
         }
 
-        let resp: DaemonResponse =
-            serde_json::from_str(resp_line.trim_end()).context("Failed to parse daemon response")?;
+        let resp: DaemonResponse = serde_json::from_str(resp_line.trim_end())
+            .context("Failed to parse daemon response")?;
         Ok(resp)
     }
 }
@@ -280,24 +286,32 @@ impl DaemonPool {
 
 fn read_frame<R: Read>(r: &mut R) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf).context("Failed to read frame len")?;
+    r.read_exact(&mut len_buf)
+        .context("Failed to read frame len")?;
     let len = u32::from_be_bytes(len_buf) as usize;
     let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).context("Failed to read frame body")?;
+    r.read_exact(&mut buf)
+        .context("Failed to read frame body")?;
     Ok(buf)
 }
 
 fn write_frame<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
     let len = u32::try_from(bytes.len()).context("frame too large")?;
-    w.write_all(&len.to_be_bytes()).context("Failed to write frame len")?;
+    w.write_all(&len.to_be_bytes())
+        .context("Failed to write frame len")?;
     w.write_all(bytes).context("Failed to write frame body")?;
     w.flush().ok();
     Ok(())
 }
 
-fn handle_stream(mut stream: impl Read + Write, prover: &DaemonPool, verifier: &DaemonPool) -> Result<()> {
+fn handle_stream(
+    mut stream: impl Read + Write,
+    prover: &DaemonPool,
+    verifier: &DaemonPool,
+) -> Result<()> {
     let req_bytes = read_frame(&mut stream)?;
-    let req: DaemonRequest = serde_json::from_slice(&req_bytes).context("Failed to parse request")?;
+    let req: DaemonRequest =
+        serde_json::from_slice(&req_bytes).context("Failed to parse request")?;
 
     let resp = match req {
         DaemonRequest::Health { id } => DaemonResponse {
@@ -337,7 +351,11 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
-    pub fn new(paths: &LigeroPaths, prover_workers: usize, verifier_workers: usize) -> Result<Self> {
+    pub fn new(
+        paths: &LigeroPaths,
+        prover_workers: usize,
+        verifier_workers: usize,
+    ) -> Result<Self> {
         Ok(Self {
             prover: DaemonPool::new_prover(paths, prover_workers)?,
             verifier: DaemonPool::new_verifier(paths, verifier_workers)?,
@@ -382,5 +400,3 @@ impl DaemonServer {
         Ok(())
     }
 }
-
-

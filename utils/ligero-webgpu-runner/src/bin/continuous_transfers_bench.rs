@@ -276,8 +276,12 @@ fn build_transfer_witness(
     args.push(LigeroArg::I64 {
         i64: note.value as i64,
     });
-    args.push(LigeroArg::Hex { hex: hx32(&note.rho) });
-    args.push(LigeroArg::Hex { hex: hx32(&recipient) });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&note.rho),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&recipient),
+    });
     args.push(LigeroArg::Hex {
         hex: hx32(&note.spend_sk),
     });
@@ -314,7 +318,9 @@ fn build_transfer_witness(
     args.push(LigeroArg::I64 {
         i64: out_value as i64,
     });
-    args.push(LigeroArg::Hex { hex: hx32(&out_rho) });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_rho),
+    });
     args.push(LigeroArg::Hex { hex: hx32(&out_pk) });
     args.push(LigeroArg::Hex { hex: hx32(&cm_out) });
 
@@ -371,8 +377,7 @@ where
     }
 
     for j in joins {
-        j.join()
-            .map_err(|_| anyhow::anyhow!("thread panicked"))??;
+        j.join().map_err(|_| anyhow::anyhow!("thread panicked"))??;
     }
 
     let mut locked = out.lock().unwrap();
@@ -399,10 +404,8 @@ fn main() -> Result<()> {
     // This makes "workers vs parallelism" impossible to misconfigure from the keyboard.
     let prover_default = env_usize("LIGERO_PROVER_WORKERS", 1);
     let verifier_default = env_usize("LIGERO_VERIFIER_WORKERS", 1);
-    let prover_concurrency =
-        prompt_usize("Prover concurrency", prover_default)?;
-    let verifier_concurrency =
-        prompt_usize("Verifier concurrency", verifier_default)?;
+    let prover_concurrency = prompt_usize("Prover concurrency", prover_default)?;
+    let verifier_concurrency = prompt_usize("Verifier concurrency", verifier_default)?;
     anyhow::ensure!(prover_concurrency > 0, "Prover concurrency must be > 0");
     anyhow::ensure!(verifier_concurrency > 0, "Verifier concurrency must be > 0");
 
@@ -418,7 +421,8 @@ fn main() -> Result<()> {
     let repo = repo_root()?;
     let program = maybe_build_note_spend_guest(&repo)?;
 
-    let paths = LigeroPaths::discover().or_else(|_| Ok::<_, anyhow::Error>(LigeroPaths::fallback()))?;
+    let paths =
+        LigeroPaths::discover().or_else(|_| Ok::<_, anyhow::Error>(LigeroPaths::fallback()))?;
     let shader_path = paths.shader_dir.to_string_lossy().to_string();
 
     eprintln!(
@@ -520,7 +524,9 @@ fn main() -> Result<()> {
                     args: w.args.clone(),
                 };
                 let cfg_json = serde_json::to_value(&cfg)?;
-                let resp = prover_pool.prove(cfg_json).context("daemon prove request failed")?;
+                let resp = prover_pool
+                    .prove(cfg_json)
+                    .context("daemon prove request failed")?;
                 if !resp.ok {
                     anyhow::bail!(
                         "prover daemon returned ok=false (exit_code={:?}): {}",
@@ -612,5 +618,3 @@ fn main() -> Result<()> {
 
     Ok(())
 }
-
-

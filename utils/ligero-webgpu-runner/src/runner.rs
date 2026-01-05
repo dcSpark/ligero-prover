@@ -37,7 +37,12 @@ fn canonicalize_config_for_run(config: &LigeroConfig, caller_cwd: &Path) -> Resu
     cfg.program = match resolve(caller_cwd, &cfg.program) {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(_) => crate::resolve_program(&cfg.program)
-            .with_context(|| format!("Failed to resolve Ligero program (path or name): {}", cfg.program))?
+            .with_context(|| {
+                format!(
+                    "Failed to resolve Ligero program (path or name): {}",
+                    cfg.program
+                )
+            })?
             .to_string_lossy()
             .into_owned(),
     };
@@ -140,7 +145,6 @@ impl LigeroRunner {
         }
     }
 
-
     /// Access the current config (immutable).
     pub fn config(&self) -> &LigeroConfig {
         &self.config
@@ -166,7 +170,6 @@ impl LigeroRunner {
         self.config.gpu_threads = gpu_threads;
         self
     }
-
 
     /// Set private argument indices (1-based).
     pub fn with_private_indices(mut self, indices: Vec<usize>) -> Self {
@@ -375,7 +378,6 @@ exec \"$PROVER_BIN\" \"$CONFIG_JSON\"
             );
         }
 
-    
         Ok((proof, stdout, stderr))
     }
 

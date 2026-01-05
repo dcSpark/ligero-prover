@@ -369,6 +369,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "hex",
+ "lazy_static",
  "ligetron",
  "rand",
  "serde",
