@@ -36,7 +36,7 @@ Environment:
   CMAKE_JOB_COUNT   Parallel build jobs
   DAWN_GIT_REF      Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
   LIGERO_REPO       Ligero prover git URL (default: https://github.com/dcspark/ligero-prover.git)
-  LIGERO_BRANCH     Ligero prover git branch (default: feature/ligero-runner)
+  LIGERO_BRANCH     Ligero prover git branch (default: feature/midnight-l2)
 EOF
 }
 
@@ -79,7 +79,7 @@ fi
 
 DAWN_GIT_REF="${DAWN_GIT_REF:-cec4482eccee45696a7c0019e750c77f101ced04}"
 LIGERO_REPO="${LIGERO_REPO:-https://github.com/dcspark/ligero-prover.git}"
-LIGERO_BRANCH="${LIGERO_BRANCH:-feature/ligero-runner}"
+LIGERO_BRANCH="${LIGERO_BRANCH:-feature/midnight-l2}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -107,6 +107,20 @@ for f in "${REQUIRED_FORMULAE[@]}"; do
     brew install "$f"
   fi
 done
+
+# Verify Boost version is >= 1.84 (archive version 19)
+# This is required for cross-platform proof compatibility with Linux builds.
+BOOST_VERSION="$(brew info --json=v2 boost | python3 -c 'import sys,json; print(json.load(sys.stdin)["formulae"][0]["versions"]["stable"])' 2>/dev/null || echo "unknown")"
+echo "==> Homebrew Boost version: $BOOST_VERSION"
+# Extract major.minor version for comparison
+BOOST_MAJOR="${BOOST_VERSION%%.*}"
+BOOST_REST="${BOOST_VERSION#*.}"
+BOOST_MINOR="${BOOST_REST%%.*}"
+if [[ "$BOOST_MAJOR" -lt 1 ]] || { [[ "$BOOST_MAJOR" -eq 1 ]] && [[ "$BOOST_MINOR" -lt 84 ]]; }; then
+  echo "warning: Boost version $BOOST_VERSION is older than 1.84."
+  echo "         Cross-platform proof compatibility requires Boost >= 1.84 (archive version 19)."
+  echo "         Consider running: brew upgrade boost"
+fi
 
 # IMPORTANT:
 # Homebrew LLVM uses its own libc++ headers which can mismatch the system libc++ at link-time,
