@@ -108,8 +108,10 @@
 	  // New code for the 'Download' button
 	  document.getElementById('download-button').addEventListener('click', function() {
 		  try {
-			  // Read the 'proof_data.gz' file from Emscripten's virtual filesystem
-			  var proofData = FS.readFile('proof_data.gz', { encoding: 'binary' });
+			  // Read the proof file from Emscripten's virtual filesystem.
+			  // Default output is `proof_data.gz`; when gzip is disabled, it can be `proof_data.bin`.
+			  var proofFilename = FS.analyzePath('proof_data.gz').exists ? 'proof_data.gz' : 'proof_data.bin';
+			  var proofData = FS.readFile(proofFilename, { encoding: 'binary' });
 			  
 			  // Create a Blob from the file data
 			  var blob = new Blob([proofData], { type: 'application/octet-stream' });
@@ -120,7 +122,7 @@
 			  // Create a temporary anchor element to initiate the download
 			  var a = document.createElement('a');
 			  a.href = url;
-			  a.download = 'proof_data.gz';
+			  a.download = proofFilename;
 			  document.body.appendChild(a);
 			  a.click();
 			  
@@ -159,6 +161,8 @@
 						  var dir = '/';
 
 						  // Write the file to Emscripten's filesystem
+						  // For backward compatibility, keep the on-page filename gzip by default.
+						  // When using uncompressed proofs, prefer writing to `proof_data.bin`.
 						  FS.writeFile('proof_data.gz', new Uint8Array(contents));
 
 						  const input1 = document.getElementById('input1').value;

@@ -263,6 +263,27 @@ impl Bn254Fr {
         }
     }
 
+    /// Get field element as bytes in big-endian order
+    pub fn get_bytes_big(&self, out: &mut [u8]) {
+        unsafe {
+            _bn254fr_get_bytes(&self.data, out.as_mut_ptr(), out.len() as u32, 1); // 1 = big-endian
+        }
+    }
+
+    /// Get field element as bytes in little-endian order  
+    pub fn get_bytes_little(&self, out: &mut [u8]) {
+        unsafe {
+            _bn254fr_get_bytes(&self.data, out.as_mut_ptr(), out.len() as u32, -1); // -1 = little-endian
+        }
+    }
+
+    /// Get field element as 32 bytes in big-endian order (convenience method)
+    pub fn to_bytes_be(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        self.get_bytes_big(&mut out);
+        out
+    }
+
     /// Print field element for debugging (base 10 or 16)
     pub fn print_dec(&self) {
         unsafe {
@@ -447,6 +468,30 @@ impl Bn254Fr {
         }
         a.set_constrained(true);
         b.set_constrained(true);
+    }
+
+    /// Assert a == u64 constant (binds as public input in constraint system)
+    pub fn assert_equal_u64(a: &Bn254Fr, value: u64) {
+        unsafe {
+            _bn254fr_assert_equal_u64(&a.data, value);
+        }
+        a.set_constrained(true);
+    }
+
+    /// Assert a == bytes (big-endian) as public input in constraint system
+    pub fn assert_equal_bytes_be(a: &Bn254Fr, bytes: &[u8]) {
+        unsafe {
+            _bn254fr_assert_equal_bytes(&a.data, bytes.as_ptr(), bytes.len() as u32, 1); // 1 = big-endian
+        }
+        a.set_constrained(true);
+    }
+
+    /// Assert a == bytes (little-endian) as public input in constraint system
+    pub fn assert_equal_bytes_le(a: &Bn254Fr, bytes: &[u8]) {
+        unsafe {
+            _bn254fr_assert_equal_bytes(&a.data, bytes.as_ptr(), bytes.len() as u32, -1); // -1 = little-endian
+        }
+        a.set_constrained(true);
     }
 
     /// Assert self == a + b (enforces a linear constraint)
@@ -739,6 +784,9 @@ extern "C" {
     #[link_name = "bn254fr_get_u64"]
     fn _bn254fr_get_u64(x: *const bn254fr_t) -> u64;
 
+    #[link_name = "bn254fr_get_bytes"]
+    fn _bn254fr_get_bytes(x: *const bn254fr_t, out: *mut u8, len: u32, order: i32);
+
     #[link_name = "bn254fr_copy"]
     fn _bn254fr_copy(dest: *mut bn254fr_t, src: *const bn254fr_t);
 
@@ -834,6 +882,12 @@ extern "C" {
     // Zero knowledge
     #[link_name = "bn254fr_assert_equal"]
     fn _bn254fr_assert_equal(a: *const bn254fr_t, b: *const bn254fr_t);
+
+    #[link_name = "bn254fr_assert_equal_u64"]
+    fn _bn254fr_assert_equal_u64(a: *const bn254fr_t, b: u64);
+
+    #[link_name = "bn254fr_assert_equal_bytes"]
+    fn _bn254fr_assert_equal_bytes(a: *const bn254fr_t, bytes: *const u8, len: u32, order: i32);
 
     #[link_name = "bn254fr_assert_add"]
     fn _bn254fr_assert_add(out: *const bn254fr_t, a: *const bn254fr_t, b: *const bn254fr_t);

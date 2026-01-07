@@ -1,0 +1,26 @@
+[package]
+name = "note-deposit-guest"
+version = "0.1.0"
+edition = "2021"
+
+# Exclude from parent workspace
+[workspace]
+
+[[bin]]
+name = "note_deposit_guest"
+path = "src/main.rs"
+
+[dependencies]
+ligetron = { path = "../../../sdk/rust", default-features = false }
+
+[features]
+native = []
+diagnostics = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+

@@ -371,6 +371,37 @@ struct bn254fr_module : public host_module {
         assert(written <= size && "invalid number of bytes written");
     }
 
+    void bn254fr_get_bytes() {
+        s32 order      = ctx_->stack_pop().as_u32();
+        u32 size       = ctx_->stack_pop().as_u32();
+        u32 data_addr  = ctx_->stack_pop().as_u32();
+        u32 bn254_addr = ctx_->stack_pop().as_u32();
+        auto *mem = ctx_->memory_data().data();
+
+        auto *wit = load_bn254(bn254_addr);
+
+        size_t count = 0;
+        mpz_export(mem + data_addr,
+                   &count,
+                   order,
+                   sizeof(u8),
+                   0,
+                   0,
+                   wit->value_ptr()->get_mpz_t());
+
+        // Zero-pad remaining bytes if the value is smaller than requested size
+        if (count < size) {
+            if (order == 1) {
+                // Big-endian: shift data right and zero-pad left
+                std::memmove(mem + data_addr + (size - count), mem + data_addr, count);
+                std::memset(mem + data_addr, 0, size - count);
+            } else {
+                // Little-endian: zero-pad on the right
+                std::memset(mem + data_addr + count, 0, size - count);
+            }
+        }
+    }
+
     void bn254fr_copy() {
         u32 src_addr  = ctx_->stack_pop().as_u32();
         u32 dest_addr = ctx_->stack_pop().as_u32();
@@ -876,6 +907,7 @@ struct bn254fr_module : public host_module {
             { "bn254fr_set_str",            &Self::bn254fr_set_str            },
 
             { "bn254fr_get_u64",            &Self::bn254fr_get_u64            },
+            { "bn254fr_get_bytes",          &Self::bn254fr_get_bytes          },
             { "bn254fr_to_bytes",           &Self::bn254fr_to_bytes           },
 
             { "bn254fr_copy",               &Self::bn254fr_copy               },

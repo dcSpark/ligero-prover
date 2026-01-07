@@ -14,6 +14,14 @@ void bn254fr_set_bytes_big(bn254fr_t out, const unsigned char *bytes, uint32_t l
     bn254fr_set_bytes(out, bytes, len, 1);
 }
 
+void bn254fr_get_bytes_little(const bn254fr_t x, unsigned char *bytes, uint32_t len) {
+    bn254fr_get_bytes(x, bytes, len, -1);
+}
+
+void bn254fr_get_bytes_big(const bn254fr_t x, unsigned char *bytes, uint32_t len) {
+    bn254fr_get_bytes(x, bytes, len, 1);
+}
+
 /* --------------- Scalar Arithmetic helpers --------------- */
 
 void bn254fr_addmod_checked(bn254fr_t out, const bn254fr_t a, const bn254fr_t b) {
@@ -226,6 +234,14 @@ void bn254fr_class::print_hex() const {
 
 uint64_t bn254fr_class::get_u64() const {
     return bn254fr_get_u64(data_);
+}
+
+void bn254fr_class::get_bytes_little(unsigned char *bytes, uint32_t len) const {
+    bn254fr_get_bytes_little(data_, bytes, len);
+}
+
+void bn254fr_class::get_bytes_big(unsigned char *bytes, uint32_t len) const {
+    bn254fr_get_bytes_big(data_, bytes, len);
 }
 
 /* --------------- Setters --------------- */

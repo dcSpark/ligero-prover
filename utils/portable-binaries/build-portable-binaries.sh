@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: build-portable-binaries.sh [options]
+
+Build and package portable Ligero native binaries into:
+
+  utils/portable-binaries/
+    <arch>/{bin,lib}/
+    shader/              (optional; only needed for tarball packaging)
+
+Then (optionally) produce a single tarball containing the staged outputs.
+
+Architectures:
+  - linux-amd64   (Docker, linux/amd64)
+  - linux-arm64   (Docker, linux/arm64)
+  - macos-arm64   (native build on Apple Silicon)
+
+Options:
+  -a, --arch <name...>   Limit builds to the listed architectures.
+                         Supported: linux-amd64 linux-x86_64 amd64 x86_64 linux-arm64 arm64 aarch64 macos-arm64 mac-arm64
+  -o, --out <dir>        Output directory (default: <repo>/utils/portable-binaries)
+  --use-local-ligero     Use this local `ligero-prover` checkout (do not git clone for shaders/sources).
+  -h, --help             Show this help message.
+
+Environment:
+  DOCKER_IMAGE           Docker image for Linux builds (default: ubuntu:24.04)
+  CMAKE_JOB_COUNT        Override parallel job count
+  LIGERO_USE_LOCAL_LIGERO Set to 1 to use this local `ligero-prover` checkout (same as --use-local-ligero)
+  LIGERO_REPO            Ligero prover git URL used to fetch shaders (default: https://github.com/dcspark/ligero-prover.git)
+  LIGERO_BRANCH          Ligero prover git branch used to fetch shaders (default: feature/midnight-l2)
+EOF
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PROVER_ROOT="$REPO_ROOT"
+PORTABLE_SCRIPTS_DIR="$REPO_ROOT/utils/portable-binaries/build-portable-binaries"
+
+OUT_DIR="$REPO_ROOT/utils/portable-binaries"
+DOCKER_IMAGE="${DOCKER_IMAGE:-ubuntu:24.04}"
+LIGERO_REPO="${LIGERO_REPO:-https://github.com/dcspark/ligero-prover.git}"
+LIGERO_BRANCH="${LIGERO_BRANCH:-feature/midnight-l2}"
+USE_LOCAL_LIGERO="${LIGERO_USE_LOCAL_LIGERO:-0}"
+
+DEFAULT_ARCHES=("linux-amd64" "linux-arm64" "macos-arm64")
+ARCHES=("${DEFAULT_ARCHES[@]}")
+
+normalize_arch() {
+  case "${1}" in
+    linux-amd64|linux-x86_64|amd64|x86_64) echo "linux-amd64" ;;
+    linux-arm64|arm64|aarch64) echo "linux-arm64" ;;
+    macos-arm64|mac-arm64) echo "macos-arm64" ;;
+    *) echo "" ;;
+  esac
+}
+
+if [[ $# -gt 0 ]]; then
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--arch)
+        shift
+        [[ $# -gt 0 ]] || { echo "error: --arch expects at least one value" >&2; usage; exit 1; }
+        ARCHES=()
+        while [[ $# -gt 0 && ${1:0:1} != "-" ]]; do
+          norm="$(normalize_arch "$1")"
+          [[ -n "$norm" ]] || { echo "error: unsupported arch '$1'" >&2; usage; exit 1; }
+          ARCHES+=("$norm")
+          shift
+        done
+        ;;
+      -o|--out)
+        shift
+        [[ $# -gt 0 ]] || { echo "error: --out expects a directory path" >&2; usage; exit 1; }
+        OUT_DIR="$1"
+        shift
+        ;;
+      --use-local-ligero)
+        USE_LOCAL_LIGERO=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "error: unknown argument '$1'" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+fi
+
+if [[ ${#ARCHES[@]} -eq 0 ]]; then
+  echo "error: no architectures selected" >&2
+  exit 1
+fi
+
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+
+if [[ ! -f "$PORTABLE_SCRIPTS_DIR/linux-build-and-stage.sh" || ! -f "$PORTABLE_SCRIPTS_DIR/macos-build-and-stage.sh" ]]; then
+  echo "error: portable build scripts not found where expected" >&2
+  echo "  expected: $PORTABLE_SCRIPTS_DIR/{linux-build-and-stage.sh,macos-build-and-stage.sh}" >&2
+  echo "  repo root: $REPO_ROOT" >&2
+  exit 1
+fi
+
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+
+STAGE_DIR="$OUT_DIR"
+
+# Only clean the selected architecture folders (avoid nuking other contents).
+for arch in "${ARCHES[@]}"; do
+  rm -rf "$STAGE_DIR/$arch"
+done
+mkdir -p "$STAGE_DIR"
+
+ensure_shaders() {
+  # If shader dir already has files, keep it.
+  if [[ -d "$STAGE_DIR/shader" ]] && find "$STAGE_DIR/shader" -mindepth 1 -maxdepth 1 | read -r _; then
+    return 0
+  fi
+
+  echo "==> Fetching shaders..."
+
+  if [[ "$USE_LOCAL_LIGERO" == "1" ]]; then
+    if [[ ! -d "$REPO_ROOT/shader" ]]; then
+      echo "error: repo shader/ folder not found at $REPO_ROOT/shader" >&2
+      exit 1
+    fi
+    rm -rf "$STAGE_DIR/shader"
+    mkdir -p "$STAGE_DIR/shader"
+    cp -R "$REPO_ROOT/shader/." "$STAGE_DIR/shader/"
+    return 0
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "error: git is required to fetch shaders but not found in PATH" >&2
+    exit 1
+  fi
+
+  tmp="$(mktemp -d -t ligero-shader.XXXXXX)"
+  trap 'rm -rf "$tmp"' RETURN
+  git clone --depth 1 -b "$LIGERO_BRANCH" "$LIGERO_REPO" "$tmp/ligero-prover"
+  if [[ ! -d "$tmp/ligero-prover/shader" ]]; then
+    echo "error: shader folder not found in $LIGERO_REPO ($LIGERO_BRANCH)" >&2
+    exit 1
+  fi
+  rm -rf "$STAGE_DIR/shader"
+  mkdir -p "$STAGE_DIR/shader"
+  cp -R "$tmp/ligero-prover/shader/." "$STAGE_DIR/shader/"
+}
+
+ensure_shaders
+
+need_docker=false
+for arch in "${ARCHES[@]}"; do
+  if [[ "$arch" == linux-* ]]; then
+    need_docker=true
+  fi
+done
+if [[ "$need_docker" == "true" ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "error: docker is required for linux builds but not found in PATH" >&2
+    exit 1
+  fi
+fi
+
+build_linux() {
+  local arch="$1"
+  local platform=""
+  case "$arch" in
+    linux-amd64) platform="linux/amd64" ;;
+    linux-arm64) platform="linux/arm64" ;;
+    *) echo "internal error: build_linux called with '$arch'" >&2; exit 1 ;;
+  esac
+
+  echo "==> Building $arch via Docker ($platform)..."
+
+  local local_mount_args=()
+  local local_run_args=()
+  if [[ "$USE_LOCAL_LIGERO" == "1" ]]; then
+    local_mount_args+=(-v "$REPO_ROOT:/ligero-local:ro")
+    local_run_args+=(--use-local-ligero)
+  fi
+
+  docker run \
+    --rm \
+    --platform="$platform" \
+    -e "HOST_UID=$HOST_UID" \
+    -e "HOST_GID=$HOST_GID" \
+    -e "CMAKE_JOB_COUNT=${CMAKE_JOB_COUNT:-}" \
+    -e "LIGERO_REPO=$LIGERO_REPO" \
+    -e "LIGERO_BRANCH=$LIGERO_BRANCH" \
+    -v "$OUT_DIR:/out" \
+    -v "$PORTABLE_SCRIPTS_DIR/linux-build-and-stage.sh:/run.sh:ro" \
+    "${local_mount_args[@]}" \
+    -w / \
+    "$DOCKER_IMAGE" \
+    bash /run.sh --arch "$arch" --out /out --no-tar "${local_run_args[@]}"
+}
+
+build_macos_arm64() {
+  echo "==> Building macos-arm64 locally..."
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "error: macos-arm64 build must be run on macOS" >&2
+    exit 1
+  fi
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    echo "error: macos-arm64 build must be run on Apple Silicon (arm64)" >&2
+    exit 1
+  fi
+  # Standalone script; stage into our shared multi-arch output and skip its tarball
+  local mac_args=(--out "$OUT_DIR" --no-tar)
+  if [[ "$USE_LOCAL_LIGERO" == "1" ]]; then
+    mac_args+=(--use-local-ligero)
+  fi
+  bash "$PORTABLE_SCRIPTS_DIR/macos-build-and-stage.sh" "${mac_args[@]}"
+}
+
+# De-dupe arches while preserving order
+UNIQ_ARCHES=()
+for a in "${ARCHES[@]}"; do
+  seen=false
+  for b in "${UNIQ_ARCHES[@]}"; do
+    if [[ "$a" == "$b" ]]; then
+      seen=true
+      break
+    fi
+  done
+  if [[ "$seen" == "false" ]]; then
+    UNIQ_ARCHES+=("$a")
+  fi
+done
+
+for arch in "${UNIQ_ARCHES[@]}"; do
+  case "$arch" in
+    linux-amd64|linux-arm64) build_linux "$arch" ;;
+    macos-arm64) build_macos_arm64 ;;
+    *) echo "error: unsupported arch '$arch'" >&2; exit 1 ;;
+  esac
+done
+
+echo "==> Creating tar.gz..."
+TARBALL="$OUT_DIR/ligero-bins.tar.gz"
+rm -f "$TARBALL"
+entries=()
+for arch in "${UNIQ_ARCHES[@]}"; do
+  entries+=("$arch")
+done
+if [[ -d "$OUT_DIR/shader" ]]; then
+  entries+=("shader")
+fi
+(cd "$OUT_DIR" && tar -czf "$(basename "$TARBALL")" "${entries[@]}")
+
+echo "==> Done."
+echo "    Folder:  $STAGE_DIR"
+echo "    Tarball: $TARBALL"
+
+
