@@ -19,8 +19,180 @@ type Hash32 = [u8; 32];
 
 const BL_DEPTH: usize = 63;
 
+const PRIVPOOL_EXAMPLE_ADDR: &str =
+    "privpool1eqrexjkvvw5wjljp4mpup250hl4sdpk6hl36dmdcdsfldvjw2j8staydzl";
+
 fn hx32(b: &Hash32) -> String {
     hex::encode(b)
+}
+
+// === Minimal Bech32m decode/encode for privpool addresses (HRP = "privpool") ===
+
+const BECH32_CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const BECH32M_CONST: u32 = 0x2bc8_30a3;
+
+fn bech32_char_to_u5(c: u8) -> Option<u8> {
+    match c {
+        b'q' => Some(0),
+        b'p' => Some(1),
+        b'z' => Some(2),
+        b'r' => Some(3),
+        b'y' => Some(4),
+        b'9' => Some(5),
+        b'x' => Some(6),
+        b'8' => Some(7),
+        b'g' => Some(8),
+        b'f' => Some(9),
+        b'2' => Some(10),
+        b't' => Some(11),
+        b'v' => Some(12),
+        b'd' => Some(13),
+        b'w' => Some(14),
+        b'0' => Some(15),
+        b's' => Some(16),
+        b'3' => Some(17),
+        b'j' => Some(18),
+        b'n' => Some(19),
+        b'5' => Some(20),
+        b'4' => Some(21),
+        b'k' => Some(22),
+        b'h' => Some(23),
+        b'c' => Some(24),
+        b'e' => Some(25),
+        b'6' => Some(26),
+        b'm' => Some(27),
+        b'u' => Some(28),
+        b'a' => Some(29),
+        b'7' => Some(30),
+        b'l' => Some(31),
+        _ => None,
+    }
+}
+
+fn bech32_polymod(values: &[u8]) -> u32 {
+    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    let mut chk: u32 = 1;
+    for &v in values {
+        let b = chk >> 25;
+        chk = ((chk & 0x01ff_ffff) << 5) ^ (v as u32);
+        for (i, g) in GEN.iter().enumerate() {
+            if ((b >> i) & 1) != 0 {
+                chk ^= g;
+            }
+        }
+    }
+    chk
+}
+
+fn bech32_hrp_expand(hrp: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hrp.len() * 2 + 1);
+    for b in hrp.as_bytes() {
+        out.push(*b >> 5);
+    }
+    out.push(0);
+    for b in hrp.as_bytes() {
+        out.push(*b & 31);
+    }
+    out
+}
+
+fn bech32m_checksum(hrp: &str, data: &[u8]) -> [u8; 6] {
+    let mut values = bech32_hrp_expand(hrp);
+    values.extend_from_slice(data);
+    values.extend_from_slice(&[0u8; 6]);
+    let pm = bech32_polymod(&values) ^ BECH32M_CONST;
+
+    let mut out = [0u8; 6];
+    for i in 0..6 {
+        out[i] = ((pm >> (5 * (5 - i))) & 31) as u8;
+    }
+    out
+}
+
+fn bech32m_decode(s: &str) -> Result<(String, Vec<u8>)> {
+    anyhow::ensure!(!s.is_empty(), "empty bech32m string");
+    anyhow::ensure!(
+        s.bytes().all(|b| (33..=126).contains(&b)),
+        "invalid ascii in bech32m string"
+    );
+
+    let has_lower = s.bytes().any(|b| (b'a'..=b'z').contains(&b));
+    let has_upper = s.bytes().any(|b| (b'A'..=b'Z').contains(&b));
+    anyhow::ensure!(!(has_lower && has_upper), "mixed-case bech32m string");
+
+    let s = s.to_ascii_lowercase();
+    let pos = s.rfind('1').context("missing bech32 separator '1'")?;
+    anyhow::ensure!(pos >= 1, "hrp too short");
+    anyhow::ensure!(pos + 7 <= s.len(), "data too short for checksum");
+
+    let hrp = s[..pos].to_string();
+    let data_part = s[pos + 1..].as_bytes();
+
+    let mut data_u5: Vec<u8> = Vec::with_capacity(data_part.len());
+    for &c in data_part {
+        data_u5.push(bech32_char_to_u5(c).context("invalid bech32 char")?);
+    }
+    anyhow::ensure!(data_u5.len() >= 6, "missing checksum");
+
+    // Verify bech32m checksum.
+    let pm = {
+        let mut v = bech32_hrp_expand(&hrp);
+        v.extend_from_slice(&data_u5);
+        bech32_polymod(&v)
+    };
+    anyhow::ensure!(pm == BECH32M_CONST, "invalid bech32m checksum");
+
+    data_u5.truncate(data_u5.len() - 6);
+    Ok((hrp, data_u5))
+}
+
+fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Result<Vec<u8>> {
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out: Vec<u8> = Vec::new();
+    let maxv: u32 = (1 << to) - 1;
+
+    for &v in data {
+        anyhow::ensure!((v as u32) < (1 << from), "convert_bits: value out of range");
+        acc = (acc << from) | (v as u32);
+        bits += from;
+        while bits >= to {
+            bits -= to;
+            out.push(((acc >> bits) & maxv) as u8);
+        }
+    }
+
+    if pad {
+        if bits != 0 {
+            out.push(((acc << (to - bits)) & maxv) as u8);
+        }
+    } else {
+        anyhow::ensure!(bits < from, "convert_bits: excess padding");
+        anyhow::ensure!(((acc << (to - bits)) & maxv) == 0, "convert_bits: non-zero padding");
+    }
+
+    Ok(out)
+}
+
+fn decode_privpool_addr(addr: &str) -> Result<Hash32> {
+    let (hrp, data_u5) = bech32m_decode(addr)?;
+    anyhow::ensure!(hrp == "privpool", "unexpected hrp: {hrp}");
+    let raw = convert_bits(&data_u5, 5, 8, false)?;
+    anyhow::ensure!(raw.len() == 32, "unexpected payload length: {}", raw.len());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+fn encode_privpool_addr(id: &Hash32) -> String {
+    let data_u5 = convert_bits(id, 8, 5, true).expect("8->5 convert_bits must succeed");
+    let checksum = bech32m_checksum("privpool", &data_u5);
+    let mut s = String::with_capacity("privpool1".len() + data_u5.len() + 6);
+    s.push_str("privpool1");
+    for v in data_u5.iter().chain(checksum.iter()) {
+        s.push(BECH32_CHARSET[*v as usize] as char);
+    }
+    s
 }
 
 fn repo_root() -> Result<PathBuf> {
@@ -775,6 +947,20 @@ fn test_note_deposit_blacklist_accepts_unlisted_and_rejects_listed() -> Result<(
         return Ok(());
     };
 
+    // Example address (bech32m) that we can add to the blacklist tree AND attempt to deposit to.
+    //
+    // This test assumes the bech32m payload is the 32-byte `pk_spend`, and (per your scheme)
+    // `pk_ivk == pk_spend`.
+    //
+    // Then the circuit-level recipient is:
+    //   recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
+    let pk_spend_example = decode_privpool_addr(PRIVPOOL_EXAMPLE_ADDR)?;
+    let pk_ivk_example = pk_spend_example;
+    anyhow::ensure!(
+        encode_privpool_addr(&pk_spend_example) == PRIVPOOL_EXAMPLE_ADDR,
+        "privpool bech32m roundtrip mismatch"
+    );
+
     // Two recipients: one will be blacklisted (leaf=1), the other unlisted (leaf=0).
     let domain: Hash32 = [0x55u8; 32];
     let value: u64 = 42;
@@ -789,23 +975,44 @@ fn test_note_deposit_blacklist_accepts_unlisted_and_rejects_listed() -> Result<(
     let pk_ivk_bad: Hash32 = [0x77u8; 32];
     let recipient_bad = recipient_from_pk(&domain, &pk_spend_bad, &pk_ivk_bad);
 
+    let recipient_example = recipient_from_pk(&domain, &pk_spend_example, &pk_ivk_example);
+    let pos_example = bl_pos_from_id(&recipient_example);
     let pos_bad = bl_pos_from_id(&recipient_bad);
     let pos_ok = bl_pos_from_id(&recipient_ok);
-    anyhow::ensure!(pos_bad != pos_ok, "unexpected blacklist index collision");
+    anyhow::ensure!(pos_bad != pos_ok, "unexpected blacklist index collision (bad vs ok)");
+    anyhow::ensure!(
+        pos_example != pos_ok,
+        "unexpected blacklist index collision (example vs ok)"
+    );
+    anyhow::ensure!(
+        pos_example != pos_bad,
+        "unexpected blacklist index collision (example vs bad)"
+    );
 
     let leaf0: Hash32 = [0u8; 32];
     let mut leaf1: Hash32 = [0u8; 32];
     leaf1[31] = 1;
 
-    // Build a sparse blacklist tree with exactly one blacklisted leaf.
+    // Build a sparse blacklist tree with two blacklisted leaves:
+    // - a fixed bech32m example (for docs/demo),
+    // - the `recipient_bad` we will actually attempt to deposit to (to assert circuit rejection).
     let (blacklist_root, openings) = merkle_root_and_openings_sparse(
         BL_DEPTH,
-        &[(pos_bad, leaf1), (pos_ok, leaf0)],
+        &[(pos_example, leaf1), (pos_bad, leaf1), (pos_ok, leaf0)],
     )?;
-    let sibs_bad = &openings[0];
-    let sibs_ok = &openings[1];
+    let sibs_example = &openings[0];
+    let sibs_bad = &openings[1];
+    let sibs_ok = &openings[2];
 
     // Sanity: membership at pos_bad is 1, and at pos_ok is 0, under the same root.
+    anyhow::ensure!(
+        merkle_root_from_path(&leaf1, pos_example, sibs_example) == blacklist_root,
+        "example blacklisted recipient opening must match root"
+    );
+    anyhow::ensure!(
+        merkle_root_from_path(&leaf0, pos_example, sibs_example) != blacklist_root,
+        "example blacklisted recipient must not be able to prove leaf=0"
+    );
     anyhow::ensure!(
         merkle_root_from_path(&leaf1, pos_bad, sibs_bad) == blacklist_root,
         "blacklisted address opening must match root"
@@ -857,6 +1064,57 @@ fn test_note_deposit_blacklist_accepts_unlisted_and_rejects_listed() -> Result<(
         anyhow::bail!(
             "verifier did not report success for unlisted address\nstdout: {v_stdout}\nstderr: {v_stderr}"
         );
+    }
+
+    // === Proof for the example bech32m address must be rejected ===
+    let rho_example: Hash32 = [0x33u8; 32];
+    let cm_example =
+        note_commitment_v2(&domain, value, &rho_example, &recipient_example, &sender_id);
+
+    let mut args_example = vec![
+        LigeroArg::Hex { hex: hx32(&domain) },
+        LigeroArg::I64 { i64: value as i64 },
+        LigeroArg::Hex {
+            hex: hx32(&rho_example),
+        },
+        LigeroArg::Hex {
+            hex: hx32(&pk_spend_example),
+        },
+        LigeroArg::Hex {
+            hex: hx32(&pk_ivk_example),
+        },
+        LigeroArg::Hex {
+            hex: hx32(&cm_example),
+        },
+        LigeroArg::Hex {
+            hex: hx32(&blacklist_root),
+        },
+    ];
+    for sib in sibs_example.iter().take(BL_DEPTH) {
+        args_example.push(LigeroArg::Hex { hex: hx32(sib) });
+    }
+
+    runner.config_mut().private_indices = priv_idx.clone();
+    runner.config_mut().args = args_example.clone();
+    match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+        keep_proof_dir: false,
+        proof_outputs_base: None,
+        write_replay_script: false,
+    }) {
+        Err(_e) => {} // rejected at prove-time ✅ (expected)
+        Ok((proof_example, _stdout, _stderr)) => {
+            let (ok_example, _stdout, _stderr) = verifier::verify_proof_with_output(
+                &vpaths,
+                &proof_example,
+                args_example,
+                priv_idx.clone(),
+            )
+            .context("Failed to run verifier")?;
+            anyhow::ensure!(
+                !ok_example,
+                "expected verification to fail for example blacklisted address, but it succeeded"
+            );
+        }
     }
 
     // === Proof for the blacklisted address must be rejected ===
