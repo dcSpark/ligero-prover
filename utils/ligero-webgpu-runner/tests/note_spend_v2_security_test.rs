@@ -21,6 +21,11 @@ const BN254_FR_MODULUS_BE: Hash32 = [
     0xf0, 0x00, 0x00, 0x01,
 ];
 
+const MAX_INS: usize = 4;
+const MAX_OUTS: usize = 2;
+const MAX_VIEWERS: usize = 8;
+const BL_DEPTH: usize = 63;
+
 fn hx32(b: &Hash32) -> String {
     hex::encode(b)
 }
@@ -226,6 +231,336 @@ fn compute_inv_enforce(
     Ok(inv.to_bytes_be())
 }
 
+#[derive(Clone, Debug)]
+struct InputSpec {
+    value: u64,
+    rho: Hash32,
+    sender_id_in: Hash32,
+    pos: u64,
+}
+
+#[derive(Clone, Debug)]
+struct OutputSpec {
+    value: u64,
+    rho: Hash32,
+    pk_spend: Hash32,
+    pk_ivk: Hash32,
+}
+
+#[derive(Clone, Debug)]
+struct SpendTxInfo {
+    #[allow(dead_code)]
+    anchor: Hash32,
+    sender_id_current: Hash32,
+    cm_outs: Vec<Hash32>,
+}
+
+fn merkle_default_nodes(depth: usize) -> Vec<Hash32> {
+    let mut out = Vec::with_capacity(depth + 1);
+    out.push([0u8; 32]); // height 0 (leaf)
+    for lvl in 0..depth {
+        let prev = out[lvl];
+        out.push(mt_combine(lvl as u8, &prev, &prev));
+    }
+    out
+}
+
+fn merkle_root_and_openings_sparse(
+    depth: usize,
+    leaves: &[(u64, Hash32)],
+) -> Result<(Hash32, Vec<Vec<Hash32>>)> {
+    use std::collections::{HashMap, HashSet};
+
+    let default_nodes = merkle_default_nodes(depth);
+
+    // Store only non-default nodes by height. Height 0 are leaves; height `depth` is the root.
+    let mut levels: Vec<HashMap<u64, Hash32>> = (0..=depth).map(|_| HashMap::new()).collect();
+
+    if depth >= 64 {
+        anyhow::bail!("depth too large for sparse tree: {depth}");
+    }
+    let max_pos = if depth == 63 { 1u64 << 63 } else { 1u64 << depth };
+    for (pos, leaf) in leaves {
+        anyhow::ensure!(*pos < max_pos, "leaf pos {pos} out of range for depth {depth}");
+        if let Some(prev) = levels[0].insert(*pos, *leaf) {
+            anyhow::ensure!(prev == *leaf, "duplicate leaf pos {pos} with different value");
+        }
+    }
+
+    // Build up.
+    for lvl in 0..depth {
+        let mut parent_set: HashSet<u64> = HashSet::new();
+        for &idx in levels[lvl].keys() {
+            parent_set.insert(idx >> 1);
+        }
+
+        for pidx in parent_set {
+            let left_idx = pidx * 2;
+            let right_idx = pidx * 2 + 1;
+            let left = levels[lvl]
+                .get(&left_idx)
+                .unwrap_or(&default_nodes[lvl]);
+            let right = levels[lvl]
+                .get(&right_idx)
+                .unwrap_or(&default_nodes[lvl]);
+            let parent = mt_combine(lvl as u8, left, right);
+            if parent != default_nodes[lvl + 1] {
+                levels[lvl + 1].insert(pidx, parent);
+            }
+        }
+    }
+
+    let root = *levels[depth].get(&0).unwrap_or(&default_nodes[depth]);
+
+    // Open siblings for each requested leaf (in input order).
+    let mut openings: Vec<Vec<Hash32>> = Vec::with_capacity(leaves.len());
+    for (pos, _leaf) in leaves {
+        let mut sibs: Vec<Hash32> = Vec::with_capacity(depth);
+        for lvl in 0..depth {
+            let idx_at_lvl = pos >> lvl;
+            let sib_idx = idx_at_lvl ^ 1;
+            let sib = *levels[lvl].get(&sib_idx).unwrap_or(&default_nodes[lvl]);
+            sibs.push(sib);
+        }
+        openings.push(sibs);
+    }
+
+    Ok((root, openings))
+}
+
+fn build_spend_tx(
+    depth: usize,
+    domain: Hash32,
+    spend_sk: Hash32,
+    pk_ivk_owner_override: Option<Hash32>,
+    inputs: &[InputSpec],
+    withdraw_amount: u64,
+    withdraw_to_override: Option<Hash32>,
+    outputs: &[OutputSpec],
+    inv_enforce_override: Option<Hash32>,
+) -> Result<(Vec<LigeroArg>, Vec<usize>, SpendTxInfo)> {
+    anyhow::ensure!(
+        (1..=MAX_INS).contains(&inputs.len()),
+        "n_in out of range: {}",
+        inputs.len()
+    );
+    anyhow::ensure!(
+        outputs.len() <= MAX_OUTS,
+        "n_out out of range: {}",
+        outputs.len()
+    );
+
+    let pk_ivk_owner = pk_ivk_owner_override.unwrap_or_else(|| ivk_seed(&domain, &spend_sk));
+    let pk_spend_owner = pk_from_sk(&spend_sk);
+    let recipient_owner = recipient_from_pk(&domain, &pk_spend_owner, &pk_ivk_owner);
+    let sender_id_current = recipient_owner;
+
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+
+    // Compute leaves (cm_in_i) for the Merkle tree.
+    let mut leaf_pairs: Vec<(u64, Hash32)> = Vec::with_capacity(inputs.len());
+    for inp in inputs {
+        let cm_in = note_commitment(
+            &domain,
+            inp.value,
+            &inp.rho,
+            &recipient_owner,
+            &inp.sender_id_in,
+        );
+        leaf_pairs.push((inp.pos, cm_in));
+    }
+
+    let (anchor, openings) = merkle_root_and_openings_sparse(depth, &leaf_pairs)?;
+
+    // Compute public nullifiers for each input.
+    let mut nullifiers: Vec<Hash32> = Vec::with_capacity(inputs.len());
+    for inp in inputs {
+        nullifiers.push(nullifier(&domain, &nf_key, &inp.rho));
+    }
+
+    // Compute public cm_outs.
+    let mut cm_outs: Vec<Hash32> = Vec::with_capacity(outputs.len());
+    for out in outputs {
+        let recipient_out = recipient_from_pk(&domain, &out.pk_spend, &out.pk_ivk);
+        let cm_out = note_commitment(
+            &domain,
+            out.value,
+            &out.rho,
+            &recipient_out,
+            &sender_id_current,
+        );
+        cm_outs.push(cm_out);
+    }
+
+    // inv_enforce (private)
+    let inv_enforce = match inv_enforce_override {
+        Some(v) => v,
+        None => {
+            let in_values: Vec<u64> = inputs.iter().map(|i| i.value).collect();
+            let in_rhos: Vec<Hash32> = inputs.iter().map(|i| i.rho).collect();
+            let out_values: Vec<u64> = outputs.iter().map(|o| o.value).collect();
+            let out_rhos: Vec<Hash32> = outputs.iter().map(|o| o.rho).collect();
+            compute_inv_enforce(&in_values, &in_rhos, &out_values, &out_rhos)?
+        }
+    };
+
+    // Build args.
+    let mut args: Vec<LigeroArg> = Vec::new();
+    args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1 domain (pub)
+    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) }); // 2 spend_sk (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&pk_ivk_owner) }); // 3 pk_ivk_owner (priv)
+    args.push(LigeroArg::I64 { i64: depth as i64 }); // 4 depth (pub)
+    args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 anchor (pub)
+    args.push(LigeroArg::I64 {
+        i64: inputs.len() as i64,
+    }); // 6 n_in (pub)
+
+    // Inputs.
+    for (i, inp) in inputs.iter().enumerate() {
+        args.push(LigeroArg::I64 {
+            i64: inp.value as i64,
+        }); // value_in_i (priv)
+        args.push(LigeroArg::Hex { hex: hx32(&inp.rho) }); // rho_in_i (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&inp.sender_id_in),
+        }); // sender_id_in_i (priv)
+
+        for lvl in 0..depth {
+            let bit = ((inp.pos >> lvl) & 1) as u8;
+            let mut bit_bytes = [0u8; 32];
+            bit_bytes[31] = bit;
+            args.push(LigeroArg::Hex {
+                hex: hx32(&bit_bytes),
+            });
+        }
+
+        for sib in &openings[i] {
+            args.push(LigeroArg::Hex { hex: hx32(sib) });
+        }
+
+        args.push(LigeroArg::Hex {
+            hex: hx32(&nullifiers[i]),
+        }); // nullifier_i (pub)
+    }
+
+    // Withdraw + n_out.
+    let withdraw_to = withdraw_to_override.unwrap_or_else(|| {
+        if withdraw_amount == 0 {
+            [0u8; 32]
+        } else {
+            [0x42u8; 32]
+        }
+    });
+    args.push(LigeroArg::I64 {
+        i64: withdraw_amount as i64,
+    }); // withdraw_amount (pub)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&withdraw_to),
+    }); // withdraw_to (pub)
+    args.push(LigeroArg::I64 {
+        i64: outputs.len() as i64,
+    }); // n_out (pub)
+
+    // Outputs.
+    for (j, out) in outputs.iter().enumerate() {
+        args.push(LigeroArg::I64 {
+            i64: out.value as i64,
+        }); // value_out_j (priv)
+        args.push(LigeroArg::Hex { hex: hx32(&out.rho) }); // rho_out_j (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&out.pk_spend),
+        }); // pk_spend_out_j (priv)
+        args.push(LigeroArg::Hex { hex: hx32(&out.pk_ivk) }); // pk_ivk_out_j (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&cm_outs[j]),
+        }); // cm_out_j (pub)
+    }
+
+    // inv_enforce (priv)
+    args.push(LigeroArg::Hex { hex: hx32(&inv_enforce) });
+
+    // Blacklist root (pub) + siblings (priv). Use the empty blacklist by default.
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
+    args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    });
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        args.push(LigeroArg::Hex { hex: hx32(sib) }); // sender
+    }
+    for _j in 0..outputs.len() {
+        for sib in bl_defaults.iter().take(BL_DEPTH) {
+            args.push(LigeroArg::Hex { hex: hx32(sib) }); // output recipient
+        }
+    }
+
+    let priv_idx = private_indices_spend(depth, inputs.len(), outputs.len());
+
+    Ok((
+        args,
+        priv_idx,
+        SpendTxInfo {
+            anchor,
+            sender_id_current,
+            cm_outs,
+        },
+    ))
+}
+
+// === Viewer attestation helpers (must match the guest program) ===
+
+const NOTE_PLAIN_LEN: usize = 144;
+
+fn fvk_commit(fvk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"FVK_COMMIT_V1", &[fvk])
+}
+
+fn view_kdf(fvk: &Hash32, cm: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_KDF_V1", &[fvk, cm])
+}
+
+fn stream_block(k: &Hash32, ctr: u32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_STREAM_V1", &[k, &ctr.to_le_bytes()])
+}
+
+fn stream_xor_encrypt_144(k: &Hash32, pt: &[u8; NOTE_PLAIN_LEN]) -> [u8; NOTE_PLAIN_LEN] {
+    let mut ct = [0u8; NOTE_PLAIN_LEN];
+    for ctr in 0u32..5u32 {
+        let ks = stream_block(k, ctr);
+        let off = (ctr as usize) * 32;
+        let take = core::cmp::min(32, NOTE_PLAIN_LEN - off);
+        for i in 0..take {
+            ct[off + i] = pt[off + i] ^ ks[i];
+        }
+    }
+    ct
+}
+
+fn ct_hash(ct: &[u8; NOTE_PLAIN_LEN]) -> Hash32 {
+    poseidon2_hash_domain(b"CT_HASH_V1", &[ct])
+}
+
+fn view_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_MAC_V1", &[k, cm, ct_h])
+}
+
+fn encode_note_plain(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> [u8; NOTE_PLAIN_LEN] {
+    let mut out = [0u8; NOTE_PLAIN_LEN];
+    out[0..32].copy_from_slice(domain);
+    out[32..40].copy_from_slice(&value.to_le_bytes());
+    // out[40..48] is zero (u64 zero-extended to 16 bytes).
+    out[48..80].copy_from_slice(rho);
+    out[80..112].copy_from_slice(recipient);
+    out[112..144].copy_from_slice(sender_id);
+    out
+}
+
 fn private_indices_spend(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
     // Mirrors the guest layout described in utils/circuits/note-spend/src/main.rs (NOTE_V2 + ADDR_V2).
     let mut idx = vec![2usize, 3usize]; // spend_sk, pk_ivk_owner
@@ -246,7 +581,7 @@ fn private_indices_spend(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> 
     }
 
     let withdraw_idx = 7 + n_in * per_in;
-    let outs_base = withdraw_idx + 2;
+    let outs_base = withdraw_idx + 3;
     for j in 0..n_out {
         idx.push(outs_base + 5 * j + 0); // value_out
         idx.push(outs_base + 5 * j + 1); // rho_out
@@ -254,7 +589,24 @@ fn private_indices_spend(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> 
         idx.push(outs_base + 5 * j + 3); // pk_ivk_out
                                          // cm_out is public
     }
-    idx.push(outs_base + 5 * n_out); // inv_enforce
+    let inv_enforce_idx = outs_base + 5 * n_out;
+    idx.push(inv_enforce_idx); // inv_enforce
+
+    // Blacklist section:
+    //   inv_enforce (priv)
+    //   blacklist_root (pub)
+    //   bl_siblings_sender[BL_DEPTH] (priv)
+    //   bl_siblings_out_j[BL_DEPTH] (priv, per output)
+    let bl_sender_start = inv_enforce_idx + 2;
+    for k in 0..BL_DEPTH {
+        idx.push(bl_sender_start + k);
+    }
+    let bl_out_start = bl_sender_start + BL_DEPTH;
+    for j in 0..n_out {
+        for k in 0..BL_DEPTH {
+            idx.push(bl_out_start + j * BL_DEPTH + k);
+        }
+    }
 
     idx.sort_unstable();
     idx.dedup();
@@ -270,7 +622,7 @@ fn withdraw_index(n_in: usize, depth: usize) -> usize {
 }
 
 fn output_base(n_in: usize, depth: usize) -> usize {
-    withdraw_index(n_in, depth) + 2
+    withdraw_index(n_in, depth) + 3
 }
 
 fn cm_out_index(n_in: usize, depth: usize, j: usize) -> usize {
@@ -419,6 +771,9 @@ fn build_transfer_1in_2out(
 
     // withdraw + n_out
     args.push(LigeroArg::I64 { i64: 0 }); // withdraw_amount (pub)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&[0u8; 32]),
+    }); // withdraw_to (pub)
     args.push(LigeroArg::I64 { i64: 2 }); // n_out (pub)
 
     // Output0
@@ -445,6 +800,21 @@ fn build_transfer_1in_2out(
     args.push(LigeroArg::Hex {
         hex: hx32(&inv_enforce),
     });
+
+    // Blacklist root (pub) + siblings (priv). Use the empty blacklist by default.
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
+    args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    });
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        args.push(LigeroArg::Hex { hex: hx32(sib) }); // sender
+    }
+    for _j in 0..2 {
+        for sib in bl_defaults.iter().take(BL_DEPTH) {
+            args.push(LigeroArg::Hex { hex: hx32(sib) }); // output recipient
+        }
+    }
 
     Ok((
         args,
@@ -526,6 +896,9 @@ fn build_withdraw_1in_1out(
     args.push(LigeroArg::I64 {
         i64: withdraw_amount as i64,
     });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&[0x99u8; 32]),
+    });
     args.push(LigeroArg::I64 { i64: 1 });
 
     args.push(LigeroArg::I64 {
@@ -540,7 +913,465 @@ fn build_withdraw_1in_1out(
         hex: hx32(&inv_enforce),
     });
 
+    // Blacklist root (pub) + siblings (priv). Use the empty blacklist by default.
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
+    args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    });
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        args.push(LigeroArg::Hex { hex: hx32(sib) }); // sender
+    }
+    for _j in 0..1 {
+        for sib in bl_defaults.iter().take(BL_DEPTH) {
+            args.push(LigeroArg::Hex { hex: hx32(sib) }); // output recipient
+        }
+    }
+
     Ok((args, private_indices_spend(depth, 1, 1)))
+}
+
+#[test]
+fn test_note_spend_v2_golden_paths_must_have() -> Result<()> {
+    let repo = repo_root()?;
+    maybe_build_guest(
+        &repo,
+        "utils/circuits/note-spend",
+        "utils/circuits/bins/note_spend_guest.wasm",
+    )?;
+
+    let program = note_spend_program_path(&repo)?
+        .canonicalize()
+        .context("Failed to canonicalize note_spend_guest.wasm")?;
+
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+
+    let mut runner = LigeroRunner::new(&program.to_string_lossy());
+    runner.config_mut().packing = packing;
+
+    if !runner.paths().prover_bin.exists() || !runner.paths().verifier_bin.exists() {
+        eprintln!(
+            "Skipping: Ligero binaries not found (prover={}, verifier={})",
+            runner.paths().prover_bin.display(),
+            runner.paths().verifier_bin.display()
+        );
+        return Ok(());
+    }
+
+    let shader_dir = PathBuf::from(&runner.config().shader_path);
+    if !shader_dir.exists() {
+        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        return Ok(());
+    }
+
+    let vpaths = verifier::VerifierPaths::from_explicit(
+        program.clone(),
+        shader_dir,
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
+
+    let depth = 8usize;
+    let domain: Hash32 = [0x22u8; 32];
+    let spend_sk: Hash32 = [0x44u8; 32];
+
+    let pk_spend_self = pk_from_sk(&spend_sk);
+    let pk_ivk_self = ivk_seed(&domain, &spend_sk);
+
+    // 2) Transfer with change (100 -> 30 Bob, 70 self).
+    {
+        let inputs = [InputSpec {
+            value: 100,
+            rho: [0x02u8; 32],
+            sender_id_in: [0x11u8; 32],
+            pos: 3,
+        }];
+
+        let bob_sk: Hash32 = [0x55u8; 32];
+        let outputs = [
+            OutputSpec {
+                value: 30,
+                rho: [0x07u8; 32],
+                pk_spend: pk_from_sk(&bob_sk),
+                pk_ivk: ivk_seed(&domain, &bob_sk),
+            },
+            OutputSpec {
+                value: 70,
+                rho: [0x08u8; 32],
+                pk_spend: pk_spend_self,
+                pk_ivk: pk_ivk_self,
+            },
+        ];
+
+        let (args, priv_idx, _info) =
+            build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
+
+        let proof = match prove(&mut runner, args.clone(), priv_idx.clone()) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+                return Ok(());
+            }
+        };
+        anyhow::ensure!(
+            verify(&vpaths, &proof, args, priv_idx)?,
+            "transfer-with-change must verify"
+        );
+    }
+
+    // 3) Full withdraw (1-in, 0-out).
+    {
+        let inputs = [InputSpec {
+            value: 100,
+            rho: [0x12u8; 32],
+            sender_id_in: [0x22u8; 32],
+            pos: 1,
+        }];
+
+        let (args, priv_idx, _info) =
+            build_spend_tx(depth, domain, spend_sk, None, &inputs, 100, None, &[], None)?;
+
+        let proof = prove(&mut runner, args.clone(), priv_idx.clone())
+            .context("full-withdraw prover failed unexpectedly")?;
+        anyhow::ensure!(
+            verify(&vpaths, &proof, args, priv_idx)?,
+            "full-withdraw must verify"
+        );
+    }
+
+    // 4) Partial withdraw with change (withdraw 30, change 70).
+    {
+        let inputs = [InputSpec {
+            value: 100,
+            rho: [0x13u8; 32],
+            sender_id_in: [0x33u8; 32],
+            pos: 0,
+        }];
+
+        let outputs = [OutputSpec {
+            value: 70,
+            rho: [0x14u8; 32],
+            pk_spend: pk_spend_self,
+            pk_ivk: pk_ivk_self,
+        }];
+
+        let (args, priv_idx, _info) =
+            build_spend_tx(depth, domain, spend_sk, None, &inputs, 30, None, &outputs, None)?;
+
+        let proof = prove(&mut runner, args.clone(), priv_idx.clone())
+            .context("partial-withdraw prover failed unexpectedly")?;
+        anyhow::ensure!(
+            verify(&vpaths, &proof, args, priv_idx)?,
+            "partial-withdraw-with-change must verify"
+        );
+    }
+
+    // 6) Multi-input payment with change (3-in, 2-out).
+    {
+        let inputs = [
+            InputSpec {
+                value: 40,
+                rho: [0x21u8; 32],
+                sender_id_in: [0x01u8; 32],
+                pos: 2,
+            },
+            InputSpec {
+                value: 30,
+                rho: [0x22u8; 32],
+                sender_id_in: [0x02u8; 32],
+                pos: 5,
+            },
+            InputSpec {
+                value: 50,
+                rho: [0x23u8; 32],
+                sender_id_in: [0x03u8; 32],
+                pos: 7,
+            },
+        ];
+
+        let bob_sk: Hash32 = [0x66u8; 32];
+        let outputs = [
+            OutputSpec {
+                value: 30,
+                rho: [0x31u8; 32],
+                pk_spend: pk_from_sk(&bob_sk),
+                pk_ivk: ivk_seed(&domain, &bob_sk),
+            },
+            OutputSpec {
+                value: 90,
+                rho: [0x32u8; 32],
+                pk_spend: pk_spend_self,
+                pk_ivk: pk_ivk_self,
+            },
+        ];
+
+        let (args, priv_idx, _info) =
+            build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
+
+        let proof = prove(&mut runner, args.clone(), priv_idx.clone())
+            .context("multi-input payment prover failed unexpectedly")?;
+        anyhow::ensure!(
+            verify(&vpaths, &proof, args, priv_idx)?,
+            "multi-input payment-with-change must verify"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_note_spend_v2_roundtrip_string_encoded_hash_args() -> Result<()> {
+    let repo = repo_root()?;
+    maybe_build_guest(
+        &repo,
+        "utils/circuits/note-spend",
+        "utils/circuits/bins/note_spend_guest.wasm",
+    )?;
+
+    let program = note_spend_program_path(&repo)?
+        .canonicalize()
+        .context("Failed to canonicalize note_spend_guest.wasm")?;
+
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+
+    let mut runner = LigeroRunner::new(&program.to_string_lossy());
+    runner.config_mut().packing = packing;
+
+    if !runner.paths().prover_bin.exists() || !runner.paths().verifier_bin.exists() {
+        eprintln!(
+            "Skipping: Ligero binaries not found (prover={}, verifier={})",
+            runner.paths().prover_bin.display(),
+            runner.paths().verifier_bin.display()
+        );
+        return Ok(());
+    }
+
+    let shader_dir = PathBuf::from(&runner.config().shader_path);
+    if !shader_dir.exists() {
+        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        return Ok(());
+    }
+
+    let vpaths = verifier::VerifierPaths::from_explicit(
+        program.clone(),
+        shader_dir,
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
+
+    let depth = 4;
+    let domain: Hash32 = [0x11u8; 32];
+    let spend_sk: Hash32 = [0x22u8; 32];
+    let value_in: u64 = 200;
+    let rho_in: Hash32 = [0x33u8; 32];
+    let sender_id_in: Hash32 = [0x44u8; 32];
+    let pos: u64 = 1;
+    let out0_rho: Hash32 = [0x55u8; 32];
+    let out1_rho: Hash32 = [0x66u8; 32];
+
+    let (hex_args, priv_idx, _anchor) = build_transfer_1in_2out(
+        depth,
+        domain,
+        spend_sk,
+        value_in,
+        rho_in,
+        sender_id_in,
+        pos,
+        out0_rho,
+        out1_rho,
+        None,
+    )?;
+
+    // Convert all `Hex` arguments to `String("0x...")` to exercise the guest `read_hash32`
+    // decoding path used by the WebGPU binaries.
+    let mut args = hex_args;
+    for a in &mut args {
+        if let LigeroArg::Hex { hex } = a {
+            *a = LigeroArg::String {
+                str: format!("0x{hex}"),
+            };
+        }
+    }
+
+    let proof = match prove(&mut runner, args.clone(), priv_idx.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+            return Ok(());
+        }
+    };
+
+    anyhow::ensure!(
+        verify(&vpaths, &proof, args, priv_idx)?,
+        "string-encoded hash args proof must verify"
+    );
+
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn test_note_spend_v2_max_bounds_sanity() -> Result<()> {
+    let repo = repo_root()?;
+    maybe_build_guest(
+        &repo,
+        "utils/circuits/note-spend",
+        "utils/circuits/bins/note_spend_guest.wasm",
+    )?;
+
+    let program = note_spend_program_path(&repo)?
+        .canonicalize()
+        .context("Failed to canonicalize note_spend_guest.wasm")?;
+
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+
+    let mut runner = LigeroRunner::new(&program.to_string_lossy());
+    runner.config_mut().packing = packing;
+
+    if !runner.paths().prover_bin.exists() || !runner.paths().verifier_bin.exists() {
+        eprintln!(
+            "Skipping: Ligero binaries not found (prover={}, verifier={})",
+            runner.paths().prover_bin.display(),
+            runner.paths().verifier_bin.display()
+        );
+        return Ok(());
+    }
+
+    let shader_dir = PathBuf::from(&runner.config().shader_path);
+    if !shader_dir.exists() {
+        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        return Ok(());
+    }
+
+    let vpaths = verifier::VerifierPaths::from_explicit(
+        program.clone(),
+        shader_dir,
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
+
+    let depth = 63usize;
+    let domain: Hash32 = [0x7fu8; 32];
+    let spend_sk: Hash32 = [0x11u8; 32];
+    let pk_spend_self = pk_from_sk(&spend_sk);
+    let pk_ivk_self = ivk_seed(&domain, &spend_sk);
+
+    let inputs = [
+        InputSpec {
+            value: 10,
+            rho: [0x01u8; 32],
+            sender_id_in: [0x10u8; 32],
+            pos: 0,
+        },
+        InputSpec {
+            value: 20,
+            rho: [0x02u8; 32],
+            sender_id_in: [0x11u8; 32],
+            pos: 1,
+        },
+        InputSpec {
+            value: 30,
+            rho: [0x03u8; 32],
+            sender_id_in: [0x12u8; 32],
+            pos: 2,
+        },
+        InputSpec {
+            value: 40,
+            rho: [0x04u8; 32],
+            sender_id_in: [0x13u8; 32],
+            pos: 3,
+        },
+    ];
+
+    let bob_sk: Hash32 = [0x22u8; 32];
+    let outputs = [
+        OutputSpec {
+            value: 60,
+            rho: [0x05u8; 32],
+            pk_spend: pk_from_sk(&bob_sk),
+            pk_ivk: ivk_seed(&domain, &bob_sk),
+        },
+        OutputSpec {
+            value: 40,
+            rho: [0x06u8; 32],
+            pk_spend: pk_spend_self,
+            pk_ivk: pk_ivk_self,
+        },
+    ];
+
+    let (mut args, mut priv_idx, info) =
+        build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
+
+    // Append viewer attestations: n_viewers=8, n_out=2.
+    let n_viewers = MAX_VIEWERS;
+    args.push(LigeroArg::I64 {
+        i64: n_viewers as i64,
+    });
+
+    let out_recipients: Vec<Hash32> = outputs
+        .iter()
+        .map(|o| recipient_from_pk(&domain, &o.pk_spend, &o.pk_ivk))
+        .collect();
+
+    let mut keep_priv_idx: Vec<usize> = Vec::new();
+    for v in 0..n_viewers {
+        let fvk: Hash32 = [0x80u8.wrapping_add(v as u8); 32];
+        let fvk_c = fvk_commit(&fvk);
+        args.push(LigeroArg::Hex { hex: hx32(&fvk_c) });
+
+        let fvk_idx1 = args.len() + 1; // 1-based index of next arg
+        args.push(LigeroArg::Hex { hex: hx32(&fvk) });
+        priv_idx.push(fvk_idx1);
+        keep_priv_idx.push(fvk_idx1);
+
+        for j in 0..outputs.len() {
+            let cm = &info.cm_outs[j];
+            let k = view_kdf(&fvk, cm);
+            let pt = encode_note_plain(
+                &domain,
+                outputs[j].value,
+                &outputs[j].rho,
+                &out_recipients[j],
+                &info.sender_id_current,
+            );
+            let ct = stream_xor_encrypt_144(&k, &pt);
+            let ct_h = ct_hash(&ct);
+            let mac = view_mac(&k, cm, &ct_h);
+            args.push(LigeroArg::Hex { hex: hx32(&ct_h) });
+            args.push(LigeroArg::Hex { hex: hx32(&mac) });
+        }
+    }
+
+    priv_idx.sort_unstable();
+    priv_idx.dedup();
+
+    let proof = match prove(&mut runner, args.clone(), priv_idx.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+            return Ok(());
+        }
+    };
+
+    let (ok, _stdout, _stderr) = verifier::verify_proof_with_output_keep_private_args(
+        &vpaths,
+        &proof,
+        args,
+        priv_idx,
+        keep_priv_idx,
+    )?;
+    anyhow::ensure!(ok, "max-bounds sanity proof must verify");
+
+    Ok(())
 }
 
 #[test]
@@ -748,6 +1579,9 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
         args.push(LigeroArg::I64 {
             i64: withdraw_amount as i64,
         });
+        args.push(LigeroArg::Hex {
+            hex: hx32(&[0x99u8; 32]),
+        }); // withdraw_to (pub)
         args.push(LigeroArg::I64 { i64: 0 }); // n_out
         args.push(LigeroArg::Hex {
             hex: hx32(&inv_enforce),
@@ -755,6 +1589,161 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
 
         let priv_idx = private_indices_spend(depth, n_in, n_out);
         assert_rejected(&mut runner, &vpaths, args, priv_idx)?;
+    }
+
+    // B2: wrong Merkle path (flip one sibling) must be rejected.
+    {
+        let mut bad_args = base_args.clone();
+        let idx_first_sibling = 7 + 3 + depth; // value,rho,sender_id + pos_bits[depth]
+        bad_args[idx_first_sibling - 1] = LigeroArg::Hex { hex: hx32(&[0x99u8; 32]) };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+    }
+
+    // B3: non-boolean position bit must be rejected.
+    {
+        let mut bad_args = base_args.clone();
+        let mut bit2 = [0u8; 32];
+        bit2[31] = 2;
+        let idx_first_pos_bit = 7 + 3; // value,rho,sender_id
+        bad_args[idx_first_pos_bit - 1] = LigeroArg::Hex { hex: hx32(&bit2) };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+    }
+
+    // B4: wrong public nullifier must be rejected.
+    {
+        let mut bad_args = base_args.clone();
+        let idx_nf0 = 7 + 3 + 2 * depth;
+        bad_args[idx_nf0 - 1] = LigeroArg::Hex { hex: hx32(&[0xabu8; 32]) };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+    }
+
+    // B9: wrong pk_ivk_owner must be rejected (ADDR_V2 owner binding).
+    {
+        let mut bad_args = base_args.clone();
+        bad_args[2] = LigeroArg::Hex { hex: hx32(&[0x98u8; 32]) }; // [3] pk_ivk_owner
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+    }
+
+    // B: output recipient mismatch (pk_ivk_out0 changed, cm_out0 unchanged) must be rejected.
+    {
+        let mut bad_args = base_args.clone();
+        let idx_out0_pk_ivk = output_base(1, depth) + 3;
+        bad_args[idx_out0_pk_ivk - 1] = LigeroArg::Hex { hex: hx32(&[0x97u8; 32]) };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+    }
+
+    // B6: balance mismatch (withdraw amount changed) must be rejected.
+    {
+        let withdraw_amount = 10u64;
+        let out_value = value_in - withdraw_amount;
+        let (good_args, good_priv) = build_withdraw_1in_1out(
+            depth,
+            domain,
+            spend_sk,
+            value_in,
+            rho_in,
+            sender_id_in,
+            pos,
+            withdraw_amount,
+            out_value,
+            [0x77u8; 32],
+            None,
+        )?;
+        let mut bad_args = good_args;
+        let idx_withdraw = withdraw_index(1, depth);
+        bad_args[idx_withdraw - 1] = LigeroArg::I64 { i64: (withdraw_amount + 1) as i64 };
+        assert_rejected(&mut runner, &vpaths, bad_args, good_priv)?;
+    }
+
+    // C1: zero-value input (within a multi-input tx) must be rejected.
+    {
+        let pk_spend_self = pk_from_sk(&spend_sk);
+        let pk_ivk_self = ivk_seed(&domain, &spend_sk);
+        let inputs = [
+            InputSpec {
+                value: 0,
+                rho: [0x01u8; 32],
+                sender_id_in: [0x10u8; 32],
+                pos: 0,
+            },
+            InputSpec {
+                value: 60,
+                rho: [0x02u8; 32],
+                sender_id_in: [0x11u8; 32],
+                pos: 1,
+            },
+        ];
+        let outputs = [OutputSpec {
+            value: 60,
+            rho: [0x03u8; 32],
+            pk_spend: pk_spend_self,
+            pk_ivk: pk_ivk_self,
+        }];
+        // inv_enforce is undefined (product includes 0); set dummy to test enforcement.
+        let (args, priv_idx, _info) =
+            build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, Some([0u8; 32]))?;
+        assert_rejected(&mut runner, &vpaths, args, priv_idx)?;
+    }
+
+    // B8: deposit-origin notes require sender_id_in == 0x00..00.
+    {
+        let pk_spend_self = pk_from_sk(&spend_sk);
+        let pk_ivk_self = ivk_seed(&domain, &spend_sk);
+        let inputs = [InputSpec {
+            value: 50,
+            rho: [0x04u8; 32],
+            sender_id_in: [0u8; 32],
+            pos: 2,
+        }];
+        let outputs = [OutputSpec {
+            value: 50,
+            rho: [0x05u8; 32],
+            pk_spend: pk_spend_self,
+            pk_ivk: pk_ivk_self,
+        }];
+        let (mut args, priv_idx, _info) =
+            build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
+        let idx_sender_id_in = 7 + 2;
+        args[idx_sender_id_in - 1] = LigeroArg::Hex { hex: hx32(&[0x01u8; 32]) };
+        assert_rejected(&mut runner, &vpaths, args, priv_idx)?;
+    }
+
+    // E: ABI / parsing robustness.
+    {
+        // Bad hex length / missing 0x prefix for a hash arg (domain).
+        let mut bad_args = base_args.clone();
+        bad_args[0] = LigeroArg::String { str: hx32(&domain) };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+
+        // Negative i64 (depth).
+        let mut bad_args = base_args.clone();
+        bad_args[3] = LigeroArg::I64 { i64: -1 };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+
+        // Out-of-range depth.
+        let mut bad_args = base_args.clone();
+        bad_args[3] = LigeroArg::I64 { i64: 64 };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+
+        // Out-of-range n_in (0 and 5).
+        let mut bad_args = base_args.clone();
+        bad_args[5] = LigeroArg::I64 { i64: 0 };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+
+        let mut bad_args = base_args.clone();
+        bad_args[5] = LigeroArg::I64 { i64: 5 };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+
+        // Out-of-range n_out.
+        let mut bad_args = base_args.clone();
+        let idx_n_out = withdraw_index(1, depth) + 2;
+        bad_args[idx_n_out - 1] = LigeroArg::I64 { i64: 3 };
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
+
+        // Out-of-range n_viewers (append a viewer section with n_viewers=9).
+        let mut bad_args = base_args.clone();
+        bad_args.push(LigeroArg::I64 { i64: 9 });
+        assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
     }
 
     Ok(())
@@ -872,6 +1861,110 @@ fn test_note_spend_v2_verifier_binding_and_tampering() -> Result<()> {
 }
 
 #[test]
+fn test_note_spend_v2_spend_to_spend_roundtrip() -> Result<()> {
+    let repo = repo_root()?;
+    maybe_build_guest(
+        &repo,
+        "utils/circuits/note-spend",
+        "utils/circuits/bins/note_spend_guest.wasm",
+    )?;
+
+    let program = note_spend_program_path(&repo)?
+        .canonicalize()
+        .context("Failed to canonicalize note_spend_guest.wasm")?;
+
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+
+    let mut runner = LigeroRunner::new(&program.to_string_lossy());
+    runner.config_mut().packing = packing;
+
+    if !runner.paths().prover_bin.exists() || !runner.paths().verifier_bin.exists() {
+        eprintln!(
+            "Skipping: Ligero binaries not found (prover={}, verifier={})",
+            runner.paths().prover_bin.display(),
+            runner.paths().verifier_bin.display()
+        );
+        return Ok(());
+    }
+
+    let shader_dir = PathBuf::from(&runner.config().shader_path);
+    if !shader_dir.exists() {
+        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        return Ok(());
+    }
+
+    let vpaths = verifier::VerifierPaths::from_explicit(
+        program.clone(),
+        shader_dir,
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
+
+    let depth = 4usize;
+    let domain: Hash32 = [0x2au8; 32];
+
+    let alice_sk: Hash32 = [0x10u8; 32];
+    let bob_sk: Hash32 = [0x20u8; 32];
+    let bob_pk_spend = pk_from_sk(&bob_sk);
+    let bob_pk_ivk = ivk_seed(&domain, &bob_sk);
+
+    // Alice pays Bob 100 (exact transfer, no withdraw, 1 output).
+    let inputs1 = [InputSpec {
+        value: 100,
+        rho: [0x01u8; 32],
+        sender_id_in: [0u8; 32], // e.g. deposit-origin
+        pos: 0,
+    }];
+    let out_rho_bob: Hash32 = [0x02u8; 32];
+    let outputs1 = [OutputSpec {
+        value: 100,
+        rho: out_rho_bob,
+        pk_spend: bob_pk_spend,
+        pk_ivk: bob_pk_ivk,
+    }];
+    let (args1, priv1, info1) = build_spend_tx(depth, domain, alice_sk, None, &inputs1, 0, None, &outputs1, None)?;
+
+    let proof1 = match prove(&mut runner, args1.clone(), priv1.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+            return Ok(());
+        }
+    };
+    anyhow::ensure!(
+        verify(&vpaths, &proof1, args1, priv1)?,
+        "first spend must verify"
+    );
+
+    // Bob spends the received NOTE_V2 (full withdraw, no outputs).
+    let inputs2 = [InputSpec {
+        value: 100,
+        rho: out_rho_bob,
+        sender_id_in: info1.sender_id_current, // must match NOTE_V2 sender binding
+        pos: 1,
+    }];
+    let (args2, priv2, _info2) = build_spend_tx(depth, domain, bob_sk, None, &inputs2, 100, None, &[], None)?;
+
+    let proof2 = prove(&mut runner, args2.clone(), priv2.clone())
+        .context("second spend prover failed unexpectedly")?;
+    anyhow::ensure!(
+        verify(&vpaths, &proof2, args2.clone(), priv2.clone())?,
+        "second spend must verify"
+    );
+
+    // Negative: wrong sender_id_in must be rejected (attempt to spend Bob's note with different sender_id).
+    let idx_sender_id_in_0 = 7 + 2; // value_in, rho_in, sender_id_in
+    let mut bad_args = args2;
+    bad_args[idx_sender_id_in_0 - 1] = LigeroArg::Hex { hex: hx32(&[0x99u8; 32]) };
+    assert_rejected(&mut runner, &vpaths, bad_args, priv2)?;
+
+    Ok(())
+}
+
+#[test]
 fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
     let repo = repo_root()?;
     maybe_build_guest(&repo, "utils/circuits/note-deposit", "utils/circuits/bins/note_deposit_guest.wasm")?;
@@ -925,7 +2018,10 @@ fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
     let sender_id_deposit = [0u8; 32];
     let cm = note_commitment(&domain, value, &rho, &recipient, &sender_id_deposit);
 
-    let deposit_args = vec![
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
+
+    let mut deposit_args = vec![
         LigeroArg::Hex { hex: hx32(&domain) },
         LigeroArg::I64 { i64: value as i64 },
         LigeroArg::Hex { hex: hx32(&rho) },
@@ -933,7 +2029,17 @@ fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
         LigeroArg::Hex { hex: hx32(&pk_ivk) },
         LigeroArg::Hex { hex: hx32(&cm) },
     ];
-    let deposit_priv = vec![3usize, 4usize, 5usize];
+    deposit_args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    });
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        deposit_args.push(LigeroArg::Hex { hex: hx32(sib) });
+    }
+
+    let mut deposit_priv = vec![3usize, 4usize, 5usize];
+    for i in 0..BL_DEPTH {
+        deposit_priv.push(8 + i);
+    }
 
     let deposit_proof = match prove(&mut deposit_runner, deposit_args.clone(), deposit_priv.clone()) {
         Ok(p) => p,
@@ -958,7 +2064,7 @@ fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
         packing,
     );
 
-    // Spend as a simple 1-in -> 1-out transfer to self (withdraw=0).
+    // Spend as a simple 1-in -> 1-out transfer to a new recipient (withdraw=0).
     let depth = 4;
     let pos: u64 = 0;
     let pk_ivk_owner = pk_ivk;
@@ -972,22 +2078,25 @@ fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
 
     let out_value = value_in;
     let out_rho: Hash32 = [0x55u8; 32];
-    let _out_pk_spend = pk_spend_owner;
-    let _out_pk_ivk = pk_ivk_owner;
+    let bob_sk: Hash32 = [0x99u8; 32];
+    let out_pk_spend = pk_from_sk(&bob_sk);
+    let out_pk_ivk = ivk_seed(&domain, &bob_sk);
 
-    let (spend_args, spend_priv) = build_withdraw_1in_1out(
-        depth,
-        domain,
-        spend_sk,
-        value_in,
-        rho_in,
+    let inputs = [InputSpec {
+        value: value_in,
+        rho: rho_in,
         sender_id_in,
         pos,
-        0,       // withdraw_amount
-        out_value,
-        out_rho,
-        None,
-    )?;
+    }];
+    let outputs = [OutputSpec {
+        value: out_value,
+        rho: out_rho,
+        pk_spend: out_pk_spend,
+        pk_ivk: out_pk_ivk,
+    }];
+
+    let (spend_args, spend_priv, _info) =
+        build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
 
     let spend_proof = match prove(&mut spend_runner, spend_args.clone(), spend_priv.clone()) {
         Ok(p) => p,

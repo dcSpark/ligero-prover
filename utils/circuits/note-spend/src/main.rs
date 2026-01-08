@@ -26,12 +26,13 @@
  * ┌─────────────────────────────────────────────────────────────────────────────┐
  * │ DEPOSIT - Enter the privacy pool                                            │
  * │                                                                             │
- * │   Public:  value (input amount), origin (sender address on transparent)     │
+ * │   Public:  value (input amount)                                             │
  * │   Private: recipient (who receives the shielded note)                       │
  * │                                                                             │
  * │   Use case: User deposits 100 tokens from their public address into the     │
  * │   shielded pool. Everyone sees the deposit amount and source, but the       │
  * │   recipient's shielded address is hidden.                                   │
+ * │   NOTE: transparent origin binding is outside this proof.                   │
  * │                                                                             │
  * │   Circuit config: n_out=1, withdraw_amount=0                                │
  * │   The input comes from a transparent source (not a spent note).             │
@@ -55,7 +56,7 @@
  * ┌─────────────────────────────────────────────────────────────────────────────┐
  * │ WITHDRAW - Exit the privacy pool                                            │
  * │                                                                             │
- * │   Public:  withdraw_amount (value leaving pool), recipient (transparent),   │
+ * │   Public:  withdraw_amount (value leaving pool), withdraw_to (destination), │
  * │            anchor, nullifier, cm_out (change commitment if any)             │
  * │   Private: input value, origin (which note), change value                   │
  * │                                                                             │
@@ -100,6 +101,7 @@
  *
  * Then:
  *   withdraw_amount    — i64 (PUBLIC)
+ *   withdraw_to        — 32 bytes (PUBLIC; transparent recipient/destination, bound to the proof)
  *   n_out              — i64 (PUBLIC; in {0,1,2})
  *
  * For each output j in [0..n_out):
@@ -115,8 +117,13 @@
  *     - output rhos differ from all input rhos
  *     - (if n_out==2) output rhos are distinct
  *
+ * Blacklist checks (sparse Merkle map; leaf=0 means "not blacklisted"):
+ *   blacklist_root            — 32 bytes [PUBLIC]
+ *   bl_siblings_sender[k]     — BL_DEPTH × 32 bytes [PRIVATE]
+ *   bl_siblings_out_j[k]      — (n_out × BL_DEPTH) × 32 bytes [PRIVATE]
+ *
  * Expected argc (no viewers) =
- *   1 + 6 + n_in*(4 + 2*depth) + 2 + 5*n_out + 1
+ *   1 + 6 + n_in*(4 + 2*depth) + 3 + 5*n_out + 1 + 1 + (1+n_out)*BL_DEPTH
  * (argc includes argv[0]).
  *
  * SECURITY NOTES:
@@ -689,10 +696,58 @@ fn encode_note_plain(domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash
 /// Must be ≤ 63 to ensure the bound check `pos >= (1u64 << depth)` is safe
 /// (shifting by 64 would overflow a u64).
 const MAX_DEPTH: usize = 63;
+// Blacklist sparse Merkle map depth. We derive path bits from the low bits of the address ID.
+// 63 keeps witnesses small while making collisions infeasible in practice.
+const BL_DEPTH: usize = 63;
 const MAX_INS: usize = 4;
 const MAX_OUTS: usize = 2;
 const MAX_VIEWERS: usize = 8;
 const NOTE_PLAIN_LEN: usize = 144; // 32 + 16 + 32 + 32 + 32 (domain + value + rho + recipient + sender_id)
+
+#[inline(always)]
+fn bl_pos_bits_from_id(id: &Hash32, depth: usize) -> Vec<Bn254Fr> {
+    // Use the low `depth` bits of the 32-byte ID (LSB-first from the last byte).
+    // This avoids trusting prover-provided path directions.
+    let mut bits = Vec::with_capacity(depth);
+    let mut i = 0usize;
+    while i < depth {
+        let byte = id[31 - (i / 8)];
+        let bit = (byte >> (i % 8)) & 1;
+        bits.push(Bn254Fr::from_u32(bit as u32));
+        i += 1;
+    }
+    bits
+}
+
+#[inline(always)]
+fn read_siblings_fr(args: &ArgHolder, arg_idx: &mut usize, depth: usize) -> Vec<Bn254Fr> {
+    let mut v = Vec::with_capacity(depth);
+    let mut i = 0usize;
+    while i < depth {
+        let sib = read_hash32(args, *arg_idx);
+        *arg_idx += 1;
+        v.push(bn254fr_from_hash32_be(&sib));
+        i += 1;
+    }
+    v
+}
+
+#[inline(always)]
+fn assert_not_blacklisted(
+    h: &Poseidon2Core,
+    id: &Hash32,
+    blacklist_root: &Hash32,
+    siblings_fr: &[Bn254Fr],
+) {
+    if siblings_fr.len() != BL_DEPTH {
+        hard_fail(94);
+    }
+
+    let pos_bits = bl_pos_bits_from_id(id, BL_DEPTH);
+    let leaf0: Hash32 = [0u8; 32];
+    let root_fr = root_from_path_field_level(h, &leaf0, &pos_bits[..], siblings_fr, BL_DEPTH);
+    assert_fr_eq_hash32(&root_fr, blacklist_root);
+}
 
 fn main() {
     let args = get_args();
@@ -808,6 +863,10 @@ fn main() {
     let withdraw_amount = read_u64(&args, arg_idx, 82);
     arg_idx += 1;
 
+    // withdraw_to (PUBLIC; transparent destination)
+    let withdraw_to = read_hash32(&args, arg_idx);
+    arg_idx += 1;
+
     // n_out (PUBLIC)
     let n_out_u32 = read_u32(&args, arg_idx, 83);
     arg_idx += 1;
@@ -823,14 +882,24 @@ fn main() {
         if n_out == 0 {
             hard_fail(87);
         }
+        // Transfers have no transparent destination; keep it canonical.
+        if withdraw_to != [0u8; 32] {
+            hard_fail(93);
+        }
     } else if n_out > 1 {
         hard_fail(87);
+    } else if withdraw_to == [0u8; 32] {
+        // Withdrawing to a zero destination is almost certainly a bug.
+        hard_fail(93);
     }
 
     // Expected argc without viewers:
-    //   1 + 6 + n_in*(4 + 2*depth) + 2 + 5*n_out + 1(inv_enforce)
+    //   1 + 6 + n_in*(4 + 2*depth) + 3 + 5*n_out + 1(inv_enforce)
     let per_in = 4u32 + 2u32 * depth_u32;
-    let expected_base = 1u32 + 6u32 + n_in_u32 * per_in + 2u32 + 5u32 * n_out_u32 + 1u32;
+    let expected_base_no_blacklist =
+        1u32 + 6u32 + n_in_u32 * per_in + 3u32 + 5u32 * n_out_u32 + 1u32;
+    let blacklist_extra = 1u32 + (BL_DEPTH as u32) * (1u32 + n_out_u32);
+    let expected_base = expected_base_no_blacklist + blacklist_extra;
     if argc < expected_base {
         hard_fail(84);
     }
@@ -911,6 +980,15 @@ fn main() {
     // Bind the public `withdraw_amount` into the statement.
     Bn254Fr::assert_equal_u64(&withdraw_fr, withdraw_amount);
 
+    // Bind the transparent withdraw destination into the statement.
+    // We bind as two 16-byte chunks to avoid requiring the full 32 bytes be < BN254 modulus.
+    let mut withdraw_to_hi = Bn254Fr::new();
+    let mut withdraw_to_lo = Bn254Fr::new();
+    withdraw_to_hi.set_bytes_big(&withdraw_to[..16]);
+    withdraw_to_lo.set_bytes_big(&withdraw_to[16..]);
+    Bn254Fr::assert_equal_bytes_be(&withdraw_to_hi, &withdraw_to[..16]);
+    Bn254Fr::assert_equal_bytes_be(&withdraw_to_lo, &withdraw_to[16..]);
+
     let mut rhs_fr = Bn254Fr::new();
     addmod_checked(&mut rhs_fr, &withdraw_fr, &out_sum_fr);
     Bn254Fr::assert_equal(&sum_in_fr, &rhs_fr);
@@ -943,6 +1021,25 @@ fn main() {
     let inv_enforce_fr = bn254fr_from_hash32_be(&inv_enforce_bytes);
     enforce_prod.mulmod_checked(&inv_enforce_fr);
     Bn254Fr::assert_equal_u64(&enforce_prod, 1);
+
+    // --- Blacklist checks (deny-list sparse Merkle map) ---
+    //
+    // Layout appended after inv_enforce:
+    //   blacklist_root                [PUBLIC]
+    //   bl_siblings_sender[k]         [PRIVATE] BL_DEPTH × 32 bytes
+    //   bl_siblings_out_j[k]          [PRIVATE] (n_out × BL_DEPTH) × 32 bytes
+    let blacklist_root = read_hash32(&args, arg_idx);
+    arg_idx += 1;
+
+    // Sender (current owner) must not be blacklisted.
+    let bl_sender_sibs = read_siblings_fr(&args, &mut arg_idx, BL_DEPTH);
+    assert_not_blacklisted(&h, &sender_id, &blacklist_root, &bl_sender_sibs);
+
+    // Output recipients must not be blacklisted (prevents "sending into" frozen accounts).
+    for j in 0..n_out {
+        let bl_out_sibs = read_siblings_fr(&args, &mut arg_idx, BL_DEPTH);
+        assert_not_blacklisted(&h, &outs[j].rcp, &blacklist_root, &bl_out_sibs);
+    }
 
     // --- Level B: Viewer Attestations ---
     let base_after_outs = arg_idx;

@@ -14,13 +14,15 @@
  *   [4]  pk_spend_recipient  — 32 bytes (PRIVATE)
  *   [5]  pk_ivk_recipient    — 32 bytes (PRIVATE)
  *   [6]  cm_out              — 32 bytes (PUBLIC; must equal NOTE_V2(...) )
+ *   [7]  blacklist_root      — 32 bytes (PUBLIC)
+ *   [8+] bl_siblings[k]      — BL_DEPTH × 32 bytes (PRIVATE; proves recipient leaf == 0)
  *
  * NOTE:
  *   Deposits do not attest to a sender inside the pool; `sender_id` is fixed to 0x00..00.
  */
 
 use ligetron::api::{get_args, ArgHolder};
-use ligetron::bn254fr::Bn254Fr;
+use ligetron::bn254fr::{Bn254Fr, addmod_checked, submod_checked};
 use ligetron::poseidon2::poseidon2_hash_bytes;
 
 type Hash32 = [u8; 32];
@@ -127,6 +129,14 @@ fn assert_fr_eq_hash32(computed: &Bn254Fr, expected_be: &Hash32) {
     Bn254Fr::assert_equal_bytes_be(computed, expected_be);
 }
 
+/// Convert a 32-byte big-endian hash to a Bn254Fr field element.
+#[inline(always)]
+fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
+    let mut result = Bn254Fr::new();
+    result.set_bytes_big(h);
+    result
+}
+
 struct Poseidon2Core;
 
 impl Poseidon2Core {
@@ -144,6 +154,109 @@ impl Poseidon2Core {
     pub fn hash_padded(&self, preimage: &[u8]) -> Hash32 {
         self.hash_padded_fr(preimage).to_bytes_be()
     }
+}
+
+/// Merkle tree node hash: H("MT_NODE_V1" || lvl || left || right)
+const MT_NODE_BUF_LEN: usize = 10 + 1 + 32 + 32; // "MT_NODE_V1" + lvl + left + right = 75
+
+#[inline(always)]
+fn mt_combine(h: &Poseidon2Core, level: u8, left: &Hash32, right: &Hash32) -> Bn254Fr {
+    let mut buf = [0u8; MT_NODE_BUF_LEN];
+    buf[..10].copy_from_slice(b"MT_NODE_V1");
+    buf[10] = level;
+    buf[11..43].copy_from_slice(left);
+    buf[43..75].copy_from_slice(right);
+    h.hash_padded_fr(&buf)
+}
+
+/// Compute Merkle root using FIELD-LEVEL MUX operations.
+/// This version works with private position bits and siblings!
+fn root_from_path_field_level(
+    h: &Poseidon2Core,
+    leaf_bytes: &Hash32,
+    pos_bits: &[Bn254Fr],
+    siblings_fr: &[Bn254Fr],
+    depth: usize,
+) -> Bn254Fr {
+    if depth == 0 {
+        hard_fail(77);
+    }
+
+    let mut cur_fr = bn254fr_from_hash32_be(leaf_bytes);
+
+    let mut left_fr = Bn254Fr::new();
+    let mut right_fr = Bn254Fr::new();
+    let mut delta = Bn254Fr::new();
+    let mut left_bytes = [0u8; 32];
+    let mut right_bytes = [0u8; 32];
+
+    let mut lvl = 0usize;
+    while lvl < depth {
+        let bit = &pos_bits[lvl];
+        let sib_fr = &siblings_fr[lvl];
+
+        // delta = bit * (sib - cur)
+        // left  = cur + delta
+        // right = sib - delta
+        submod_checked(&mut delta, sib_fr, &cur_fr);
+        delta.mulmod_checked(bit);
+        addmod_checked(&mut left_fr, &cur_fr, &delta);
+        submod_checked(&mut right_fr, sib_fr, &delta);
+
+        left_fr.get_bytes_big(&mut left_bytes);
+        right_fr.get_bytes_big(&mut right_bytes);
+
+        cur_fr = mt_combine(h, lvl as u8, &left_bytes, &right_bytes);
+        lvl += 1;
+    }
+
+    cur_fr
+}
+
+// Blacklist sparse Merkle map depth. We derive path bits from the low bits of the recipient ID.
+const BL_DEPTH: usize = 63;
+
+#[inline(always)]
+fn bl_pos_bits_from_id(id: &Hash32, depth: usize) -> Vec<Bn254Fr> {
+    let mut bits = Vec::with_capacity(depth);
+    let mut i = 0usize;
+    while i < depth {
+        let byte = id[31 - (i / 8)];
+        let bit = (byte >> (i % 8)) & 1;
+        bits.push(Bn254Fr::from_u32(bit as u32));
+        i += 1;
+    }
+    bits
+}
+
+#[inline(always)]
+fn read_siblings_fr(args: &ArgHolder, arg_idx: &mut usize, depth: usize, fail_code: u32) -> Vec<Bn254Fr> {
+    let mut v = Vec::with_capacity(depth);
+    let mut i = 0usize;
+    while i < depth {
+        let sib = read_hash32(args, *arg_idx, fail_code);
+        *arg_idx += 1;
+        v.push(bn254fr_from_hash32_be(&sib));
+        i += 1;
+    }
+    v
+}
+
+#[inline(always)]
+fn assert_not_blacklisted(
+    h: &Poseidon2Core,
+    id: &Hash32,
+    blacklist_root: &Hash32,
+    siblings_fr: &[Bn254Fr],
+) {
+    if siblings_fr.len() != BL_DEPTH {
+        hard_fail(78);
+    }
+
+    let pos_bits = bl_pos_bits_from_id(id, BL_DEPTH);
+    let leaf0: Hash32 = [0u8; 32];
+    let root_fr = root_from_path_field_level(h, &leaf0, &pos_bits[..], siblings_fr, BL_DEPTH);
+    assert_fr_eq_hash32(&root_fr, blacklist_root);
 }
 
 const ADDR_V2_BUF_LEN: usize = 7 + 32 + 32 + 32; // "ADDR_V2" + domain + pk_spend + pk_ivk = 103
@@ -180,7 +293,8 @@ fn note_commitment_fr(
 
 fn main() {
     let args = get_args();
-    if args.len() != 7 {
+    let expected_argc = 8 + BL_DEPTH; // argv[0] + 6 base args + blacklist_root + BL_DEPTH siblings
+    if args.len() != expected_argc {
         hard_fail(70);
     }
 
@@ -198,9 +312,15 @@ fn main() {
     let pk_spend_recipient = read_hash32(&args, 4, 74);
     let pk_ivk_recipient = read_hash32(&args, 5, 75);
     let cm_out_arg = read_hash32(&args, 6, 76);
+    let blacklist_root = read_hash32(&args, 7, 77);
+    let mut arg_idx: usize = 8;
+    let bl_sibs = read_siblings_fr(&args, &mut arg_idx, BL_DEPTH, 78);
 
     let recipient = recipient_from_pk(&h, &domain, &pk_spend_recipient, &pk_ivk_recipient);
     let sender_id = [0u8; 32];
     let cm_out_fr = note_commitment_fr(&h, &domain, value, &rho, &recipient, &sender_id);
     assert_fr_eq_hash32(&cm_out_fr, &cm_out_arg);
+
+    // Recipient must not be blacklisted.
+    assert_not_blacklisted(&h, &recipient, &blacklist_root, &bl_sibs);
 }

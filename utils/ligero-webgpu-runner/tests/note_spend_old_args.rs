@@ -14,6 +14,8 @@ use ligetron::Bn254Fr;
 
 type Hash32 = [u8; 32];
 
+const BL_DEPTH: usize = 63;
+
 fn hx32(b: &Hash32) -> String {
     hex::encode(b)
 }
@@ -43,6 +45,32 @@ fn poseidon2_hash_domain(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
 fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     let lvl = [level];
     poseidon2_hash_domain(b"MT_NODE_V1", &[&lvl, left, right])
+}
+
+fn merkle_default_nodes(depth: usize) -> Vec<Hash32> {
+    let mut out = Vec::with_capacity(depth + 1);
+    out.push([0u8; 32]); // height 0 (leaf)
+    for lvl in 0..depth {
+        let prev = out[lvl];
+        out.push(mt_combine(lvl as u8, &prev, &prev));
+    }
+    out
+}
+
+fn append_empty_blacklist(args: &mut Vec<LigeroArg>, n_out: usize) {
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
+    args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    }); // blacklist_root (pub)
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        args.push(LigeroArg::Hex { hex: hx32(sib) }); // sender siblings (priv)
+    }
+    for _j in 0..n_out {
+        for sib in bl_defaults.iter().take(BL_DEPTH) {
+            args.push(LigeroArg::Hex { hex: hx32(sib) }); // output recipient siblings (priv)
+        }
+    }
 }
 
 fn note_commitment(
@@ -209,7 +237,7 @@ fn private_indices(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
     }
 
     let withdraw_idx = 7 + n_in * per_in;
-    let outs_base = withdraw_idx + 2; // skip withdraw_amount + n_out
+    let outs_base = withdraw_idx + 3; // skip withdraw_amount + withdraw_to + n_out
     for j in 0..n_out {
         idx.push(outs_base + 5 * j + 0); // value_out
         idx.push(outs_base + 5 * j + 1); // rho_out
@@ -218,7 +246,20 @@ fn private_indices(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
                                          // cm_out is public
     }
 
-    idx.push(outs_base + 5 * n_out); // inv_enforce
+    let inv_enforce_idx = outs_base + 5 * n_out;
+    idx.push(inv_enforce_idx); // inv_enforce
+
+    // Blacklist siblings are private; blacklist_root is public.
+    let bl_sender_start = inv_enforce_idx + 2;
+    for k in 0..BL_DEPTH {
+        idx.push(bl_sender_start + k);
+    }
+    let bl_out_start = bl_sender_start + BL_DEPTH;
+    for j in 0..n_out {
+        for k in 0..BL_DEPTH {
+            idx.push(bl_out_start + j * BL_DEPTH + k);
+        }
+    }
 
     idx
 }
@@ -398,6 +439,9 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
     args.push(LigeroArg::I64 {
         i64: withdraw_amount as i64,
     });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&[0u8; 32]),
+    });
     args.push(LigeroArg::I64 { i64: n_out as i64 });
     args.push(LigeroArg::I64 {
         i64: out_value as i64,
@@ -415,6 +459,8 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
     args.push(LigeroArg::Hex {
         hex: hx32(&inv_enforce),
     });
+
+    append_empty_blacklist(&mut args, n_out as usize);
 
     let priv_idx = private_indices(depth, 1, 1);
     runner.config_mut().private_indices = priv_idx;

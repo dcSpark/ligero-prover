@@ -17,6 +17,8 @@ use ligetron::poseidon2_hash_bytes;
 
 type Hash32 = [u8; 32];
 
+const BL_DEPTH: usize = 63;
+
 fn hx32(b: &Hash32) -> String {
     hex::encode(b)
 }
@@ -98,6 +100,111 @@ fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Has
     poseidon2_hash_domain(b"ADDR_V2", &[domain, pk_spend, pk_ivk])
 }
 
+fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
+    let lvl = [level];
+    poseidon2_hash_domain(b"MT_NODE_V1", &[&lvl, left, right])
+}
+
+fn merkle_default_nodes(depth: usize) -> Vec<Hash32> {
+    let mut out = Vec::with_capacity(depth + 1);
+    out.push([0u8; 32]); // height 0 (leaf)
+    for lvl in 0..depth {
+        let prev = out[lvl];
+        out.push(mt_combine(lvl as u8, &prev, &prev));
+    }
+    out
+}
+
+fn bl_pos_from_id(id: &Hash32) -> u64 {
+    // Must match the guest's `bl_pos_bits_from_id`: low bits, LSB-first from the last byte.
+    let mut pos: u64 = 0;
+    let mut i = 0usize;
+    while i < BL_DEPTH {
+        let byte = id[31 - (i / 8)];
+        let bit = (byte >> (i % 8)) & 1;
+        pos |= (bit as u64) << i;
+        i += 1;
+    }
+    pos
+}
+
+fn merkle_root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32]) -> Hash32 {
+    let mut cur = *leaf;
+    let mut idx = pos;
+    for (lvl, sib) in siblings.iter().enumerate() {
+        cur = if (idx & 1) == 0 {
+            mt_combine(lvl as u8, &cur, sib)
+        } else {
+            mt_combine(lvl as u8, sib, &cur)
+        };
+        idx >>= 1;
+    }
+    cur
+}
+
+fn merkle_root_and_openings_sparse(
+    depth: usize,
+    leaves: &[(u64, Hash32)],
+) -> Result<(Hash32, Vec<Vec<Hash32>>)> {
+    use std::collections::{HashMap, HashSet};
+
+    let default_nodes = merkle_default_nodes(depth);
+
+    // Store only non-default nodes by height. Height 0 are leaves; height `depth` is the root.
+    let mut levels: Vec<HashMap<u64, Hash32>> = (0..=depth).map(|_| HashMap::new()).collect();
+
+    if depth >= 64 {
+        anyhow::bail!("depth too large for sparse tree: {depth}");
+    }
+    let max_pos = if depth == 63 { 1u64 << 63 } else { 1u64 << depth };
+    for (pos, leaf) in leaves {
+        anyhow::ensure!(*pos < max_pos, "leaf pos {pos} out of range for depth {depth}");
+        if let Some(prev) = levels[0].insert(*pos, *leaf) {
+            anyhow::ensure!(prev == *leaf, "duplicate leaf pos {pos} with different value");
+        }
+    }
+
+    // Build up.
+    for lvl in 0..depth {
+        let mut parent_set: HashSet<u64> = HashSet::new();
+        for &idx in levels[lvl].keys() {
+            parent_set.insert(idx >> 1);
+        }
+
+        for pidx in parent_set {
+            let left_idx = pidx * 2;
+            let right_idx = pidx * 2 + 1;
+            let left = levels[lvl]
+                .get(&left_idx)
+                .unwrap_or(&default_nodes[lvl]);
+            let right = levels[lvl]
+                .get(&right_idx)
+                .unwrap_or(&default_nodes[lvl]);
+            let parent = mt_combine(lvl as u8, left, right);
+            if parent != default_nodes[lvl + 1] {
+                levels[lvl + 1].insert(pidx, parent);
+            }
+        }
+    }
+
+    let root = *levels[depth].get(&0).unwrap_or(&default_nodes[depth]);
+
+    // Open siblings for each requested leaf (in input order).
+    let mut openings: Vec<Vec<Hash32>> = Vec::with_capacity(leaves.len());
+    for (pos, _leaf) in leaves {
+        let mut sibs: Vec<Hash32> = Vec::with_capacity(depth);
+        for lvl in 0..depth {
+            let idx_at_lvl = pos >> lvl;
+            let sib_idx = idx_at_lvl ^ 1;
+            let sib = *levels[lvl].get(&sib_idx).unwrap_or(&default_nodes[lvl]);
+            sibs.push(sib);
+        }
+        openings.push(sibs);
+    }
+
+    Ok((root, openings))
+}
+
 fn note_commitment_v2(
     domain: &Hash32,
     value: u64,
@@ -114,8 +221,13 @@ fn note_commitment_v2(
 fn private_indices_note_deposit() -> Vec<usize> {
     // Deposit circuit ABI:
     // 1 domain (PUB), 2 value (PUB), 3 rho (PRIV), 4 pk_spend_recipient (PRIV),
-    // 5 pk_ivk_recipient (PRIV), 6 cm_out (PUB)
-    vec![3, 4, 5]
+    // 5 pk_ivk_recipient (PRIV), 6 cm_out (PUB),
+    // 7 blacklist_root (PUB), 8..(8+BL_DEPTH-1) bl_siblings (PRIV)
+    let mut idx = vec![3, 4, 5];
+    for i in 0..BL_DEPTH {
+        idx.push(8 + i);
+    }
+    idx
 }
 
 fn setup_runner_and_paths(
@@ -186,8 +298,10 @@ fn test_note_deposit_roundtrip_hex_args() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
 
-    let args = vec![
+    let mut args = vec![
         LigeroArg::Hex { hex: hx32(&domain) },
         LigeroArg::I64 { i64: value as i64 },
         LigeroArg::Hex { hex: hx32(&rho) },
@@ -195,6 +309,12 @@ fn test_note_deposit_roundtrip_hex_args() -> Result<()> {
         LigeroArg::Hex { hex: hx32(&pk_ivk) },
         LigeroArg::Hex { hex: hx32(&cm_out) },
     ];
+    args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    });
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        args.push(LigeroArg::Hex { hex: hx32(sib) });
+    }
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
@@ -246,8 +366,10 @@ fn test_note_deposit_roundtrip_string_args() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
 
-    let args = vec![
+    let mut args = vec![
         LigeroArg::String {
             str: format!("0x{}", hx32(&domain)),
         },
@@ -265,6 +387,14 @@ fn test_note_deposit_roundtrip_string_args() -> Result<()> {
             str: format!("0x{}", hx32(&cm_out)),
         },
     ];
+    args.push(LigeroArg::String {
+        str: format!("0x{}", hx32(&blacklist_root)),
+    });
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        args.push(LigeroArg::String {
+            str: format!("0x{}", hx32(sib)),
+        });
+    }
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
@@ -315,8 +445,10 @@ fn test_note_deposit_verifier_rejects_mutated_value() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
 
-    let args = vec![
+    let mut args = vec![
         LigeroArg::Hex { hex: hx32(&domain) },
         LigeroArg::I64 { i64: value as i64 },
         LigeroArg::Hex { hex: hx32(&rho) },
@@ -324,6 +456,12 @@ fn test_note_deposit_verifier_rejects_mutated_value() -> Result<()> {
         LigeroArg::Hex { hex: hx32(&pk_ivk) },
         LigeroArg::Hex { hex: hx32(&cm_out) },
     ];
+    args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    });
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        args.push(LigeroArg::Hex { hex: hx32(sib) });
+    }
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
@@ -393,8 +531,10 @@ fn test_note_deposit_verifier_rejects_mutated_cm_out() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
 
-    let args = vec![
+    let mut args = vec![
         LigeroArg::Hex { hex: hx32(&domain) },
         LigeroArg::I64 { i64: value as i64 },
         LigeroArg::Hex { hex: hx32(&rho) },
@@ -402,6 +542,12 @@ fn test_note_deposit_verifier_rejects_mutated_cm_out() -> Result<()> {
         LigeroArg::Hex { hex: hx32(&pk_ivk) },
         LigeroArg::Hex { hex: hx32(&cm_out) },
     ];
+    args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    });
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        args.push(LigeroArg::Hex { hex: hx32(sib) });
+    }
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
@@ -472,8 +618,10 @@ fn test_note_deposit_rejects_negative_value_and_wrong_argc() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
+    let bl_defaults = merkle_default_nodes(BL_DEPTH);
+    let blacklist_root = bl_defaults[BL_DEPTH];
 
-    let good_args = vec![
+    let mut good_args = vec![
         LigeroArg::Hex { hex: hx32(&domain) },
         LigeroArg::I64 { i64: value as i64 },
         LigeroArg::Hex { hex: hx32(&rho) },
@@ -481,6 +629,12 @@ fn test_note_deposit_rejects_negative_value_and_wrong_argc() -> Result<()> {
         LigeroArg::Hex { hex: hx32(&pk_ivk) },
         LigeroArg::Hex { hex: hx32(&cm_out) },
     ];
+    good_args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    });
+    for sib in bl_defaults.iter().take(BL_DEPTH) {
+        good_args.push(LigeroArg::Hex { hex: hx32(sib) });
+    }
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = good_args.clone();
@@ -532,9 +686,60 @@ fn test_note_deposit_rejects_negative_value_and_wrong_argc() -> Result<()> {
         }
     }
 
+    // Invalid: zero `value` must be rejected.
+    let mut bad_args = good_args.clone();
+    bad_args[1] = LigeroArg::I64 { i64: 0 };
+    runner.config_mut().private_indices = priv_idx.clone();
+    runner.config_mut().args = bad_args.clone();
+    match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+        keep_proof_dir: false,
+        proof_outputs_base: None,
+        write_replay_script: false,
+    }) {
+        Ok((proof, _stdout, _stderr)) => {
+            let (ok, stdout, stderr) =
+                verifier::verify_proof_with_output(&vpaths, &proof, bad_args, priv_idx.clone())
+                    .context("Failed to run verifier")?;
+            anyhow::ensure!(
+                !ok,
+                "expected verification to fail, but it succeeded\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+        Err(_e) => {
+            // Expected: invalid input triggers UNSAT and the prover exits non-zero.
+        }
+    }
+
+    // Invalid: mismatch between recipient keys and cm_out must be rejected (prove-time).
+    let mut bad_args = good_args.clone();
+    let wrong_pk_ivk: Hash32 = [0x99u8; 32];
+    bad_args[4] = LigeroArg::Hex {
+        hex: hx32(&wrong_pk_ivk),
+    };
+    runner.config_mut().private_indices = priv_idx.clone();
+    runner.config_mut().args = bad_args.clone();
+    match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+        keep_proof_dir: false,
+        proof_outputs_base: None,
+        write_replay_script: false,
+    }) {
+        Ok((proof, _stdout, _stderr)) => {
+            let (ok, stdout, stderr) =
+                verifier::verify_proof_with_output(&vpaths, &proof, bad_args, priv_idx.clone())
+                    .context("Failed to run verifier")?;
+            anyhow::ensure!(
+                !ok,
+                "expected verification to fail, but it succeeded\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+        Err(_e) => {
+            // Expected: witness no longer satisfies cm_out == NOTE_V2(...).
+        }
+    }
+
     // Invalid: wrong arg count must be rejected (regression test for failure-path soundness).
     let mut bad_args = good_args;
-    bad_args.pop(); // drop cm_out
+    bad_args.pop(); // drop one arg (wrong arg count)
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = bad_args.clone();
     match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
@@ -555,4 +760,141 @@ fn test_note_deposit_rejects_negative_value_and_wrong_argc() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn test_note_deposit_blacklist_accepts_unlisted_and_rejects_listed() -> Result<()> {
+    let repo = repo_root()?;
+    maybe_build_note_deposit_guest(&repo)?;
+
+    let program = note_deposit_program_path(&repo)
+        .canonicalize()
+        .context("Failed to canonicalize note_deposit_guest.wasm")?;
+
+    let Some((mut runner, vpaths, priv_idx)) = try_skip(setup_runner_and_paths(&program))? else {
+        return Ok(());
+    };
+
+    // Two recipients: one will be blacklisted (leaf=1), the other unlisted (leaf=0).
+    let domain: Hash32 = [0x55u8; 32];
+    let value: u64 = 42;
+    let rho_ok: Hash32 = [0x11u8; 32];
+    let rho_bad: Hash32 = [0x22u8; 32];
+
+    let pk_spend_ok: Hash32 = [0x33u8; 32];
+    let pk_ivk_ok: Hash32 = [0x44u8; 32];
+    let recipient_ok = recipient_from_pk(&domain, &pk_spend_ok, &pk_ivk_ok);
+
+    let pk_spend_bad: Hash32 = [0x66u8; 32];
+    let pk_ivk_bad: Hash32 = [0x77u8; 32];
+    let recipient_bad = recipient_from_pk(&domain, &pk_spend_bad, &pk_ivk_bad);
+
+    let pos_bad = bl_pos_from_id(&recipient_bad);
+    let pos_ok = bl_pos_from_id(&recipient_ok);
+    anyhow::ensure!(pos_bad != pos_ok, "unexpected blacklist index collision");
+
+    let leaf0: Hash32 = [0u8; 32];
+    let mut leaf1: Hash32 = [0u8; 32];
+    leaf1[31] = 1;
+
+    // Build a sparse blacklist tree with exactly one blacklisted leaf.
+    let (blacklist_root, openings) = merkle_root_and_openings_sparse(
+        BL_DEPTH,
+        &[(pos_bad, leaf1), (pos_ok, leaf0)],
+    )?;
+    let sibs_bad = &openings[0];
+    let sibs_ok = &openings[1];
+
+    // Sanity: membership at pos_bad is 1, and at pos_ok is 0, under the same root.
+    anyhow::ensure!(
+        merkle_root_from_path(&leaf1, pos_bad, sibs_bad) == blacklist_root,
+        "blacklisted address opening must match root"
+    );
+    anyhow::ensure!(
+        merkle_root_from_path(&leaf0, pos_ok, sibs_ok) == blacklist_root,
+        "unlisted address opening must match root"
+    );
+
+    // === Proof for the unlisted address should verify ===
+    let sender_id = [0u8; 32];
+    let cm_ok = note_commitment_v2(&domain, value, &rho_ok, &recipient_ok, &sender_id);
+
+    let mut args_ok = vec![
+        LigeroArg::Hex { hex: hx32(&domain) },
+        LigeroArg::I64 { i64: value as i64 },
+        LigeroArg::Hex { hex: hx32(&rho_ok) },
+        LigeroArg::Hex { hex: hx32(&pk_spend_ok) },
+        LigeroArg::Hex { hex: hx32(&pk_ivk_ok) },
+        LigeroArg::Hex { hex: hx32(&cm_ok) },
+        LigeroArg::Hex {
+            hex: hx32(&blacklist_root),
+        },
+    ];
+    for sib in sibs_ok.iter().take(BL_DEPTH) {
+        args_ok.push(LigeroArg::Hex { hex: hx32(sib) });
+    }
+
+    runner.config_mut().private_indices = priv_idx.clone();
+    runner.config_mut().args = args_ok.clone();
+    let (proof_ok, _p_stdout, _p_stderr) =
+        match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+            keep_proof_dir: false,
+            proof_outputs_base: None,
+            write_replay_script: false,
+        }) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("Skipping: prover failed (GPU/WebGPU likely unavailable): {err}");
+                return Ok(());
+            }
+        };
+    anyhow::ensure!(!proof_ok.is_empty(), "proof should not be empty");
+
+    let (ok, v_stdout, v_stderr) =
+        verifier::verify_proof_with_output(&vpaths, &proof_ok, args_ok, priv_idx.clone())
+            .context("Failed to run verifier")?;
+    if !ok {
+        anyhow::bail!(
+            "verifier did not report success for unlisted address\nstdout: {v_stdout}\nstderr: {v_stderr}"
+        );
+    }
+
+    // === Proof for the blacklisted address must be rejected ===
+    let cm_bad = note_commitment_v2(&domain, value, &rho_bad, &recipient_bad, &sender_id);
+    let mut args_bad = vec![
+        LigeroArg::Hex { hex: hx32(&domain) },
+        LigeroArg::I64 { i64: value as i64 },
+        LigeroArg::Hex { hex: hx32(&rho_bad) },
+        LigeroArg::Hex {
+            hex: hx32(&pk_spend_bad),
+        },
+        LigeroArg::Hex { hex: hx32(&pk_ivk_bad) },
+        LigeroArg::Hex { hex: hx32(&cm_bad) },
+        LigeroArg::Hex {
+            hex: hx32(&blacklist_root),
+        },
+    ];
+    for sib in sibs_bad.iter().take(BL_DEPTH) {
+        args_bad.push(LigeroArg::Hex { hex: hx32(sib) });
+    }
+
+    runner.config_mut().private_indices = priv_idx.clone();
+    runner.config_mut().args = args_bad.clone();
+    match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
+        keep_proof_dir: false,
+        proof_outputs_base: None,
+        write_replay_script: false,
+    }) {
+        Err(_e) => Ok(()), // rejected at prove-time ✅ (expected)
+        Ok((proof_bad, _stdout, _stderr)) => {
+            let (ok_bad, _stdout, _stderr) =
+                verifier::verify_proof_with_output(&vpaths, &proof_bad, args_bad, priv_idx)
+                    .context("Failed to run verifier")?;
+            anyhow::ensure!(
+                !ok_bad,
+                "expected verification to fail for blacklisted address, but it succeeded"
+            );
+            Ok(())
+        }
+    }
 }

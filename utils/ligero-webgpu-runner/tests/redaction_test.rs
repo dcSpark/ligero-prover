@@ -245,6 +245,8 @@ fn test_note_spend_argument_layout_shape() {
 
     // withdraw_amount (i64) - PUBLIC
     args.push(LigeroArg::I64 { i64: 200 });
+    // withdraw_to (hex) - PUBLIC
+    args.push(LigeroArg::Hex { hex: hex32(0x00) });
     // n_out (i64) - PUBLIC
     args.push(LigeroArg::I64 { i64: n_out as i64 });
 
@@ -276,7 +278,7 @@ fn test_note_spend_argument_layout_shape() {
     // Outputs: value, rho, pk_spend, pk_ivk are private
     let per_in = 4 + 2 * depth;
     let withdraw_idx = 7 + n_in * per_in;
-    let out0_base = withdraw_idx + 2; // 1-based index of value_out_0
+    let out0_base = withdraw_idx + 3; // 1-based index of value_out_0
     private_indices.push(out0_base + 0); // value_out_0
     private_indices.push(out0_base + 1); // rho_out_0
     private_indices.push(out0_base + 2); // pk_spend_out_0
@@ -293,6 +295,7 @@ fn test_note_spend_argument_layout_shape() {
     assert_eq!(redacted[5], args[5]); // n_in
     assert_eq!(redacted[17], args[17]); // nullifier_0
     assert_eq!(redacted[18], args[18]); // withdraw_amount
-    assert_eq!(redacted[19], args[19]); // n_out
-    assert_eq!(redacted[24], args[24]); // cm_out_0
+    assert_eq!(redacted[19], args[19]); // withdraw_to
+    assert_eq!(redacted[20], args[20]); // n_out
+    assert_eq!(redacted[25], args[25]); // cm_out_0
 }
