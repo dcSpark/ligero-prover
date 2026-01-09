@@ -26,6 +26,25 @@ pub enum LigeroArg {
         /// i64 value.
         i64: i64,
     },
+    /// Backwards/forwards compatible byte argument: carries both `hex` and `bytes_b64`.
+    ///
+    /// - New binaries will prefer `bytes_b64` and pass raw bytes to the guest.
+    /// - Older binaries will ignore `bytes_b64` and fall back to `hex`.
+    ///
+    /// This is the recommended encoding for 32-byte values used by the circuits.
+    #[serde(rename = "hex")]
+    HexBytesB64 {
+        /// Hex string value (no `0x` prefix required).
+        hex: String,
+        /// Base64-encoded raw bytes.
+        bytes_b64: String,
+    },
+    /// Base64-encoded raw bytes argument.
+    #[serde(rename = "bytes_b64")]
+    BytesB64 {
+        /// Base64-encoded raw bytes.
+        bytes_b64: String,
+    },
     /// Hex argument.
     #[serde(rename = "hex")]
     Hex {

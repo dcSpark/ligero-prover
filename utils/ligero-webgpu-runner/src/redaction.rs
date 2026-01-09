@@ -4,6 +4,7 @@
 //! looking like numbers) while removing sensitive material.
 
 use crate::LigeroArg;
+use base64::{engine::general_purpose, Engine as _};
 
 /// Redact a single Ligero argument while preserving basic parseability.
 ///
@@ -15,6 +16,8 @@ use crate::LigeroArg;
 ///   - otherwise replace with `x` (same length; minimum 1)
 /// - `I64`: replaced with `0`
 /// - `Hex`: replaced with zeros (same length; minimum 1)
+/// - `BytesB64`: replaced with base64 of zero bytes (same decoded length)
+/// - `HexBytesB64`: redacts both fields (same decoded length for `bytes_b64`)
 pub fn redact_arg(arg: &LigeroArg) -> LigeroArg {
     match arg {
         LigeroArg::String { str: s } => {
@@ -45,6 +48,25 @@ pub fn redact_arg(arg: &LigeroArg) -> LigeroArg {
             }
         }
         LigeroArg::I64 { .. } => LigeroArg::I64 { i64: 0 },
+        LigeroArg::BytesB64 { bytes_b64 } => {
+            let decoded_len = general_purpose::STANDARD
+                .decode(bytes_b64)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            let redacted = general_purpose::STANDARD.encode(vec![0u8; decoded_len]);
+            LigeroArg::BytesB64 { bytes_b64: redacted }
+        }
+        LigeroArg::HexBytesB64 { hex, bytes_b64 } => {
+            let decoded_len = general_purpose::STANDARD
+                .decode(bytes_b64)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            let redacted_b64 = general_purpose::STANDARD.encode(vec![0u8; decoded_len]);
+            LigeroArg::HexBytesB64 {
+                hex: "0".repeat(hex.len().max(1)),
+                bytes_b64: redacted_b64,
+            }
+        }
         LigeroArg::Hex { hex: h } => LigeroArg::Hex {
             hex: "0".repeat(h.len().max(1)),
         },

@@ -16,15 +16,15 @@ use ligetron::{poseidon2_hash_bytes, Bn254Fr};
 type Hash32 = [u8; 32];
 
 const BN254_FR_MODULUS_BE: Hash32 = [
-    0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81,
-    0x58, 0x5d, 0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93,
-    0xf0, 0x00, 0x00, 0x01,
+    0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
+    0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
 ];
 
 const MAX_INS: usize = 4;
 const MAX_OUTS: usize = 2;
 const MAX_VIEWERS: usize = 8;
-const BL_DEPTH: usize = 63;
+const BL_DEPTH: usize = 16;
+const BL_BUCKET_SIZE: usize = 12;
 
 fn hx32(b: &Hash32) -> String {
     hex::encode(b)
@@ -265,6 +265,72 @@ fn merkle_default_nodes(depth: usize) -> Vec<Hash32> {
     out
 }
 
+fn merkle_default_nodes_from_leaf(depth: usize, leaf0: &Hash32) -> Vec<Hash32> {
+    let mut out = Vec::with_capacity(depth + 1);
+    out.push(*leaf0);
+    for lvl in 0..depth {
+        let prev = out[lvl];
+        out.push(mt_combine(lvl as u8, &prev, &prev));
+    }
+    out
+}
+
+fn bl_empty_bucket_entries() -> [Hash32; BL_BUCKET_SIZE] {
+    [[0u8; 32]; BL_BUCKET_SIZE]
+}
+
+fn bl_bucket_leaf(entries: &[Hash32; BL_BUCKET_SIZE]) -> Hash32 {
+    let mut buf = Vec::with_capacity(12 + 32 * BL_BUCKET_SIZE);
+    buf.extend_from_slice(b"BL_BUCKET_V1");
+    for e in entries {
+        buf.extend_from_slice(e);
+    }
+    poseidon2_hash_bytes(&buf).to_bytes_be()
+}
+
+fn bl_bucket_inv_for_id(id: &Hash32, bucket_entries: &[Hash32; BL_BUCKET_SIZE]) -> Option<Hash32> {
+    let id_fr = fr_from_hash32_be(id);
+    let mut prod = Bn254Fr::from_u32(1);
+    for e in bucket_entries.iter() {
+        let e_fr = fr_from_hash32_be(e);
+        let mut delta = id_fr.clone();
+        delta.submod_checked(&e_fr);
+        prod.mulmod_checked(&delta);
+    }
+    if prod.is_zero() {
+        return None;
+    }
+    let mut inv = prod.clone();
+    inv.inverse();
+    Some(inv.to_bytes_be())
+}
+
+fn append_empty_blacklist_interval(args: &mut Vec<LigeroArg>, ids_to_check: &[Hash32]) -> Result<()> {
+    let bucket_entries = bl_empty_bucket_entries();
+    let leaf0 = bl_bucket_leaf(&bucket_entries);
+    let default_nodes = merkle_default_nodes_from_leaf(BL_DEPTH, &leaf0);
+    let blacklist_root = default_nodes[BL_DEPTH];
+    let siblings: Vec<Hash32> = default_nodes.iter().take(BL_DEPTH).copied().collect();
+
+    args.push(LigeroArg::Hex {
+        hex: hx32(&blacklist_root),
+    }); // blacklist_root (pub)
+
+    for id in ids_to_check {
+        for e in bucket_entries.iter() {
+            args.push(LigeroArg::Hex { hex: hx32(e) }); // bucket entry (priv)
+        }
+        let inv = bl_bucket_inv_for_id(id, &bucket_entries)
+            .context("unexpected: id collides with empty blacklist bucket")?;
+        args.push(LigeroArg::Hex { hex: hx32(&inv) }); // bucket_inv (priv)
+        for sib in siblings.iter() {
+            args.push(LigeroArg::Hex { hex: hx32(sib) }); // sibling (priv)
+        }
+    }
+
+    Ok(())
+}
+
 fn merkle_root_and_openings_sparse(
     depth: usize,
     leaves: &[(u64, Hash32)],
@@ -279,11 +345,21 @@ fn merkle_root_and_openings_sparse(
     if depth >= 64 {
         anyhow::bail!("depth too large for sparse tree: {depth}");
     }
-    let max_pos = if depth == 63 { 1u64 << 63 } else { 1u64 << depth };
+    let max_pos = if depth == 63 {
+        1u64 << 63
+    } else {
+        1u64 << depth
+    };
     for (pos, leaf) in leaves {
-        anyhow::ensure!(*pos < max_pos, "leaf pos {pos} out of range for depth {depth}");
+        anyhow::ensure!(
+            *pos < max_pos,
+            "leaf pos {pos} out of range for depth {depth}"
+        );
         if let Some(prev) = levels[0].insert(*pos, *leaf) {
-            anyhow::ensure!(prev == *leaf, "duplicate leaf pos {pos} with different value");
+            anyhow::ensure!(
+                prev == *leaf,
+                "duplicate leaf pos {pos} with different value"
+            );
         }
     }
 
@@ -297,12 +373,8 @@ fn merkle_root_and_openings_sparse(
         for pidx in parent_set {
             let left_idx = pidx * 2;
             let right_idx = pidx * 2 + 1;
-            let left = levels[lvl]
-                .get(&left_idx)
-                .unwrap_or(&default_nodes[lvl]);
-            let right = levels[lvl]
-                .get(&right_idx)
-                .unwrap_or(&default_nodes[lvl]);
+            let left = levels[lvl].get(&left_idx).unwrap_or(&default_nodes[lvl]);
+            let right = levels[lvl].get(&right_idx).unwrap_or(&default_nodes[lvl]);
             let parent = mt_combine(lvl as u8, left, right);
             if parent != default_nodes[lvl + 1] {
                 levels[lvl + 1].insert(pidx, parent);
@@ -407,8 +479,12 @@ fn build_spend_tx(
     // Build args.
     let mut args: Vec<LigeroArg> = Vec::new();
     args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1 domain (pub)
-    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) }); // 2 spend_sk (priv)
-    args.push(LigeroArg::Hex { hex: hx32(&pk_ivk_owner) }); // 3 pk_ivk_owner (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&spend_sk),
+    }); // 2 spend_sk (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 pk_ivk_owner (priv)
     args.push(LigeroArg::I64 { i64: depth as i64 }); // 4 depth (pub)
     args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 anchor (pub)
     args.push(LigeroArg::I64 {
@@ -420,19 +496,15 @@ fn build_spend_tx(
         args.push(LigeroArg::I64 {
             i64: inp.value as i64,
         }); // value_in_i (priv)
-        args.push(LigeroArg::Hex { hex: hx32(&inp.rho) }); // rho_in_i (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&inp.rho),
+        }); // rho_in_i (priv)
         args.push(LigeroArg::Hex {
             hex: hx32(&inp.sender_id_in),
         }); // sender_id_in_i (priv)
-
-        for lvl in 0..depth {
-            let bit = ((inp.pos >> lvl) & 1) as u8;
-            let mut bit_bytes = [0u8; 32];
-            bit_bytes[31] = bit;
-            args.push(LigeroArg::Hex {
-                hex: hx32(&bit_bytes),
-            });
-        }
+        args.push(LigeroArg::I64 {
+            i64: inp.pos as i64,
+        }); // pos_i (priv)
 
         for sib in &openings[i] {
             args.push(LigeroArg::Hex { hex: hx32(sib) });
@@ -466,35 +538,37 @@ fn build_spend_tx(
         args.push(LigeroArg::I64 {
             i64: out.value as i64,
         }); // value_out_j (priv)
-        args.push(LigeroArg::Hex { hex: hx32(&out.rho) }); // rho_out_j (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&out.rho),
+        }); // rho_out_j (priv)
         args.push(LigeroArg::Hex {
             hex: hx32(&out.pk_spend),
         }); // pk_spend_out_j (priv)
-        args.push(LigeroArg::Hex { hex: hx32(&out.pk_ivk) }); // pk_ivk_out_j (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&out.pk_ivk),
+        }); // pk_ivk_out_j (priv)
         args.push(LigeroArg::Hex {
             hex: hx32(&cm_outs[j]),
         }); // cm_out_j (pub)
     }
 
     // inv_enforce (priv)
-    args.push(LigeroArg::Hex { hex: hx32(&inv_enforce) });
-
-    // Blacklist root (pub) + siblings (priv). Use the empty blacklist by default.
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
     args.push(LigeroArg::Hex {
-        hex: hx32(&blacklist_root),
+        hex: hx32(&inv_enforce),
     });
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        args.push(LigeroArg::Hex { hex: hx32(sib) }); // sender
-    }
-    for _j in 0..outputs.len() {
-        for sib in bl_defaults.iter().take(BL_DEPTH) {
-            args.push(LigeroArg::Hex { hex: hx32(sib) }); // output recipient
-        }
+
+    // Blacklist root (pub) + interval proofs (priv). Use the empty blacklist by default.
+    if withdraw_amount == 0 {
+        let out0 = outputs
+            .first()
+            .context("transfer requires at least one output")?;
+        let out0_recipient = recipient_from_pk(&domain, &out0.pk_spend, &out0.pk_ivk);
+        append_empty_blacklist_interval(&mut args, &[sender_id_current, out0_recipient])?;
+    } else {
+        append_empty_blacklist_interval(&mut args, &[sender_id_current])?;
     }
 
-    let priv_idx = private_indices_spend(depth, inputs.len(), outputs.len());
+    let priv_idx = private_indices_spend(depth, inputs.len(), outputs.len(), withdraw_amount == 0);
 
     Ok((
         args,
@@ -561,21 +635,19 @@ fn encode_note_plain(
     out
 }
 
-fn private_indices_spend(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
+fn private_indices_spend(depth: usize, n_in: usize, n_out: usize, is_transfer: bool) -> Vec<usize> {
     // Mirrors the guest layout described in utils/circuits/note-spend/src/main.rs (NOTE_V2 + ADDR_V2).
     let mut idx = vec![2usize, 3usize]; // spend_sk, pk_ivk_owner
 
-    let per_in = 4usize + 2usize * depth;
+    let per_in = 5usize + depth;
     for i in 0..n_in {
         let base = 7 + i * per_in;
         idx.push(base); // value_in
         idx.push(base + 1); // rho_in
         idx.push(base + 2); // sender_id_in
+        idx.push(base + 3); // pos
         for k in 0..depth {
-            idx.push(base + 3 + k); // pos_bit
-        }
-        for k in 0..depth {
-            idx.push(base + 3 + depth + k); // sibling
+            idx.push(base + 4 + k); // sibling
         }
         // nullifier is public
     }
@@ -595,18 +667,26 @@ fn private_indices_spend(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> 
     // Blacklist section:
     //   inv_enforce (priv)
     //   blacklist_root (pub)
-    //   bl_siblings_sender[BL_DEPTH] (priv)
-    //   bl_siblings_out_j[BL_DEPTH] (priv, per output)
-    let bl_sender_start = inv_enforce_idx + 2;
-    for k in 0..BL_DEPTH {
-        idx.push(bl_sender_start + k);
-    }
-    let bl_out_start = bl_sender_start + BL_DEPTH;
-    for j in 0..n_out {
-        for k in 0..BL_DEPTH {
-            idx.push(bl_out_start + j * BL_DEPTH + k);
+    //   per check: bucket_entries[BL_BUCKET_SIZE] (priv), bucket_inv (priv), siblings[BL_DEPTH] (priv)
+    let per_check = BL_BUCKET_SIZE + 1 + BL_DEPTH;
+    let bl_checks = if is_transfer { 2usize } else { 1usize };
+    let mut cur = inv_enforce_idx + 2; // skip blacklist_root (pub)
+    for _ in 0..bl_checks {
+        for i in 0..BL_BUCKET_SIZE {
+            idx.push(cur + i); // bucket_entry
         }
+        idx.push(cur + BL_BUCKET_SIZE); // bucket_inv
+        cur += BL_BUCKET_SIZE + 1;
+        for k in 0..BL_DEPTH {
+            idx.push(cur + k); // sibling
+        }
+        cur += BL_DEPTH;
     }
+    debug_assert_eq!(
+        cur,
+        inv_enforce_idx + 2 + bl_checks * per_check,
+        "blacklist private indices mismatch"
+    );
 
     idx.sort_unstable();
     idx.dedup();
@@ -614,7 +694,7 @@ fn private_indices_spend(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> 
 }
 
 fn per_in(depth: usize) -> usize {
-    4 + 2 * depth
+    5 + depth
 }
 
 fn withdraw_index(n_in: usize, depth: usize) -> usize {
@@ -655,9 +735,14 @@ fn prove(runner: &mut LigeroRunner, args: Vec<LigeroArg>, priv_idx: Vec<usize>) 
     Ok(proof)
 }
 
-fn verify(paths: &verifier::VerifierPaths, proof: &[u8], args: Vec<LigeroArg>, priv_idx: Vec<usize>) -> Result<bool> {
-    let (ok, _stdout, _stderr) =
-        verifier::verify_proof_with_output(paths, proof, args, priv_idx).context("Failed to run verifier")?;
+fn verify(
+    paths: &verifier::VerifierPaths,
+    proof: &[u8],
+    args: Vec<LigeroArg>,
+    priv_idx: Vec<usize>,
+) -> Result<bool> {
+    let (ok, _stdout, _stderr) = verifier::verify_proof_with_output(paths, proof, args, priv_idx)
+        .context("Failed to run verifier")?;
     Ok(ok)
 }
 
@@ -671,7 +756,10 @@ fn assert_rejected(
         Err(_) => Ok(()), // rejected at prove-time ✅
         Ok(proof) => {
             let ok = verify(vpaths, &proof, args, priv_idx)?;
-            anyhow::ensure!(!ok, "expected verifier rejection, but verification succeeded");
+            anyhow::ensure!(
+                !ok,
+                "expected verifier rejection, but verification succeeded"
+            );
             Ok(())
         }
     }
@@ -744,8 +832,12 @@ fn build_transfer_1in_2out(
 
     let mut args: Vec<LigeroArg> = Vec::new();
     args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1 domain (pub)
-    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) }); // 2 spend_sk (priv)
-    args.push(LigeroArg::Hex { hex: hx32(&pk_ivk_owner) }); // 3 pk_ivk_owner (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&spend_sk),
+    }); // 2 spend_sk (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 pk_ivk_owner (priv)
     args.push(LigeroArg::I64 { i64: depth as i64 }); // 4 depth (pub)
     args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 anchor (pub)
     args.push(LigeroArg::I64 { i64: 1 }); // 6 n_in (pub)
@@ -758,12 +850,7 @@ fn build_transfer_1in_2out(
     args.push(LigeroArg::Hex {
         hex: hx32(&sender_id_in),
     }); // sender_id_in_0 (priv)
-    for lvl in 0..depth {
-        let bit = ((pos >> lvl) & 1) as u8;
-        let mut bit_bytes = [0u8; 32];
-        bit_bytes[31] = bit;
-        args.push(LigeroArg::Hex { hex: hx32(&bit_bytes) });
-    }
+    args.push(LigeroArg::I64 { i64: pos as i64 }); // pos_0 (priv)
     for s in &siblings {
         args.push(LigeroArg::Hex { hex: hx32(s) });
     }
@@ -780,45 +867,47 @@ fn build_transfer_1in_2out(
     args.push(LigeroArg::I64 {
         i64: out0_value as i64,
     });
-    args.push(LigeroArg::Hex { hex: hx32(&out0_rho) });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out0_rho),
+    });
     args.push(LigeroArg::Hex {
         hex: hx32(&out0_pk_spend),
     });
-    args.push(LigeroArg::Hex { hex: hx32(&out0_pk_ivk) });
-    args.push(LigeroArg::Hex { hex: hx32(&cm_out0) });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out0_pk_ivk),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&cm_out0),
+    });
 
     // Output1
     args.push(LigeroArg::I64 {
         i64: out1_value as i64,
     });
-    args.push(LigeroArg::Hex { hex: hx32(&out1_rho) });
-    args.push(LigeroArg::Hex { hex: hx32(&out1_pk_spend) });
-    args.push(LigeroArg::Hex { hex: hx32(&out1_pk_ivk) });
-    args.push(LigeroArg::Hex { hex: hx32(&cm_out1) });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out1_rho),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out1_pk_spend),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out1_pk_ivk),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&cm_out1),
+    });
 
     // inv_enforce
     args.push(LigeroArg::Hex {
         hex: hx32(&inv_enforce),
     });
 
-    // Blacklist root (pub) + siblings (priv). Use the empty blacklist by default.
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
-    args.push(LigeroArg::Hex {
-        hex: hx32(&blacklist_root),
-    });
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        args.push(LigeroArg::Hex { hex: hx32(sib) }); // sender
-    }
-    for _j in 0..2 {
-        for sib in bl_defaults.iter().take(BL_DEPTH) {
-            args.push(LigeroArg::Hex { hex: hx32(sib) }); // output recipient
-        }
-    }
+    // Blacklist root (pub) + interval proofs (priv). Use the empty blacklist by default.
+    append_empty_blacklist_interval(&mut args, &[sender_id_current, out0_recipient])?;
 
     Ok((
         args,
-        private_indices_spend(depth, 1, 2),
+        private_indices_spend(depth, 1, 2, true),
         anchor, // return anchor for canonical-encoding tests
     ))
 }
@@ -869,8 +958,12 @@ fn build_withdraw_1in_1out(
 
     let mut args: Vec<LigeroArg> = Vec::new();
     args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1
-    args.push(LigeroArg::Hex { hex: hx32(&spend_sk) }); // 2 (priv)
-    args.push(LigeroArg::Hex { hex: hx32(&pk_ivk_owner) }); // 3 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&spend_sk),
+    }); // 2 (priv)
+    args.push(LigeroArg::Hex {
+        hex: hx32(&pk_ivk_owner),
+    }); // 3 (priv)
     args.push(LigeroArg::I64 { i64: depth as i64 }); // 4
     args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 (pub)
     args.push(LigeroArg::I64 { i64: 1 }); // 6 n_in
@@ -882,12 +975,7 @@ fn build_withdraw_1in_1out(
     args.push(LigeroArg::Hex {
         hex: hx32(&sender_id_in),
     });
-    for lvl in 0..depth {
-        let bit = ((pos >> lvl) & 1) as u8;
-        let mut bit_bytes = [0u8; 32];
-        bit_bytes[31] = bit;
-        args.push(LigeroArg::Hex { hex: hx32(&bit_bytes) });
-    }
+    args.push(LigeroArg::I64 { i64: pos as i64 });
     for s in &siblings {
         args.push(LigeroArg::Hex { hex: hx32(s) });
     }
@@ -904,31 +992,32 @@ fn build_withdraw_1in_1out(
     args.push(LigeroArg::I64 {
         i64: out_value as i64,
     });
-    args.push(LigeroArg::Hex { hex: hx32(&out_rho) });
-    args.push(LigeroArg::Hex { hex: hx32(&out_pk_spend) });
-    args.push(LigeroArg::Hex { hex: hx32(&out_pk_ivk) });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_rho),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_spend),
+    });
+    args.push(LigeroArg::Hex {
+        hex: hx32(&out_pk_ivk),
+    });
     args.push(LigeroArg::Hex { hex: hx32(&cm_out) });
 
     args.push(LigeroArg::Hex {
         hex: hx32(&inv_enforce),
     });
 
-    // Blacklist root (pub) + siblings (priv). Use the empty blacklist by default.
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
-    args.push(LigeroArg::Hex {
-        hex: hx32(&blacklist_root),
-    });
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        args.push(LigeroArg::Hex { hex: hx32(sib) }); // sender
-    }
-    for _j in 0..1 {
-        for sib in bl_defaults.iter().take(BL_DEPTH) {
-            args.push(LigeroArg::Hex { hex: hx32(sib) }); // output recipient
-        }
+    // Blacklist root (pub) + interval proofs (priv). Use the empty blacklist by default.
+    if withdraw_amount == 0 {
+        append_empty_blacklist_interval(&mut args, &[sender_id_current, recipient_owner])?;
+    } else {
+        append_empty_blacklist_interval(&mut args, &[sender_id_current])?;
     }
 
-    Ok((args, private_indices_spend(depth, 1, 1)))
+    Ok((
+        args,
+        private_indices_spend(depth, 1, 1, withdraw_amount == 0),
+    ))
 }
 
 #[test]
@@ -963,7 +1052,10 @@ fn test_note_spend_v2_golden_paths_must_have() -> Result<()> {
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
@@ -1006,8 +1098,9 @@ fn test_note_spend_v2_golden_paths_must_have() -> Result<()> {
             },
         ];
 
-        let (args, priv_idx, _info) =
-            build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
+        let (args, priv_idx, _info) = build_spend_tx(
+            depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None,
+        )?;
 
         let proof = match prove(&mut runner, args.clone(), priv_idx.clone()) {
             Ok(p) => p,
@@ -1058,8 +1151,9 @@ fn test_note_spend_v2_golden_paths_must_have() -> Result<()> {
             pk_ivk: pk_ivk_self,
         }];
 
-        let (args, priv_idx, _info) =
-            build_spend_tx(depth, domain, spend_sk, None, &inputs, 30, None, &outputs, None)?;
+        let (args, priv_idx, _info) = build_spend_tx(
+            depth, domain, spend_sk, None, &inputs, 30, None, &outputs, None,
+        )?;
 
         let proof = prove(&mut runner, args.clone(), priv_idx.clone())
             .context("partial-withdraw prover failed unexpectedly")?;
@@ -1108,8 +1202,9 @@ fn test_note_spend_v2_golden_paths_must_have() -> Result<()> {
             },
         ];
 
-        let (args, priv_idx, _info) =
-            build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
+        let (args, priv_idx, _info) = build_spend_tx(
+            depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None,
+        )?;
 
         let proof = prove(&mut runner, args.clone(), priv_idx.clone())
             .context("multi-input payment prover failed unexpectedly")?;
@@ -1154,7 +1249,10 @@ fn test_note_spend_v2_roundtrip_string_encoded_hash_args() -> Result<()> {
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
@@ -1248,7 +1346,10 @@ fn test_note_spend_v2_max_bounds_sanity() -> Result<()> {
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
@@ -1308,8 +1409,9 @@ fn test_note_spend_v2_max_bounds_sanity() -> Result<()> {
         },
     ];
 
-    let (mut args, mut priv_idx, info) =
-        build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
+    let (mut args, mut priv_idx, info) = build_spend_tx(
+        depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None,
+    )?;
 
     // Append viewer attestations: n_viewers=8, n_out=2.
     let n_viewers = MAX_VIEWERS;
@@ -1377,7 +1479,11 @@ fn test_note_spend_v2_max_bounds_sanity() -> Result<()> {
 #[test]
 fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
     let repo = repo_root()?;
-    maybe_build_guest(&repo, "utils/circuits/note-spend", "utils/circuits/bins/note_spend_guest.wasm")?;
+    maybe_build_guest(
+        &repo,
+        "utils/circuits/note-spend",
+        "utils/circuits/bins/note_spend_guest.wasm",
+    )?;
 
     let program = note_spend_program_path(&repo)?
         .canonicalize()
@@ -1402,7 +1508,10 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
@@ -1453,13 +1562,17 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
     // F21: wrong inv_enforce must be rejected.
     let mut bad_args = base_args.clone();
     let idx_inv = inv_enforce_index(1, depth, 2);
-    bad_args[idx_inv - 1] = LigeroArg::Hex { hex: hx32(&[0u8; 32]) };
+    bad_args[idx_inv - 1] = LigeroArg::Hex {
+        hex: hx32(&[0u8; 32]),
+    };
     assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
 
     // F5: wrong sender_id_in must be rejected (leaf changes => anchor mismatch).
     let mut bad_args = base_args.clone();
     let idx_sender_id_in = 7 + 2; // value_in, rho_in, sender_id_in
-    bad_args[idx_sender_id_in - 1] = LigeroArg::Hex { hex: hx32(&[0x99u8; 32]) };
+    bad_args[idx_sender_id_in - 1] = LigeroArg::Hex {
+        hex: hx32(&[0x99u8; 32]),
+    };
     assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
 
     // F24: rho reuse (out0 rho == in rho), with consistent cm_out0.
@@ -1471,7 +1584,7 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
         rho_in,
         sender_id_in,
         pos,
-        rho_in,           // out0_rho == in_rho
+        rho_in, // out0_rho == in_rho
         out1_rho,
         Some([0u8; 32]), // inv_enforce undefined -> set dummy
     )?;
@@ -1487,7 +1600,7 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
         sender_id_in,
         pos,
         out0_rho,
-        out0_rho,         // out1_rho == out0_rho
+        out0_rho,        // out1_rho == out0_rho
         Some([0u8; 32]), // inv_enforce undefined -> set dummy
     )?;
     assert_rejected(&mut runner, &vpaths, dup_out_rho_args, dup_out_rho_priv)?;
@@ -1501,8 +1614,8 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
         rho_in,
         sender_id_in,
         pos,
-        value_in,         // withdraw all
-        0,                // out_value=0 (balance holds)
+        value_in, // withdraw all
+        0,        // out_value=0 (balance holds)
         [0x77u8; 32],
         Some([0u8; 32]), // inv_enforce undefined -> set dummy
     )?;
@@ -1545,8 +1658,12 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
 
         let mut args: Vec<LigeroArg> = Vec::new();
         args.push(LigeroArg::Hex { hex: hx32(&domain) }); // 1
-        args.push(LigeroArg::Hex { hex: hx32(&spend_sk) }); // 2 (priv)
-        args.push(LigeroArg::Hex { hex: hx32(&pk_ivk_owner) }); // 3 (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&spend_sk),
+        }); // 2 (priv)
+        args.push(LigeroArg::Hex {
+            hex: hx32(&pk_ivk_owner),
+        }); // 3 (priv)
         args.push(LigeroArg::I64 { i64: depth as i64 }); // 4
         args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 (pub)
         args.push(LigeroArg::I64 { i64: n_in as i64 }); // 6 (pub)
@@ -1555,16 +1672,17 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
             args.push(LigeroArg::I64 {
                 i64: values_in[i] as i64,
             });
-            args.push(LigeroArg::Hex { hex: hx32(&rhos_in[i]) });
-            args.push(LigeroArg::Hex { hex: hx32(&sender_ids_in[i]) });
+            args.push(LigeroArg::Hex {
+                hex: hx32(&rhos_in[i]),
+            });
+            args.push(LigeroArg::Hex {
+                hex: hx32(&sender_ids_in[i]),
+            });
 
             let pos_i = positions[i];
-            for lvl in 0..depth {
-                let bit = ((pos_i >> lvl) & 1) as u8;
-                let mut bit_bytes = [0u8; 32];
-                bit_bytes[31] = bit;
-                args.push(LigeroArg::Hex { hex: hx32(&bit_bytes) });
-            }
+            args.push(LigeroArg::I64 {
+                i64: pos_i as i64,
+            });
 
             let sibs = if i == 0 { &siblings0 } else { &siblings1 };
             for s in sibs {
@@ -1587,40 +1705,48 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
             hex: hx32(&inv_enforce),
         });
 
-        let priv_idx = private_indices_spend(depth, n_in, n_out);
+        append_empty_blacklist_interval(&mut args, &[recipient_owner])?;
+
+        let priv_idx = private_indices_spend(depth, n_in, n_out, false);
         assert_rejected(&mut runner, &vpaths, args, priv_idx)?;
     }
 
     // B2: wrong Merkle path (flip one sibling) must be rejected.
     {
         let mut bad_args = base_args.clone();
-        let idx_first_sibling = 7 + 3 + depth; // value,rho,sender_id + pos_bits[depth]
-        bad_args[idx_first_sibling - 1] = LigeroArg::Hex { hex: hx32(&[0x99u8; 32]) };
+        let idx_first_sibling = 7 + 4; // value,rho,sender_id,pos
+        bad_args[idx_first_sibling - 1] = LigeroArg::Hex {
+            hex: hx32(&[0x99u8; 32]),
+        };
         assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
     }
 
-    // B3: non-boolean position bit must be rejected.
+    // B3: out-of-range position must be rejected.
     {
         let mut bad_args = base_args.clone();
-        let mut bit2 = [0u8; 32];
-        bit2[31] = 2;
-        let idx_first_pos_bit = 7 + 3; // value,rho,sender_id
-        bad_args[idx_first_pos_bit - 1] = LigeroArg::Hex { hex: hx32(&bit2) };
+        let idx_pos0 = 7 + 3; // value,rho,sender_id
+        bad_args[idx_pos0 - 1] = LigeroArg::I64 {
+            i64: 1i64 << depth,
+        };
         assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
     }
 
     // B4: wrong public nullifier must be rejected.
     {
         let mut bad_args = base_args.clone();
-        let idx_nf0 = 7 + 3 + 2 * depth;
-        bad_args[idx_nf0 - 1] = LigeroArg::Hex { hex: hx32(&[0xabu8; 32]) };
+        let idx_nf0 = 7 + 4 + depth;
+        bad_args[idx_nf0 - 1] = LigeroArg::Hex {
+            hex: hx32(&[0xabu8; 32]),
+        };
         assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
     }
 
     // B9: wrong pk_ivk_owner must be rejected (ADDR_V2 owner binding).
     {
         let mut bad_args = base_args.clone();
-        bad_args[2] = LigeroArg::Hex { hex: hx32(&[0x98u8; 32]) }; // [3] pk_ivk_owner
+        bad_args[2] = LigeroArg::Hex {
+            hex: hx32(&[0x98u8; 32]),
+        }; // [3] pk_ivk_owner
         assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
     }
 
@@ -1628,7 +1754,9 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
     {
         let mut bad_args = base_args.clone();
         let idx_out0_pk_ivk = output_base(1, depth) + 3;
-        bad_args[idx_out0_pk_ivk - 1] = LigeroArg::Hex { hex: hx32(&[0x97u8; 32]) };
+        bad_args[idx_out0_pk_ivk - 1] = LigeroArg::Hex {
+            hex: hx32(&[0x97u8; 32]),
+        };
         assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
     }
 
@@ -1651,7 +1779,9 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
         )?;
         let mut bad_args = good_args;
         let idx_withdraw = withdraw_index(1, depth);
-        bad_args[idx_withdraw - 1] = LigeroArg::I64 { i64: (withdraw_amount + 1) as i64 };
+        bad_args[idx_withdraw - 1] = LigeroArg::I64 {
+            i64: (withdraw_amount + 1) as i64,
+        };
         assert_rejected(&mut runner, &vpaths, bad_args, good_priv)?;
     }
 
@@ -1680,8 +1810,17 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
             pk_ivk: pk_ivk_self,
         }];
         // inv_enforce is undefined (product includes 0); set dummy to test enforcement.
-        let (args, priv_idx, _info) =
-            build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, Some([0u8; 32]))?;
+        let (args, priv_idx, _info) = build_spend_tx(
+            depth,
+            domain,
+            spend_sk,
+            None,
+            &inputs,
+            0,
+            None,
+            &outputs,
+            Some([0u8; 32]),
+        )?;
         assert_rejected(&mut runner, &vpaths, args, priv_idx)?;
     }
 
@@ -1701,10 +1840,13 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
             pk_spend: pk_spend_self,
             pk_ivk: pk_ivk_self,
         }];
-        let (mut args, priv_idx, _info) =
-            build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
+        let (mut args, priv_idx, _info) = build_spend_tx(
+            depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None,
+        )?;
         let idx_sender_id_in = 7 + 2;
-        args[idx_sender_id_in - 1] = LigeroArg::Hex { hex: hx32(&[0x01u8; 32]) };
+        args[idx_sender_id_in - 1] = LigeroArg::Hex {
+            hex: hx32(&[0x01u8; 32]),
+        };
         assert_rejected(&mut runner, &vpaths, args, priv_idx)?;
     }
 
@@ -1752,7 +1894,11 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
 #[test]
 fn test_note_spend_v2_verifier_binding_and_tampering() -> Result<()> {
     let repo = repo_root()?;
-    maybe_build_guest(&repo, "utils/circuits/note-spend", "utils/circuits/bins/note_spend_guest.wasm")?;
+    maybe_build_guest(
+        &repo,
+        "utils/circuits/note-spend",
+        "utils/circuits/bins/note_spend_guest.wasm",
+    )?;
 
     let program = note_spend_program_path(&repo)?
         .canonicalize()
@@ -1777,7 +1923,10 @@ fn test_note_spend_v2_verifier_binding_and_tampering() -> Result<()> {
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
@@ -1892,7 +2041,10 @@ fn test_note_spend_v2_spend_to_spend_roundtrip() -> Result<()> {
 
     let shader_dir = PathBuf::from(&runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
@@ -1925,7 +2077,9 @@ fn test_note_spend_v2_spend_to_spend_roundtrip() -> Result<()> {
         pk_spend: bob_pk_spend,
         pk_ivk: bob_pk_ivk,
     }];
-    let (args1, priv1, info1) = build_spend_tx(depth, domain, alice_sk, None, &inputs1, 0, None, &outputs1, None)?;
+    let (args1, priv1, info1) = build_spend_tx(
+        depth, domain, alice_sk, None, &inputs1, 0, None, &outputs1, None,
+    )?;
 
     let proof1 = match prove(&mut runner, args1.clone(), priv1.clone()) {
         Ok(p) => p,
@@ -1946,7 +2100,8 @@ fn test_note_spend_v2_spend_to_spend_roundtrip() -> Result<()> {
         sender_id_in: info1.sender_id_current, // must match NOTE_V2 sender binding
         pos: 1,
     }];
-    let (args2, priv2, _info2) = build_spend_tx(depth, domain, bob_sk, None, &inputs2, 100, None, &[], None)?;
+    let (args2, priv2, _info2) =
+        build_spend_tx(depth, domain, bob_sk, None, &inputs2, 100, None, &[], None)?;
 
     let proof2 = prove(&mut runner, args2.clone(), priv2.clone())
         .context("second spend prover failed unexpectedly")?;
@@ -1958,7 +2113,9 @@ fn test_note_spend_v2_spend_to_spend_roundtrip() -> Result<()> {
     // Negative: wrong sender_id_in must be rejected (attempt to spend Bob's note with different sender_id).
     let idx_sender_id_in_0 = 7 + 2; // value_in, rho_in, sender_id_in
     let mut bad_args = args2;
-    bad_args[idx_sender_id_in_0 - 1] = LigeroArg::Hex { hex: hx32(&[0x99u8; 32]) };
+    bad_args[idx_sender_id_in_0 - 1] = LigeroArg::Hex {
+        hex: hx32(&[0x99u8; 32]),
+    };
     assert_rejected(&mut runner, &vpaths, bad_args, priv2)?;
 
     Ok(())
@@ -1967,8 +2124,16 @@ fn test_note_spend_v2_spend_to_spend_roundtrip() -> Result<()> {
 #[test]
 fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
     let repo = repo_root()?;
-    maybe_build_guest(&repo, "utils/circuits/note-deposit", "utils/circuits/bins/note_deposit_guest.wasm")?;
-    maybe_build_guest(&repo, "utils/circuits/note-spend", "utils/circuits/bins/note_spend_guest.wasm")?;
+    maybe_build_guest(
+        &repo,
+        "utils/circuits/note-deposit",
+        "utils/circuits/bins/note_deposit_guest.wasm",
+    )?;
+    maybe_build_guest(
+        &repo,
+        "utils/circuits/note-spend",
+        "utils/circuits/bins/note_spend_guest.wasm",
+    )?;
 
     let deposit_program = note_deposit_program_path(&repo)
         .canonicalize()
@@ -1986,7 +2151,8 @@ fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
     let mut deposit_runner = LigeroRunner::new(&deposit_program.to_string_lossy());
     deposit_runner.config_mut().packing = packing;
 
-    if !deposit_runner.paths().prover_bin.exists() || !deposit_runner.paths().verifier_bin.exists() {
+    if !deposit_runner.paths().prover_bin.exists() || !deposit_runner.paths().verifier_bin.exists()
+    {
         eprintln!(
             "Skipping: Ligero binaries not found (prover={}, verifier={})",
             deposit_runner.paths().prover_bin.display(),
@@ -1997,7 +2163,10 @@ fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
 
     let shader_dir = PathBuf::from(&deposit_runner.config().shader_path);
     if !shader_dir.exists() {
-        eprintln!("Skipping: shader path not found at {}", shader_dir.display());
+        eprintln!(
+            "Skipping: shader path not found at {}",
+            shader_dir.display()
+        );
         return Ok(());
     }
 
@@ -2018,30 +2187,32 @@ fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
     let sender_id_deposit = [0u8; 32];
     let cm = note_commitment(&domain, value, &rho, &recipient, &sender_id_deposit);
 
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
-
     let mut deposit_args = vec![
         LigeroArg::Hex { hex: hx32(&domain) },
         LigeroArg::I64 { i64: value as i64 },
         LigeroArg::Hex { hex: hx32(&rho) },
-        LigeroArg::Hex { hex: hx32(&pk_spend) },
+        LigeroArg::Hex {
+            hex: hx32(&pk_spend),
+        },
         LigeroArg::Hex { hex: hx32(&pk_ivk) },
         LigeroArg::Hex { hex: hx32(&cm) },
     ];
-    deposit_args.push(LigeroArg::Hex {
-        hex: hx32(&blacklist_root),
-    });
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        deposit_args.push(LigeroArg::Hex { hex: hx32(sib) });
-    }
+    append_empty_blacklist_interval(&mut deposit_args, &[recipient])?;
 
     let mut deposit_priv = vec![3usize, 4usize, 5usize];
-    for i in 0..BL_DEPTH {
+    for i in 0..BL_BUCKET_SIZE {
         deposit_priv.push(8 + i);
     }
+    deposit_priv.push(8 + BL_BUCKET_SIZE);
+    for i in 0..BL_DEPTH {
+        deposit_priv.push(9 + BL_BUCKET_SIZE + i);
+    }
 
-    let deposit_proof = match prove(&mut deposit_runner, deposit_args.clone(), deposit_priv.clone()) {
+    let deposit_proof = match prove(
+        &mut deposit_runner,
+        deposit_args.clone(),
+        deposit_priv.clone(),
+    ) {
         Ok(p) => p,
         Err(err) => {
             eprintln!("Skipping: deposit prover failed (GPU/WebGPU likely unavailable): {err}");
@@ -2095,8 +2266,9 @@ fn test_note_deposit_note_v2_is_spendable() -> Result<()> {
         pk_ivk: out_pk_ivk,
     }];
 
-    let (spend_args, spend_priv, _info) =
-        build_spend_tx(depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None)?;
+    let (spend_args, spend_priv, _info) = build_spend_tx(
+        depth, domain, spend_sk, None, &inputs, 0, None, &outputs, None,
+    )?;
 
     let spend_proof = match prove(&mut spend_runner, spend_args.clone(), spend_priv.clone()) {
         Ok(p) => p,

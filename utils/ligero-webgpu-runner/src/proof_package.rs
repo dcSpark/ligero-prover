@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose, Engine as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// A Ligero proof package containing both the proof and serialized public output.
@@ -111,11 +112,30 @@ fn redact_arg_value(v: &mut serde_json::Value) {
         return;
     }
 
+    let mut handled = false;
+
+    if let Some(serde_json::Value::String(b64)) = map.get("bytes_b64") {
+        let decoded_len = general_purpose::STANDARD
+            .decode(b64)
+            .map(|b| b.len())
+            .unwrap_or(0);
+        let redacted_b64 = general_purpose::STANDARD.encode(vec![0u8; decoded_len]);
+        map.insert(
+            "bytes_b64".to_string(),
+            serde_json::Value::String(redacted_b64),
+        );
+        handled = true;
+    }
+
     if let Some(serde_json::Value::String(h)) = map.get("hex") {
         map.insert(
             "hex".to_string(),
             serde_json::Value::String("0".repeat(h.len().max(1))),
         );
+        handled = true;
+    }
+
+    if handled {
         return;
     }
 

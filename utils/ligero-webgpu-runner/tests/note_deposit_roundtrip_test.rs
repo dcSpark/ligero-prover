@@ -12,18 +12,32 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose, Engine as _};
 use ligero_runner::{verifier, LigeroArg, LigeroRunner};
 use ligetron::poseidon2_hash_bytes;
+use ligetron::Bn254Fr;
 
 type Hash32 = [u8; 32];
 
-const BL_DEPTH: usize = 63;
+const BL_DEPTH: usize = 16;
+const BL_BUCKET_SIZE: usize = 12;
 
 const PRIVPOOL_EXAMPLE_ADDR: &str =
     "privpool1eqrexjkvvw5wjljp4mpup250hl4sdpk6hl36dmdcdsfldvjw2j8staydzl";
 
 fn hx32(b: &Hash32) -> String {
     hex::encode(b)
+}
+
+fn b64_32(b: &Hash32) -> String {
+    general_purpose::STANDARD.encode(b)
+}
+
+fn arg32(b: &Hash32) -> LigeroArg {
+    LigeroArg::HexBytesB64 {
+        hex: hx32(b),
+        bytes_b64: b64_32(b),
+    }
 }
 
 // === Minimal Bech32m decode/encode for privpool addresses (HRP = "privpool") ===
@@ -70,7 +84,13 @@ fn bech32_char_to_u5(c: u8) -> Option<u8> {
 }
 
 fn bech32_polymod(values: &[u8]) -> u32 {
-    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    const GEN: [u32; 5] = [
+        0x3b6a_57b2,
+        0x2650_8e6d,
+        0x1ea1_19fa,
+        0x3d42_33dd,
+        0x2a14_62b3,
+    ];
     let mut chk: u32 = 1;
     for &v in values {
         let b = chk >> 25;
@@ -168,7 +188,10 @@ fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Result<Vec<u8>> {
         }
     } else {
         anyhow::ensure!(bits < from, "convert_bits: excess padding");
-        anyhow::ensure!(((acc << (to - bits)) & maxv) == 0, "convert_bits: non-zero padding");
+        anyhow::ensure!(
+            ((acc << (to - bits)) & maxv) == 0,
+            "convert_bits: non-zero padding"
+        );
     }
 
     Ok(out)
@@ -277,9 +300,9 @@ fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"MT_NODE_V1", &[&lvl, left, right])
 }
 
-fn merkle_default_nodes(depth: usize) -> Vec<Hash32> {
+fn merkle_default_nodes_from_leaf(depth: usize, leaf0: &Hash32) -> Vec<Hash32> {
     let mut out = Vec::with_capacity(depth + 1);
-    out.push([0u8; 32]); // height 0 (leaf)
+    out.push(*leaf0); // height 0 (leaf)
     for lvl in 0..depth {
         let prev = out[lvl];
         out.push(mt_combine(lvl as u8, &prev, &prev));
@@ -287,17 +310,98 @@ fn merkle_default_nodes(depth: usize) -> Vec<Hash32> {
     out
 }
 
-fn bl_pos_from_id(id: &Hash32) -> u64 {
-    // Must match the guest's `bl_pos_bits_from_id`: low bits, LSB-first from the last byte.
+fn fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
+    let mut fr = Bn254Fr::new();
+    fr.set_bytes_big(h);
+    fr
+}
+
+fn bl_empty_bucket_entries() -> [Hash32; BL_BUCKET_SIZE] {
+    [[0u8; 32]; BL_BUCKET_SIZE]
+}
+
+fn bl_bucket_pos_from_id(id: &Hash32) -> u64 {
+    // Derive the bucket index from the low BL_DEPTH bits of `id` (LSB-first).
     let mut pos: u64 = 0;
-    let mut i = 0usize;
-    while i < BL_DEPTH {
+    for i in 0..BL_DEPTH {
         let byte = id[31 - (i / 8)];
         let bit = (byte >> (i % 8)) & 1;
-        pos |= (bit as u64) << i;
-        i += 1;
+        pos |= (bit as u64) << (i as u32);
     }
     pos
+}
+
+fn bl_bucket_leaf(entries: &[Hash32; BL_BUCKET_SIZE]) -> Hash32 {
+    let mut buf = Vec::with_capacity(12 + 32 * BL_BUCKET_SIZE);
+    buf.extend_from_slice(b"BL_BUCKET_V1");
+    for e in entries {
+        buf.extend_from_slice(e);
+    }
+    poseidon2_hash_bytes(&buf).to_bytes_be()
+}
+
+fn bl_bucket_inv_for_id(id: &Hash32, bucket_entries: &[Hash32; BL_BUCKET_SIZE]) -> Option<Hash32> {
+    let id_fr = fr_from_hash32_be(id);
+    let mut prod = Bn254Fr::from_u32(1);
+    for e in bucket_entries.iter() {
+        let e_fr = fr_from_hash32_be(e);
+        let mut delta = id_fr.clone();
+        delta.submod_checked(&e_fr);
+        prod.mulmod_checked(&delta);
+    }
+    if prod.is_zero() {
+        return None;
+    }
+    let mut inv = prod.clone();
+    inv.inverse();
+    Some(inv.to_bytes_be())
+}
+
+fn empty_blacklist_bucket_proof_for_id(
+    id: &Hash32,
+) -> Result<(Hash32, [Hash32; BL_BUCKET_SIZE], Hash32, Vec<Hash32>)> {
+    let entries = bl_empty_bucket_entries();
+    let leaf0 = bl_bucket_leaf(&entries);
+    let default_nodes = merkle_default_nodes_from_leaf(BL_DEPTH, &leaf0);
+    let blacklist_root = default_nodes[BL_DEPTH];
+    let inv = bl_bucket_inv_for_id(id, &entries)
+        .context("unexpected: recipient id collides with empty bucket")?;
+    let siblings: Vec<Hash32> = default_nodes.iter().take(BL_DEPTH).copied().collect();
+    Ok((blacklist_root, entries, inv, siblings))
+}
+
+fn append_empty_blacklist_bucket_hex(args: &mut Vec<LigeroArg>, id: &Hash32) -> Result<()> {
+    let (blacklist_root, entries, inv, siblings) = empty_blacklist_bucket_proof_for_id(id)?;
+    args.push(arg32(&blacklist_root));
+    for e in entries.iter() {
+        args.push(arg32(e));
+    }
+    args.push(arg32(&inv));
+    for sib in siblings.iter() {
+        args.push(arg32(sib));
+    }
+    Ok(())
+}
+
+fn append_empty_blacklist_bucket_string(args: &mut Vec<LigeroArg>, id: &Hash32) -> Result<()> {
+    let (blacklist_root, entries, inv, siblings) = empty_blacklist_bucket_proof_for_id(id)?;
+    args.push(LigeroArg::String {
+        str: format!("0x{}", hx32(&blacklist_root)),
+    });
+    for e in entries.iter() {
+        args.push(LigeroArg::String {
+            str: format!("0x{}", hx32(e)),
+        });
+    }
+    args.push(LigeroArg::String {
+        str: format!("0x{}", hx32(&inv)),
+    });
+    for sib in siblings.iter() {
+        args.push(LigeroArg::String {
+            str: format!("0x{}", hx32(sib)),
+        });
+    }
+    Ok(())
 }
 
 fn merkle_root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32]) -> Hash32 {
@@ -316,11 +420,15 @@ fn merkle_root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32]) -> Hash32
 
 fn merkle_root_and_openings_sparse(
     depth: usize,
+    default_nodes: &[Hash32],
     leaves: &[(u64, Hash32)],
 ) -> Result<(Hash32, Vec<Vec<Hash32>>)> {
     use std::collections::{HashMap, HashSet};
 
-    let default_nodes = merkle_default_nodes(depth);
+    anyhow::ensure!(
+        default_nodes.len() == depth + 1,
+        "default_nodes must have length depth+1"
+    );
 
     // Store only non-default nodes by height. Height 0 are leaves; height `depth` is the root.
     let mut levels: Vec<HashMap<u64, Hash32>> = (0..=depth).map(|_| HashMap::new()).collect();
@@ -328,11 +436,21 @@ fn merkle_root_and_openings_sparse(
     if depth >= 64 {
         anyhow::bail!("depth too large for sparse tree: {depth}");
     }
-    let max_pos = if depth == 63 { 1u64 << 63 } else { 1u64 << depth };
+    let max_pos = if depth == 63 {
+        1u64 << 63
+    } else {
+        1u64 << depth
+    };
     for (pos, leaf) in leaves {
-        anyhow::ensure!(*pos < max_pos, "leaf pos {pos} out of range for depth {depth}");
+        anyhow::ensure!(
+            *pos < max_pos,
+            "leaf pos {pos} out of range for depth {depth}"
+        );
         if let Some(prev) = levels[0].insert(*pos, *leaf) {
-            anyhow::ensure!(prev == *leaf, "duplicate leaf pos {pos} with different value");
+            anyhow::ensure!(
+                prev == *leaf,
+                "duplicate leaf pos {pos} with different value"
+            );
         }
     }
 
@@ -346,12 +464,8 @@ fn merkle_root_and_openings_sparse(
         for pidx in parent_set {
             let left_idx = pidx * 2;
             let right_idx = pidx * 2 + 1;
-            let left = levels[lvl]
-                .get(&left_idx)
-                .unwrap_or(&default_nodes[lvl]);
-            let right = levels[lvl]
-                .get(&right_idx)
-                .unwrap_or(&default_nodes[lvl]);
+            let left = levels[lvl].get(&left_idx).unwrap_or(&default_nodes[lvl]);
+            let right = levels[lvl].get(&right_idx).unwrap_or(&default_nodes[lvl]);
             let parent = mt_combine(lvl as u8, left, right);
             if parent != default_nodes[lvl + 1] {
                 levels[lvl + 1].insert(pidx, parent);
@@ -394,10 +508,17 @@ fn private_indices_note_deposit() -> Vec<usize> {
     // Deposit circuit ABI:
     // 1 domain (PUB), 2 value (PUB), 3 rho (PRIV), 4 pk_spend_recipient (PRIV),
     // 5 pk_ivk_recipient (PRIV), 6 cm_out (PUB),
-    // 7 blacklist_root (PUB), 8..(8+BL_DEPTH-1) bl_siblings (PRIV)
+    // 7 blacklist_root (PUB),
+    // 8 bucket_entries[BL_BUCKET_SIZE] (PRIV),
+    // 8+BL_BUCKET_SIZE bucket_inv (PRIV),
+    // then BL_DEPTH siblings (PRIV)
     let mut idx = vec![3, 4, 5];
-    for i in 0..BL_DEPTH {
+    for i in 0..BL_BUCKET_SIZE {
         idx.push(8 + i);
+    }
+    idx.push(8 + BL_BUCKET_SIZE);
+    for i in 0..BL_DEPTH {
+        idx.push(9 + BL_BUCKET_SIZE + i);
     }
     idx
 }
@@ -470,23 +591,16 @@ fn test_note_deposit_roundtrip_hex_args() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
 
     let mut args = vec![
-        LigeroArg::Hex { hex: hx32(&domain) },
+        arg32(&domain),
         LigeroArg::I64 { i64: value as i64 },
-        LigeroArg::Hex { hex: hx32(&rho) },
-        LigeroArg::Hex { hex: hx32(&pk_spend) },
-        LigeroArg::Hex { hex: hx32(&pk_ivk) },
-        LigeroArg::Hex { hex: hx32(&cm_out) },
+        arg32(&rho),
+        arg32(&pk_spend),
+        arg32(&pk_ivk),
+        arg32(&cm_out),
     ];
-    args.push(LigeroArg::Hex {
-        hex: hx32(&blacklist_root),
-    });
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        args.push(LigeroArg::Hex { hex: hx32(sib) });
-    }
+    append_empty_blacklist_bucket_hex(&mut args, &recipient)?;
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
@@ -538,8 +652,6 @@ fn test_note_deposit_roundtrip_string_args() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
 
     let mut args = vec![
         LigeroArg::String {
@@ -559,14 +671,7 @@ fn test_note_deposit_roundtrip_string_args() -> Result<()> {
             str: format!("0x{}", hx32(&cm_out)),
         },
     ];
-    args.push(LigeroArg::String {
-        str: format!("0x{}", hx32(&blacklist_root)),
-    });
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        args.push(LigeroArg::String {
-            str: format!("0x{}", hx32(sib)),
-        });
-    }
+    append_empty_blacklist_bucket_string(&mut args, &recipient)?;
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
@@ -617,23 +722,16 @@ fn test_note_deposit_verifier_rejects_mutated_value() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
 
     let mut args = vec![
-        LigeroArg::Hex { hex: hx32(&domain) },
+        arg32(&domain),
         LigeroArg::I64 { i64: value as i64 },
-        LigeroArg::Hex { hex: hx32(&rho) },
-        LigeroArg::Hex { hex: hx32(&pk_spend) },
-        LigeroArg::Hex { hex: hx32(&pk_ivk) },
-        LigeroArg::Hex { hex: hx32(&cm_out) },
+        arg32(&rho),
+        arg32(&pk_spend),
+        arg32(&pk_ivk),
+        arg32(&cm_out),
     ];
-    args.push(LigeroArg::Hex {
-        hex: hx32(&blacklist_root),
-    });
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        args.push(LigeroArg::Hex { hex: hx32(sib) });
-    }
+    append_empty_blacklist_bucket_hex(&mut args, &recipient)?;
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
@@ -703,23 +801,16 @@ fn test_note_deposit_verifier_rejects_mutated_cm_out() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
 
     let mut args = vec![
-        LigeroArg::Hex { hex: hx32(&domain) },
+        arg32(&domain),
         LigeroArg::I64 { i64: value as i64 },
-        LigeroArg::Hex { hex: hx32(&rho) },
-        LigeroArg::Hex { hex: hx32(&pk_spend) },
-        LigeroArg::Hex { hex: hx32(&pk_ivk) },
-        LigeroArg::Hex { hex: hx32(&cm_out) },
+        arg32(&rho),
+        arg32(&pk_spend),
+        arg32(&pk_ivk),
+        arg32(&cm_out),
     ];
-    args.push(LigeroArg::Hex {
-        hex: hx32(&blacklist_root),
-    });
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        args.push(LigeroArg::Hex { hex: hx32(sib) });
-    }
+    append_empty_blacklist_bucket_hex(&mut args, &recipient)?;
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
@@ -751,7 +842,7 @@ fn test_note_deposit_verifier_rejects_mutated_cm_out() -> Result<()> {
     let mut bad_args = args;
     let mut bad_cm = cm_out;
     bad_cm[0] ^= 1;
-    bad_args[5] = LigeroArg::Hex { hex: hx32(&bad_cm) };
+    bad_args[5] = arg32(&bad_cm);
 
     match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx) {
         Ok((ok_bad, _stdout, _stderr)) => {
@@ -790,23 +881,16 @@ fn test_note_deposit_rejects_negative_value_and_wrong_argc() -> Result<()> {
     let recipient = recipient_from_pk(&domain, &pk_spend, &pk_ivk);
     let sender_id = [0u8; 32];
     let cm_out = note_commitment_v2(&domain, value, &rho, &recipient, &sender_id);
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
 
     let mut good_args = vec![
-        LigeroArg::Hex { hex: hx32(&domain) },
+        arg32(&domain),
         LigeroArg::I64 { i64: value as i64 },
-        LigeroArg::Hex { hex: hx32(&rho) },
-        LigeroArg::Hex { hex: hx32(&pk_spend) },
-        LigeroArg::Hex { hex: hx32(&pk_ivk) },
-        LigeroArg::Hex { hex: hx32(&cm_out) },
+        arg32(&rho),
+        arg32(&pk_spend),
+        arg32(&pk_ivk),
+        arg32(&cm_out),
     ];
-    good_args.push(LigeroArg::Hex {
-        hex: hx32(&blacklist_root),
-    });
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        good_args.push(LigeroArg::Hex { hex: hx32(sib) });
-    }
+    append_empty_blacklist_bucket_hex(&mut good_args, &recipient)?;
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = good_args.clone();
@@ -885,9 +969,7 @@ fn test_note_deposit_rejects_negative_value_and_wrong_argc() -> Result<()> {
     // Invalid: mismatch between recipient keys and cm_out must be rejected (prove-time).
     let mut bad_args = good_args.clone();
     let wrong_pk_ivk: Hash32 = [0x99u8; 32];
-    bad_args[4] = LigeroArg::Hex {
-        hex: hx32(&wrong_pk_ivk),
-    };
+    bad_args[4] = arg32(&wrong_pk_ivk);
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = bad_args.clone();
     match runner.run_prover_with_output(ligero_runner::ProverRunOptions {
@@ -961,7 +1043,7 @@ fn test_note_deposit_blacklist_accepts_unlisted_and_rejects_listed() -> Result<(
         "privpool bech32m roundtrip mismatch"
     );
 
-    // Two recipients: one will be blacklisted (leaf=1), the other unlisted (leaf=0).
+    // Two recipients: one will be blacklisted, the other unlisted.
     let domain: Hash32 = [0x55u8; 32];
     let value: u64 = 42;
     let rho_ok: Hash32 = [0x11u8; 32];
@@ -976,69 +1058,105 @@ fn test_note_deposit_blacklist_accepts_unlisted_and_rejects_listed() -> Result<(
     let recipient_bad = recipient_from_pk(&domain, &pk_spend_bad, &pk_ivk_bad);
 
     let recipient_example = recipient_from_pk(&domain, &pk_spend_example, &pk_ivk_example);
-    let pos_example = bl_pos_from_id(&recipient_example);
-    let pos_bad = bl_pos_from_id(&recipient_bad);
-    let pos_ok = bl_pos_from_id(&recipient_ok);
-    anyhow::ensure!(pos_bad != pos_ok, "unexpected blacklist index collision (bad vs ok)");
     anyhow::ensure!(
-        pos_example != pos_ok,
-        "unexpected blacklist index collision (example vs ok)"
-    );
-    anyhow::ensure!(
-        pos_example != pos_bad,
-        "unexpected blacklist index collision (example vs bad)"
+        recipient_example != recipient_bad,
+        "example and bad recipients must be distinct"
     );
 
-    let leaf0: Hash32 = [0u8; 32];
-    let mut leaf1: Hash32 = [0u8; 32];
-    leaf1[31] = 1;
+    // Build a bucketed blacklist tree (depth BL_DEPTH), where each leaf commits to BL_BUCKET_SIZE IDs.
+    let empty_bucket = bl_empty_bucket_entries();
+    let leaf_default = bl_bucket_leaf(&empty_bucket);
+    let default_nodes = merkle_default_nodes_from_leaf(BL_DEPTH, &leaf_default);
 
-    // Build a sparse blacklist tree with two blacklisted leaves:
-    // - a fixed bech32m example (for docs/demo),
-    // - the `recipient_bad` we will actually attempt to deposit to (to assert circuit rejection).
-    let (blacklist_root, openings) = merkle_root_and_openings_sparse(
-        BL_DEPTH,
-        &[(pos_example, leaf1), (pos_bad, leaf1), (pos_ok, leaf0)],
-    )?;
-    let sibs_example = &openings[0];
-    let sibs_bad = &openings[1];
-    let sibs_ok = &openings[2];
+    // Blacklist set: include a fixed bech32m example (for docs/demo) and a synthetic bad recipient.
+    let mut blacklist_ids: Vec<Hash32> = vec![recipient_example, recipient_bad];
+    blacklist_ids.sort();
+    blacklist_ids.dedup();
+    anyhow::ensure!(
+        blacklist_ids.len() == 2,
+        "expected exactly 2 unique blacklisted IDs for this test"
+    );
 
-    // Sanity: membership at pos_bad is 1, and at pos_ok is 0, under the same root.
+    use std::collections::{BTreeMap, HashMap};
+
+    let mut bucket_ids: BTreeMap<u64, Vec<Hash32>> = BTreeMap::new();
+    for id in blacklist_ids.iter() {
+        bucket_ids
+            .entry(bl_bucket_pos_from_id(id))
+            .or_default()
+            .push(*id);
+    }
+
+    let mut bucket_entries_by_pos: HashMap<u64, [Hash32; BL_BUCKET_SIZE]> = HashMap::new();
+    let mut leaves: Vec<(u64, Hash32)> = Vec::new();
+    for (pos, mut ids) in bucket_ids.into_iter() {
+        ids.sort();
+        anyhow::ensure!(
+            ids.len() <= BL_BUCKET_SIZE,
+            "bucket overflow at pos={pos}: {} entries",
+            ids.len()
+        );
+        let mut entries = bl_empty_bucket_entries();
+        for (i, id) in ids.into_iter().enumerate() {
+            entries[i] = id;
+        }
+        bucket_entries_by_pos.insert(pos, entries);
+        let leaf = bl_bucket_leaf(&entries);
+        if leaf != leaf_default {
+            leaves.push((pos, leaf));
+        }
+    }
+
+    // Ensure we can open the (possibly default) bucket that the unlisted recipient lands in.
+    let pos_ok = bl_bucket_pos_from_id(&recipient_ok);
+    let bucket_ok = bucket_entries_by_pos
+        .get(&pos_ok)
+        .copied()
+        .unwrap_or(empty_bucket);
+    let leaf_ok = bl_bucket_leaf(&bucket_ok);
+    if !leaves.iter().any(|(p, _)| *p == pos_ok) {
+        leaves.push((pos_ok, leaf_ok));
+    }
+
+    let (blacklist_root, openings) =
+        merkle_root_and_openings_sparse(BL_DEPTH, &default_nodes, &leaves)?;
+    let mut opening_by_pos: HashMap<u64, Vec<Hash32>> = HashMap::new();
+    for ((pos, _leaf), sibs) in leaves.iter().zip(openings.into_iter()) {
+        opening_by_pos.insert(*pos, sibs);
+    }
+
+    let sibs_ok = opening_by_pos.get(&pos_ok).context("missing opening for pos_ok")?;
     anyhow::ensure!(
-        merkle_root_from_path(&leaf1, pos_example, sibs_example) == blacklist_root,
-        "example blacklisted recipient opening must match root"
-    );
-    anyhow::ensure!(
-        merkle_root_from_path(&leaf0, pos_example, sibs_example) != blacklist_root,
-        "example blacklisted recipient must not be able to prove leaf=0"
-    );
-    anyhow::ensure!(
-        merkle_root_from_path(&leaf1, pos_bad, sibs_bad) == blacklist_root,
-        "blacklisted address opening must match root"
-    );
-    anyhow::ensure!(
-        merkle_root_from_path(&leaf0, pos_ok, sibs_ok) == blacklist_root,
-        "unlisted address opening must match root"
+        merkle_root_from_path(&leaf_ok, pos_ok, sibs_ok) == blacklist_root,
+        "bucket opening for recipient_ok must match root"
     );
 
     // === Proof for the unlisted address should verify ===
     let sender_id = [0u8; 32];
     let cm_ok = note_commitment_v2(&domain, value, &rho_ok, &recipient_ok, &sender_id);
+    anyhow::ensure!(
+        blacklist_ids.binary_search(&recipient_ok).is_err(),
+        "expected ok recipient to be unlisted"
+    );
+
+    let inv_ok = bl_bucket_inv_for_id(&recipient_ok, &bucket_ok)
+        .context("unexpected: recipient_ok collides with its bucket entries")?;
 
     let mut args_ok = vec![
-        LigeroArg::Hex { hex: hx32(&domain) },
+        arg32(&domain),
         LigeroArg::I64 { i64: value as i64 },
-        LigeroArg::Hex { hex: hx32(&rho_ok) },
-        LigeroArg::Hex { hex: hx32(&pk_spend_ok) },
-        LigeroArg::Hex { hex: hx32(&pk_ivk_ok) },
-        LigeroArg::Hex { hex: hx32(&cm_ok) },
-        LigeroArg::Hex {
-            hex: hx32(&blacklist_root),
-        },
+        arg32(&rho_ok),
+        arg32(&pk_spend_ok),
+        arg32(&pk_ivk_ok),
+        arg32(&cm_ok),
+        arg32(&blacklist_root),
     ];
+    for e in bucket_ok.iter() {
+        args_ok.push(arg32(e));
+    }
+    args_ok.push(arg32(&inv_ok));
     for sib in sibs_ok.iter().take(BL_DEPTH) {
-        args_ok.push(LigeroArg::Hex { hex: hx32(sib) });
+        args_ok.push(arg32(sib));
     }
 
     runner.config_mut().private_indices = priv_idx.clone();
@@ -1070,28 +1188,36 @@ fn test_note_deposit_blacklist_accepts_unlisted_and_rejects_listed() -> Result<(
     let rho_example: Hash32 = [0x33u8; 32];
     let cm_example =
         note_commitment_v2(&domain, value, &rho_example, &recipient_example, &sender_id);
+    let pos_example = bl_bucket_pos_from_id(&recipient_example);
+    let bucket_example = bucket_entries_by_pos
+        .get(&pos_example)
+        .copied()
+        .context("missing bucket for example recipient")?;
+    let leaf_example = bl_bucket_leaf(&bucket_example);
+    let sibs_example = opening_by_pos
+        .get(&pos_example)
+        .context("missing opening for example bucket")?;
+    anyhow::ensure!(
+        merkle_root_from_path(&leaf_example, pos_example, sibs_example) == blacklist_root,
+        "bucket opening for example recipient must match root"
+    );
 
     let mut args_example = vec![
-        LigeroArg::Hex { hex: hx32(&domain) },
+        arg32(&domain),
         LigeroArg::I64 { i64: value as i64 },
-        LigeroArg::Hex {
-            hex: hx32(&rho_example),
-        },
-        LigeroArg::Hex {
-            hex: hx32(&pk_spend_example),
-        },
-        LigeroArg::Hex {
-            hex: hx32(&pk_ivk_example),
-        },
-        LigeroArg::Hex {
-            hex: hx32(&cm_example),
-        },
-        LigeroArg::Hex {
-            hex: hx32(&blacklist_root),
-        },
+        arg32(&rho_example),
+        arg32(&pk_spend_example),
+        arg32(&pk_ivk_example),
+        arg32(&cm_example),
+        arg32(&blacklist_root),
     ];
+    for e in bucket_example.iter() {
+        args_example.push(arg32(e));
+    }
+    // No inverse exists for a blacklisted id; provide a dummy value and expect UNSAT.
+    args_example.push(arg32(&[0u8; 32]));
     for sib in sibs_example.iter().take(BL_DEPTH) {
-        args_example.push(LigeroArg::Hex { hex: hx32(sib) });
+        args_example.push(arg32(sib));
     }
 
     runner.config_mut().private_indices = priv_idx.clone();
@@ -1119,21 +1245,34 @@ fn test_note_deposit_blacklist_accepts_unlisted_and_rejects_listed() -> Result<(
 
     // === Proof for the blacklisted address must be rejected ===
     let cm_bad = note_commitment_v2(&domain, value, &rho_bad, &recipient_bad, &sender_id);
+    let pos_bad = bl_bucket_pos_from_id(&recipient_bad);
+    let bucket_bad = bucket_entries_by_pos
+        .get(&pos_bad)
+        .copied()
+        .context("missing bucket for bad recipient")?;
+    let leaf_bad = bl_bucket_leaf(&bucket_bad);
+    let sibs_bad = opening_by_pos
+        .get(&pos_bad)
+        .context("missing opening for bad bucket")?;
+    anyhow::ensure!(
+        merkle_root_from_path(&leaf_bad, pos_bad, sibs_bad) == blacklist_root,
+        "bucket opening for bad recipient must match root"
+    );
     let mut args_bad = vec![
-        LigeroArg::Hex { hex: hx32(&domain) },
+        arg32(&domain),
         LigeroArg::I64 { i64: value as i64 },
-        LigeroArg::Hex { hex: hx32(&rho_bad) },
-        LigeroArg::Hex {
-            hex: hx32(&pk_spend_bad),
-        },
-        LigeroArg::Hex { hex: hx32(&pk_ivk_bad) },
-        LigeroArg::Hex { hex: hx32(&cm_bad) },
-        LigeroArg::Hex {
-            hex: hx32(&blacklist_root),
-        },
+        arg32(&rho_bad),
+        arg32(&pk_spend_bad),
+        arg32(&pk_ivk_bad),
+        arg32(&cm_bad),
+        arg32(&blacklist_root),
     ];
+    for e in bucket_bad.iter() {
+        args_bad.push(arg32(e));
+    }
+    args_bad.push(arg32(&[0u8; 32]));
     for sib in sibs_bad.iter().take(BL_DEPTH) {
-        args_bad.push(LigeroArg::Hex { hex: hx32(sib) });
+        args_bad.push(arg32(sib));
     }
 
     runner.config_mut().private_indices = priv_idx.clone();

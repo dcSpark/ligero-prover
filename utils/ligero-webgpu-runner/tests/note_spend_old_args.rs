@@ -14,7 +14,8 @@ use ligetron::Bn254Fr;
 
 type Hash32 = [u8; 32];
 
-const BL_DEPTH: usize = 63;
+const BL_DEPTH: usize = 16;
+const BL_BUCKET_SIZE: usize = 12;
 
 fn hx32(b: &Hash32) -> String {
     hex::encode(b)
@@ -47,9 +48,9 @@ fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"MT_NODE_V1", &[&lvl, left, right])
 }
 
-fn merkle_default_nodes(depth: usize) -> Vec<Hash32> {
+fn merkle_default_nodes_from_leaf(depth: usize, leaf0: &Hash32) -> Vec<Hash32> {
     let mut out = Vec::with_capacity(depth + 1);
-    out.push([0u8; 32]); // height 0 (leaf)
+    out.push(*leaf0); // height 0 (leaf)
     for lvl in 0..depth {
         let prev = out[lvl];
         out.push(mt_combine(lvl as u8, &prev, &prev));
@@ -57,20 +58,49 @@ fn merkle_default_nodes(depth: usize) -> Vec<Hash32> {
     out
 }
 
-fn append_empty_blacklist(args: &mut Vec<LigeroArg>, n_out: usize) {
-    let bl_defaults = merkle_default_nodes(BL_DEPTH);
-    let blacklist_root = bl_defaults[BL_DEPTH];
+fn append_empty_blacklist(args: &mut Vec<LigeroArg>, ids_to_check: &[Hash32]) -> Result<()> {
+    let bucket_entries = [[0u8; 32]; BL_BUCKET_SIZE];
+    let leaf0 = {
+        let mut buf = Vec::with_capacity(12 + 32 * BL_BUCKET_SIZE);
+        buf.extend_from_slice(b"BL_BUCKET_V1");
+        for e in bucket_entries.iter() {
+            buf.extend_from_slice(e);
+        }
+        poseidon2_hash_bytes(&buf).to_bytes_be()
+    };
+    let default_nodes = merkle_default_nodes_from_leaf(BL_DEPTH, &leaf0);
+    let blacklist_root = default_nodes[BL_DEPTH];
+    let siblings: Vec<Hash32> = default_nodes.iter().take(BL_DEPTH).copied().collect();
+
     args.push(LigeroArg::Hex {
         hex: hx32(&blacklist_root),
     }); // blacklist_root (pub)
-    for sib in bl_defaults.iter().take(BL_DEPTH) {
-        args.push(LigeroArg::Hex { hex: hx32(sib) }); // sender siblings (priv)
-    }
-    for _j in 0..n_out {
-        for sib in bl_defaults.iter().take(BL_DEPTH) {
-            args.push(LigeroArg::Hex { hex: hx32(sib) }); // output recipient siblings (priv)
+
+    for id in ids_to_check {
+        for e in bucket_entries.iter() {
+            args.push(LigeroArg::Hex { hex: hx32(e) }); // bucket entry (priv)
+        }
+        // inv(product) for in-bucket non-membership (empty bucket => product = id^BL_BUCKET_SIZE).
+        let id_fr = fr_from_hash32_be(id);
+        let mut prod = Bn254Fr::from_u32(1);
+        for e in bucket_entries.iter() {
+            let e_fr = fr_from_hash32_be(e);
+            let mut delta = id_fr.clone();
+            delta.submod_checked(&e_fr);
+            prod.mulmod_checked(&delta);
+        }
+        anyhow::ensure!(!prod.is_zero(), "unexpected: id collides with empty bucket");
+        let mut inv = prod.clone();
+        inv.inverse();
+        args.push(LigeroArg::Hex {
+            hex: hx32(&inv.to_bytes_be()),
+        }); // bucket_inv (priv)
+        for sib in siblings.iter().take(BL_DEPTH) {
+            args.push(LigeroArg::Hex { hex: hx32(sib) }); // bl_sibling (priv)
         }
     }
+
+    Ok(())
 }
 
 fn note_commitment(
@@ -211,27 +241,25 @@ impl MerkleTree {
     }
 }
 
-fn private_indices(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
+fn private_indices(depth: usize, n_in: usize, n_out: usize, is_transfer: bool) -> Vec<usize> {
     // Mirrors the guest layout described in utils/circuits/note-spend/src/main.rs (v2 ABI).
     //
     // Private:
     // - spend_sk, pk_ivk_owner
-    // - per-input: value_in, rho_in, sender_id_in, pos_bits, siblings
+    // - per-input: value_in, rho_in, sender_id_in, pos, siblings
     // - per-output: value_out, rho_out, pk_spend_out, pk_ivk_out
     // - inv_enforce witness
     let mut idx = vec![2usize, 3usize]; // spend_sk, pk_ivk_owner
 
-    let per_in = 4usize + 2usize * depth; // value + rho + sender_id_in + pos_bits[depth] + siblings[depth] + nullifier
+    let per_in = 5usize + depth; // value + rho + sender_id_in + pos + siblings[depth] + nullifier
     for i in 0..n_in {
         let base = 7 + i * per_in;
         idx.push(base); // value_in
         idx.push(base + 1); // rho_in
         idx.push(base + 2); // sender_id_in
+        idx.push(base + 3); // pos
         for k in 0..depth {
-            idx.push(base + 3 + k); // pos_bit
-        }
-        for k in 0..depth {
-            idx.push(base + 3 + depth + k); // sibling
+            idx.push(base + 4 + k); // sibling
         }
         // nullifier is public
     }
@@ -249,17 +277,28 @@ fn private_indices(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
     let inv_enforce_idx = outs_base + 5 * n_out;
     idx.push(inv_enforce_idx); // inv_enforce
 
-    // Blacklist siblings are private; blacklist_root is public.
-    let bl_sender_start = inv_enforce_idx + 2;
-    for k in 0..BL_DEPTH {
-        idx.push(bl_sender_start + k);
-    }
-    let bl_out_start = bl_sender_start + BL_DEPTH;
-    for j in 0..n_out {
-        for k in 0..BL_DEPTH {
-            idx.push(bl_out_start + j * BL_DEPTH + k);
+    // Blacklist section:
+    // - blacklist_root is public
+    // - per check: bucket_entries[BL_BUCKET_SIZE], bucket_inv, siblings[BL_DEPTH] are private
+    let per_check = BL_BUCKET_SIZE + 1 + BL_DEPTH;
+    let bl_checks = if is_transfer { 2usize } else { 1usize };
+    let mut cur = inv_enforce_idx + 2; // skip blacklist_root (pub)
+    for _ in 0..bl_checks {
+        for i in 0..BL_BUCKET_SIZE {
+            idx.push(cur + i); // bucket_entry
         }
+        idx.push(cur + BL_BUCKET_SIZE); // bucket_inv
+        cur += BL_BUCKET_SIZE + 1;
+        for k in 0..BL_DEPTH {
+            idx.push(cur + k); // sibling
+        }
+        cur += BL_DEPTH;
     }
+    debug_assert_eq!(
+        cur,
+        inv_enforce_idx + 2 + bl_checks * per_check,
+        "blacklist private indices mismatch"
+    );
 
     idx
 }
@@ -413,21 +452,14 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
     args.push(LigeroArg::Hex { hex: hx32(&anchor) }); // 5 anchor (public)
     args.push(LigeroArg::I64 { i64: n_in as i64 }); // 6 n_in (public)
 
-    // Input 0 (value, rho, sender_id_in, pos_bits[depth], siblings[depth], nullifier)
+    // Input 0 (value, rho, sender_id_in, pos, siblings[depth], nullifier)
     args.push(LigeroArg::I64 { i64: value as i64 }); // 7 value_in_0 (private)
     args.push(LigeroArg::Hex { hex: hx32(&rho) }); // 8 rho_in_0 (private)
     args.push(LigeroArg::Hex {
         hex: hx32(&sender_id_in),
     }); // sender_id_in_0 (private)
 
-    for lvl in 0..depth {
-        let bit = ((pos >> lvl) & 1) as u8;
-        let mut bit_bytes = [0u8; 32];
-        bit_bytes[31] = bit;
-        args.push(LigeroArg::Hex {
-            hex: hx32(&bit_bytes),
-        });
-    }
+    args.push(LigeroArg::I64 { i64: pos as i64 });
 
     for s in &siblings {
         args.push(LigeroArg::Hex { hex: hx32(s) });
@@ -460,9 +492,9 @@ fn test_two_pass_daemon_prover_and_verifier_timings() -> Result<()> {
         hex: hx32(&inv_enforce),
     });
 
-    append_empty_blacklist(&mut args, n_out as usize);
+    append_empty_blacklist(&mut args, &[sender_id_current, out_recipient])?;
 
-    let priv_idx = private_indices(depth, 1, 1);
+    let priv_idx = private_indices(depth, 1, 1, true);
     runner.config_mut().private_indices = priv_idx;
     runner.config_mut().args = args;
 
