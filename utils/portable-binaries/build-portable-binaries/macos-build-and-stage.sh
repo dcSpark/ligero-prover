@@ -36,7 +36,7 @@ Environment:
   CMAKE_JOB_COUNT   Parallel build jobs
   DAWN_GIT_REF      Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
   LIGERO_REPO       Ligero prover git URL (default: https://github.com/dcspark/ligero-prover.git)
-  LIGERO_BRANCH     Ligero prover git branch (default: feature/ligero-runner)
+  LIGERO_BRANCH     Ligero prover git branch (default: main)
 EOF
 }
 
@@ -79,7 +79,7 @@ fi
 
 DAWN_GIT_REF="${DAWN_GIT_REF:-cec4482eccee45696a7c0019e750c77f101ced04}"
 LIGERO_REPO="${LIGERO_REPO:-https://github.com/dcspark/ligero-prover.git}"
-LIGERO_BRANCH="${LIGERO_BRANCH:-feature/ligero-runner}"
+LIGERO_BRANCH="${LIGERO_BRANCH:-main}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"

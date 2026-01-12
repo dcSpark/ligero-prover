@@ -30,7 +30,7 @@ Environment:
   CMAKE_JOB_COUNT        Override parallel job count
   LIGERO_USE_LOCAL_LIGERO Set to 1 to use this local `ligero-prover` checkout (same as --use-local-ligero)
   LIGERO_REPO            Ligero prover git URL used to fetch shaders (default: https://github.com/dcspark/ligero-prover.git)
-  LIGERO_BRANCH          Ligero prover git branch used to fetch shaders (default: feature/ligero-runner)
+  LIGERO_BRANCH          Ligero prover git branch used to fetch shaders (default: main)
 EOF
 }
 
@@ -42,7 +42,7 @@ PORTABLE_SCRIPTS_DIR="$REPO_ROOT/utils/portable-binaries/build-portable-binaries
 OUT_DIR="$REPO_ROOT/utils/portable-binaries"
 DOCKER_IMAGE="${DOCKER_IMAGE:-ubuntu:24.04}"
 LIGERO_REPO="${LIGERO_REPO:-https://github.com/dcspark/ligero-prover.git}"
-LIGERO_BRANCH="${LIGERO_BRANCH:-feature/ligero-runner}"
+LIGERO_BRANCH="${LIGERO_BRANCH:-main}"
 USE_LOCAL_LIGERO="${LIGERO_USE_LOCAL_LIGERO:-0}"
 
 DEFAULT_ARCHES=("linux-amd64" "linux-arm64" "macos-arm64")
