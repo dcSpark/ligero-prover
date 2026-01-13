@@ -31,6 +31,7 @@ Environment:
   LIGERO_USE_LOCAL_LIGERO Set to 1 to use this local `ligero-prover` checkout (same as --use-local-ligero)
   LIGERO_REPO            Ligero prover git URL used to fetch shaders (default: https://github.com/dcspark/ligero-prover.git)
   LIGERO_BRANCH          Ligero prover git branch used to fetch shaders (default: main)
+  FORCE_DOWNLOAD         Set to 1 to force re-downloading cached repositories (Dawn, wabt, ligero-prover)
 EOF
 }
 
@@ -44,6 +45,7 @@ DOCKER_IMAGE="${DOCKER_IMAGE:-ubuntu:24.04}"
 LIGERO_REPO="${LIGERO_REPO:-https://github.com/dcspark/ligero-prover.git}"
 LIGERO_BRANCH="${LIGERO_BRANCH:-main}"
 USE_LOCAL_LIGERO="${LIGERO_USE_LOCAL_LIGERO:-0}"
+FORCE_DOWNLOAD="${FORCE_DOWNLOAD:-0}"
 
 DEFAULT_ARCHES=("linux-amd64" "linux-arm64" "macos-arm64")
 ARCHES=("${DEFAULT_ARCHES[@]}")
@@ -197,6 +199,7 @@ build_linux() {
     -e "CMAKE_JOB_COUNT=${CMAKE_JOB_COUNT:-}" \
     -e "LIGERO_REPO=$LIGERO_REPO" \
     -e "LIGERO_BRANCH=$LIGERO_BRANCH" \
+    -e "FORCE_DOWNLOAD=$FORCE_DOWNLOAD" \
     -v "$OUT_DIR:/out" \
     -v "$PORTABLE_SCRIPTS_DIR/linux-build-and-stage.sh:/run.sh:ro" \
     "${local_mount_args[@]}" \
@@ -220,6 +223,8 @@ build_macos_arm64() {
   if [[ "$USE_LOCAL_LIGERO" == "1" ]]; then
     mac_args+=(--use-local-ligero)
   fi
+  # Pass environment variables to the macOS script
+  FORCE_DOWNLOAD="$FORCE_DOWNLOAD" \
   bash "$PORTABLE_SCRIPTS_DIR/macos-build-and-stage.sh" "${mac_args[@]}"
 }
 

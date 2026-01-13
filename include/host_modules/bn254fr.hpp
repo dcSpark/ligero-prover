@@ -311,6 +311,14 @@ struct bn254fr_module : public host_module {
                 0,
                 0,
                 mem + data_addr);
+
+        // Ensure canonical field representation by reducing values >= modulus.
+        // This matches the native Rust implementation which uses Fr::from_be_bytes_mod_order.
+        // Without this, random 32-byte values >= BN254 modulus would cause constraint
+        // validation failures due to mismatches between test helpers and circuit execution.
+        if (*wit->value_ptr() >= Field::modulus) {
+            Field::reduce(*wit->value_ptr(), *wit->value_ptr());
+        }
     }
 
     void bn254fr_set_str() {

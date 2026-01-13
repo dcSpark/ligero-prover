@@ -25,24 +25,27 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: macos-build-and-stage.sh [--out <dir>] [--no-tar]
+Usage: macos-build-and-stage.sh [--out <dir>] [--no-tar] [--cache-dir <dir>]
 
 Options:
-  --out <dir>   Output directory (default: current directory)
-  --no-tar      Only stage the `ligero/` directory; do not create tarball
+  --out <dir>         Output directory (default: current directory)
+  --no-tar            Only stage the `ligero/` directory; do not create tarball
   --use-local-ligero  Use this local `ligero-prover` checkout instead of cloning
+  --cache-dir <dir>   Directory to cache downloaded repos (default: ~/.cache/ligero-build)
 
 Environment:
-  CMAKE_JOB_COUNT   Parallel build jobs
-  DAWN_GIT_REF      Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
-  LIGERO_REPO       Ligero prover git URL (default: https://github.com/dcspark/ligero-prover.git)
-  LIGERO_BRANCH     Ligero prover git branch (default: main)
+  CMAKE_JOB_COUNT     Parallel build jobs
+  DAWN_GIT_REF        Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
+  LIGERO_REPO         Ligero prover git URL (default: https://github.com/dcspark/ligero-prover.git)
+  LIGERO_BRANCH       Ligero prover git branch (default: main)
+  FORCE_DOWNLOAD      Set to 1 to force re-downloading all repos even if cached
 EOF
 }
 
 OUT_DIR="$PWD"
 NO_TAR=false
 USE_LOCAL_LIGERO=0
+CACHE_DIR="${HOME}/.cache/ligero-build"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +61,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --use-local-ligero)
       USE_LOCAL_LIGERO=1
+      shift
+      ;;
+    --cache-dir)
+      shift
+      [[ $# -gt 0 ]] || { echo "error: --cache-dir expects a path" >&2; usage; exit 1; }
+      CACHE_DIR="$1"
       shift
       ;;
     -h|--help)
@@ -140,28 +149,53 @@ if [[ ! -x "$CC" || ! -x "$CXX" ]]; then
   exit 1
 fi
 
+# Create cache directory for downloaded repos (persistent across builds)
+mkdir -p "$CACHE_DIR"
+CACHE_DIR="$(cd "$CACHE_DIR" && pwd)"
+
+# Temp directory for build artifacts (cleaned up on exit)
 TMP_ROOT="$(mktemp -d -t ligero-macos-build.XXXXXX)"
 cleanup() {
   rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
 
-DAWN_SRC="$TMP_ROOT/dawn"
-WABT_SRC="$TMP_ROOT/wabt"
-LIGERO_SRC="$TMP_ROOT/ligero-prover"
+# Source directories (cached)
+DAWN_SRC="$CACHE_DIR/dawn"
+WABT_SRC="$CACHE_DIR/wabt"
+LIGERO_SRC="$TMP_ROOT/ligero-prover"  # ligero-prover is special (--use-local-ligero or branch)
 
+# Build directories (temporary)
 SYSROOT="$TMP_ROOT/sysroot"
-
 DAWN_BUILD="$TMP_ROOT/dawn-build"
 WABT_BUILD="$TMP_ROOT/wabt-build"
 LIGERO_BUILD="$TMP_ROOT/ligero-build"
 
 mkdir -p "$SYSROOT" "$DAWN_BUILD" "$WABT_BUILD" "$LIGERO_BUILD"
 
-echo "==> Cloning Dawn..."
-git clone https://dawn.googlesource.com/dawn "$DAWN_SRC"
-cd "$DAWN_SRC"
-git checkout "$DAWN_GIT_REF"
+FORCE_DOWNLOAD="${FORCE_DOWNLOAD:-0}"
+
+# Clone or update Dawn
+if [[ "$FORCE_DOWNLOAD" == "1" ]] && [[ -d "$DAWN_SRC" ]]; then
+  echo "==> FORCE_DOWNLOAD: removing cached Dawn..."
+  rm -rf "$DAWN_SRC"
+fi
+
+if [[ -d "$DAWN_SRC/.git" ]]; then
+  echo "==> Using cached Dawn at $DAWN_SRC"
+  cd "$DAWN_SRC"
+  CURRENT_REF="$(git rev-parse HEAD 2>/dev/null || echo "")"
+  if [[ "$CURRENT_REF" != "$DAWN_GIT_REF" ]]; then
+    echo "==> Updating Dawn to $DAWN_GIT_REF..."
+    git fetch origin
+    git checkout "$DAWN_GIT_REF"
+  fi
+else
+  echo "==> Cloning Dawn..."
+  git clone https://dawn.googlesource.com/dawn "$DAWN_SRC"
+  cd "$DAWN_SRC"
+  git checkout "$DAWN_GIT_REF"
+fi
 
 echo "==> Building Dawn..."
 cmake -S "$DAWN_SRC" -B "$DAWN_BUILD" \
@@ -175,10 +209,21 @@ cmake -S "$DAWN_SRC" -B "$DAWN_BUILD" \
 cmake --build "$DAWN_BUILD" --parallel "$JOBS"
 cmake --install "$DAWN_BUILD"
 
-echo "==> Cloning wabt..."
-git clone https://github.com/WebAssembly/wabt.git "$WABT_SRC"
-cd "$WABT_SRC"
-git submodule update --init
+# Clone or update wabt
+if [[ "$FORCE_DOWNLOAD" == "1" ]] && [[ -d "$WABT_SRC" ]]; then
+  echo "==> FORCE_DOWNLOAD: removing cached wabt..."
+  rm -rf "$WABT_SRC"
+fi
+
+if [[ -d "$WABT_SRC/.git" ]]; then
+  echo "==> Using cached wabt at $WABT_SRC"
+  cd "$WABT_SRC"
+else
+  echo "==> Cloning wabt..."
+  git clone https://github.com/WebAssembly/wabt.git "$WABT_SRC"
+  cd "$WABT_SRC"
+  git submodule update --init
+fi
 
 echo "==> Building wabt..."
 cmake -S "$WABT_SRC" -B "$WABT_BUILD" \
@@ -189,7 +234,8 @@ cmake -S "$WABT_SRC" -B "$WABT_BUILD" \
 cmake --build "$WABT_BUILD" --parallel "$JOBS"
 cmake --install "$WABT_BUILD"
 
-echo "==> Cloning ligero-prover..."
+# Clone or copy ligero-prover
+echo "==> Preparing ligero-prover..."
 if [[ "$USE_LOCAL_LIGERO" == "1" ]]; then
   if [[ ! -f "$REPO_ROOT/CMakeLists.txt" ]]; then
     echo "error: expected to be running inside a ligero-prover checkout (repo root: $REPO_ROOT)" >&2

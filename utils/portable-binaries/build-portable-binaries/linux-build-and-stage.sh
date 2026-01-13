@@ -38,6 +38,7 @@ Environment:
   DAWN_GIT_REF      Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
   LIGERO_REPO       Ligero prover git URL (default: https://github.com/dcspark/ligero-prover.git)
   LIGERO_BRANCH     Ligero prover git branch (default: main)
+  FORCE_DOWNLOAD    Ignored in Docker (no persistent cache); included for parity with macOS script
 EOF
 }
 
