@@ -134,6 +134,23 @@
  *   where bl_checks = 1 + (withdraw_amount == 0 ? 1 : 0)
  * (argc includes argv[0]).
  *
+ * --- Level B: Viewer Attestations (optional; appended after blacklist args) ---
+ *
+ *   n_viewers          — i64 (PUBLIC; number of viewers, 0..=MAX_VIEWERS)
+ *
+ *   For each viewer v in [0..n_viewers):
+ *     fvk_commit_v      — 32 bytes (PUBLIC)  = H("FVK_COMMIT_V1" || fvk_v)
+ *     fvk_v             — 32 bytes (PRIVATE) viewer key material (NOT required for verification)
+ *
+ *     For each output j in [0..n_out):
+ *       ct_hash_v_j     — 32 bytes (PUBLIC)  = H("CT_HASH_V1" || ct_v_j)
+ *       mac_v_j         — 32 bytes (PUBLIC)  = H("VIEW_MAC_V1" || k_v_j || cm_out_j || ct_hash_v_j)
+ *
+ * Notes:
+ *   - The verifier MUST NOT require the real `fvk_v`. Only `fvk_commit_v` is public.
+ *   - Ensure your runner marks each `fvk_v` argv index as PRIVATE (witness) so verification
+ *     only needs the public commitments and digests.
+ *
  * SECURITY NOTES:
  *   1) All validation paths inject UNSAT constraints before exit (hard_fail)
  *   2) Balance check uses field-level constraint, not runtime boolean comparison
@@ -426,12 +443,7 @@ fn note_commitment_fr(
 /// Nullifier: H("PRF_NF_V1" || domain || nf_key || rho)
 /// Fixed 105-byte preimage.
 
-fn nullifier_fr(
-    h: &Poseidon2Core,
-    domain: &Hash32,
-    nf_key: &Hash32,
-    rho: &Hash32,
-) -> Bn254Fr {
+fn nullifier_fr(h: &Poseidon2Core, domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Bn254Fr {
     let mut buf = [0u8; PRF_NF_BUF_LEN];
     buf[..9].copy_from_slice(b"PRF_NF_V1");
     buf[9..41].copy_from_slice(domain);
@@ -1029,7 +1041,13 @@ fn main() {
 
     // Transfers have a "pay recipient" output; withdraws only have change-to-self outputs, already enforced above.
     if withdraw_amount == 0 {
-        assert_not_blacklisted_bucket_from_args(&h, &outs[0].rcp, &blacklist_root, &args, &mut arg_idx);
+        assert_not_blacklisted_bucket_from_args(
+            &h,
+            &outs[0].rcp,
+            &blacklist_root,
+            &args,
+            &mut arg_idx,
+        );
     }
 
     // --- Level B: Viewer Attestations ---
@@ -1077,18 +1095,20 @@ fn main() {
 
     let mut v_idx = base_after_outs + 1; // start right after n_viewers
     for _vi in 0..n_viewers {
-        let fvk_commit_arg = read_hash32(&args, v_idx);
+        // PUBLIC: commitment/hash of the viewer key material.
+        let fvk_commit_pub = read_hash32(&args, v_idx);
         v_idx += 1;
 
-        let fvk = read_hash32(&args, v_idx);
+        // PRIVATE: viewer key material (witness). Verifier must not need the real value.
+        let fvk_priv = read_hash32(&args, v_idx);
         v_idx += 1;
 
-        let fvk_c_fr = fvk_commit_fr(&h, &fvk);
-        assert_fr_eq_hash32(&fvk_c_fr, &fvk_commit_arg);
+        let fvk_c_fr = fvk_commit_fr(&h, &fvk_priv);
+        assert_fr_eq_hash32(&fvk_c_fr, &fvk_commit_pub);
 
         for j in 0..n_out {
             let outp = &outs[j];
-            let k = view_kdf(&h, &fvk, &outp.cm);
+            let k = view_kdf(&h, &fvk_priv, &outp.cm);
             stream_xor_encrypt_144(&h, &k, &out_pts[j], &mut ct_buf);
 
             let (ct_h_fr, ct_h_bytes) = ct_hash(&h, &ct_buf);
