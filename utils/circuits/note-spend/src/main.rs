@@ -170,8 +170,8 @@
 
 // Ligetron SDK imports
 use ligetron::api::{get_args, ArgHolder};
-use ligetron::bn254fr::{addmod_checked, submod_checked, Bn254Fr};
-use ligetron::poseidon2::poseidon2_hash_bytes;
+use ligetron::bn254fr::{addmod_checked, mulmod_checked, submod_checked, Bn254Fr};
+use ligetron::poseidon2::{poseidon2_hash_bytes, Poseidon2Context};
 
 /// Exit the program with the given code.
 fn exit_with_code(code: i32) -> ! {
@@ -243,6 +243,39 @@ impl Poseidon2Core {
         let digest = self.hash_padded_fr(preimage);
         bn254fr_to_hash32(&digest)
     }
+
+    /// Return Poseidon2 digest as a field element from byte field elements.
+    #[inline(always)]
+    pub fn hash_padded_fr_bytes(&self, preimage: &[Bn254Fr]) -> Bn254Fr {
+        let mut ctx = Poseidon2Context::new();
+        let mut offset = 0usize;
+
+        // Process full 31-byte blocks.
+        while preimage.len().saturating_sub(offset) >= 31 {
+            let chunk_fr = bytes_to_fr_be(&preimage[offset..offset + 31]);
+            ctx.digest_update(&chunk_fr);
+            offset += 31;
+        }
+
+        // Final block: remaining bytes + 0x80 + zero padding.
+        let mut block: Vec<Bn254Fr> = Vec::with_capacity(31);
+        block.extend_from_slice(&preimage[offset..]);
+        block.push(Bn254Fr::from_u32(0x80));
+        while block.len() < 31 {
+            block.push(Bn254Fr::from_u32(0));
+        }
+        let last_fr = bytes_to_fr_be(&block);
+        ctx.digest_update(&last_fr);
+
+        ctx.digest_final_no_pad()
+    }
+
+    /// Return Poseidon2 digest as 32-byte BE (field bytes) from byte field elements.
+    #[inline(always)]
+    pub fn hash_padded_bytes_frs(&self, preimage: &[Bn254Fr]) -> [Bn254Fr; 32] {
+        let digest = self.hash_padded_fr_bytes(preimage);
+        fr_to_bytes_be_bits(&digest)
+    }
 }
 
 /// Convert a Bn254Fr field element to a 32-byte hash.
@@ -277,6 +310,101 @@ fn assert_fr_eq_hash32(computed: &Bn254Fr, expected_be: &Hash32) {
     // without evaluating private inputs: parsing bytes into a field element via `set_bytes_big`
     // does *not* by itself constrain the value to equal those bytes.
     Bn254Fr::assert_equal_bytes_be(computed, expected_be);
+}
+
+// ============================================================================
+// BYTE/FR HELPERS (Constraint-friendly)
+// ============================================================================
+
+/// Pack up to 31 byte field elements into a single field element (big-endian).
+#[inline(always)]
+fn bytes_to_fr_be(bytes: &[Bn254Fr]) -> Bn254Fr {
+    let mut acc = Bn254Fr::from_u32(0);
+    let base = Bn254Fr::from_u32(256);
+    for b in bytes {
+        let mut tmp = Bn254Fr::new();
+        mulmod_checked(&mut tmp, &acc, &base);
+        addmod_checked(&mut acc, &tmp, b);
+    }
+    acc
+}
+
+#[inline(always)]
+fn bits_to_byte_fr(bits: &[Bn254Fr; 8]) -> Bn254Fr {
+    let pow2: [Bn254Fr; 8] = std::array::from_fn(|i| Bn254Fr::from_u32(1u32 << i));
+    let mut out = Bn254Fr::from_u32(0);
+    for i in 0..8 {
+        let mut term = Bn254Fr::new();
+        mulmod_checked(&mut term, &bits[i], &pow2[i]);
+        out.addmod_checked(&term);
+    }
+    out
+}
+
+/// Convert a field element into 32 byte field elements (big-endian) via bit decomposition.
+#[inline(always)]
+fn fr_to_bytes_be_bits(x: &Bn254Fr) -> [Bn254Fr; 32] {
+    let mut out: [Bn254Fr; 32] = std::array::from_fn(|_| Bn254Fr::new());
+    let bits = x.to_bits(254); // LSB-first
+    let zero = Bn254Fr::from_u32(0);
+
+    for i in 0..32 {
+        let mut byte_bits: [Bn254Fr; 8] = std::array::from_fn(|_| Bn254Fr::new());
+        for j in 0..8 {
+            let bit_idx = i * 8 + j;
+            if bit_idx < bits.len() {
+                byte_bits[j] = bits[bit_idx].clone();
+            } else {
+                byte_bits[j] = zero.clone();
+            }
+        }
+        let byte_fr = bits_to_byte_fr(&byte_bits);
+        out[31 - i] = byte_fr;
+    }
+    out
+}
+
+/// Convert a 32-byte array into field-byte elements (byte value only).
+#[inline(always)]
+fn hash32_to_fr_bytes(h: &Hash32) -> [Bn254Fr; 32] {
+    let mut out: [Bn254Fr; 32] = std::array::from_fn(|_| Bn254Fr::new());
+    for i in 0..32 {
+        out[i].set_bytes_big(&h[i..i + 1]);
+    }
+    out
+}
+
+/// Convert a 144-byte array into field-byte elements (byte value only).
+#[inline(always)]
+fn bytes144_to_fr_bytes(bytes: &[u8; NOTE_PLAIN_LEN]) -> [Bn254Fr; NOTE_PLAIN_LEN] {
+    let mut out: [Bn254Fr; NOTE_PLAIN_LEN] = std::array::from_fn(|_| Bn254Fr::new());
+    for i in 0..NOTE_PLAIN_LEN {
+        out[i].set_bytes_big(&bytes[i..i + 1]);
+    }
+    out
+}
+
+/// XOR two byte field elements using bit-level constraints.
+#[inline(always)]
+fn xor_byte_fr(a: &Bn254Fr, b: &Bn254Fr) -> Bn254Fr {
+    let a_bits = a.to_bits(8);
+    let b_bits = b.to_bits(8);
+    let two = Bn254Fr::from_u32(2);
+    let mut out_bits: [Bn254Fr; 8] = std::array::from_fn(|_| Bn254Fr::new());
+
+    for i in 0..8 {
+        let mut ab = Bn254Fr::new();
+        mulmod_checked(&mut ab, &a_bits[i], &b_bits[i]);
+        let mut sum = Bn254Fr::new();
+        addmod_checked(&mut sum, &a_bits[i], &b_bits[i]);
+        let mut two_ab = Bn254Fr::new();
+        mulmod_checked(&mut two_ab, &ab, &two);
+        let mut out = Bn254Fr::new();
+        submod_checked(&mut out, &sum, &two_ab);
+        out_bits[i] = out;
+    }
+
+    bits_to_byte_fr(&out_bits)
 }
 
 // ============================================================================
@@ -385,6 +513,8 @@ fn read_u32(args: &ArgHolder, index: usize, fail_code: u32) -> u32 {
     }
     v as u32
 }
+
+// (intentionally no public hash -> field helper; use read_hash32 + assert_fr_eq_hash32)
 
 // ============================================================================
 // OPTIMIZED HASH FUNCTIONS: Fixed-size buffers, single hasher instance
@@ -546,103 +676,107 @@ fn root_from_path_field_level(
 
 /// FVK commitment: H("FVK_COMMIT_V1" || fvk)
 /// Fixed 45-byte preimage.
-
-fn fvk_commit_fr(h: &Poseidon2Core, fvk: &Hash32) -> Bn254Fr {
-    let mut buf = [0u8; FVK_COMMIT_BUF_LEN];
-    buf[..13].copy_from_slice(b"FVK_COMMIT_V1");
-    buf[13..45].copy_from_slice(fvk);
-    h.hash_padded_fr(&buf)
+fn fvk_commit_fr(h: &Poseidon2Core, fvk: &[Bn254Fr; 32]) -> Bn254Fr {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(FVK_COMMIT_BUF_LEN);
+    for b in b"FVK_COMMIT_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(fvk);
+    h.hash_padded_fr_bytes(&buf)
 }
 
 /// View KDF: H("VIEW_KDF_V1" || fvk || cm)
 /// Fixed 75-byte preimage.
-
-fn view_kdf(h: &Poseidon2Core, fvk: &Hash32, cm: &Hash32) -> Hash32 {
-    let mut buf = [0u8; VIEW_KDF_BUF_LEN];
-    buf[..11].copy_from_slice(b"VIEW_KDF_V1");
-    buf[11..43].copy_from_slice(fvk);
-    buf[43..75].copy_from_slice(cm);
-    h.hash_padded(&buf)
+fn view_kdf(h: &Poseidon2Core, fvk: &[Bn254Fr; 32], cm: &[Bn254Fr; 32]) -> [Bn254Fr; 32] {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(VIEW_KDF_BUF_LEN);
+    for b in b"VIEW_KDF_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(fvk);
+    buf.extend_from_slice(cm);
+    h.hash_padded_bytes_frs(&buf)
 }
 
 /// Stream block: H("VIEW_STREAM_V1" || k || ctr)
 /// Fixed 50-byte preimage.
-
-fn stream_block(h: &Poseidon2Core, k: &Hash32, ctr: u32) -> Hash32 {
-    let mut buf = [0u8; VIEW_STREAM_BUF_LEN];
-    buf[..14].copy_from_slice(b"VIEW_STREAM_V1");
-    buf[14..46].copy_from_slice(k);
-    buf[46..50].copy_from_slice(&ctr.to_le_bytes());
-    h.hash_padded(&buf)
+fn stream_block(h: &Poseidon2Core, k: &[Bn254Fr; 32], ctr: u32) -> [Bn254Fr; 32] {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(VIEW_STREAM_BUF_LEN);
+    for b in b"VIEW_STREAM_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(k);
+    for b in ctr.to_le_bytes() {
+        buf.push(Bn254Fr::from_u32(b as u32));
+    }
+    h.hash_padded_bytes_frs(&buf)
 }
 
 /// Stream XOR encrypt for exactly 144 bytes (NOTE_PLAIN_LEN).
 /// Optimized: 5 hash calls for 144 bytes (4 full blocks + 16-byte remainder).
-
-fn stream_xor_encrypt_144(h: &Poseidon2Core, k: &Hash32, pt: &[u8; 144], ct_out: &mut [u8; 144]) {
+fn stream_xor_encrypt_144(
+    h: &Poseidon2Core,
+    k: &[Bn254Fr; 32],
+    pt: &[Bn254Fr; 144],
+    ct_out: &mut [Bn254Fr; 144],
+) {
     // Block 0: bytes 0-31
     let ks0 = stream_block(h, k, 0);
-    let mut i = 0;
-    while i < 32 {
-        ct_out[i] = pt[i] ^ ks0[i];
-        i += 1;
+    for i in 0..32 {
+        ct_out[i] = xor_byte_fr(&pt[i], &ks0[i]);
     }
 
     // Block 1: bytes 32-63
     let ks1 = stream_block(h, k, 1);
-    i = 0;
-    while i < 32 {
-        ct_out[32 + i] = pt[32 + i] ^ ks1[i];
-        i += 1;
+    for i in 0..32 {
+        ct_out[32 + i] = xor_byte_fr(&pt[32 + i], &ks1[i]);
     }
 
     // Block 2: bytes 64-95
     let ks2 = stream_block(h, k, 2);
-    i = 0;
-    while i < 32 {
-        ct_out[64 + i] = pt[64 + i] ^ ks2[i];
-        i += 1;
+    for i in 0..32 {
+        ct_out[64 + i] = xor_byte_fr(&pt[64 + i], &ks2[i]);
     }
 
     // Block 3: bytes 96-127
     let ks3 = stream_block(h, k, 3);
-    i = 0;
-    while i < 32 {
-        ct_out[96 + i] = pt[96 + i] ^ ks3[i];
-        i += 1;
+    for i in 0..32 {
+        ct_out[96 + i] = xor_byte_fr(&pt[96 + i], &ks3[i]);
     }
 
     // Block 4: bytes 128-143 (16-byte remainder)
     let ks4 = stream_block(h, k, 4);
-    i = 0;
-    while i < 16 {
-        ct_out[128 + i] = pt[128 + i] ^ ks4[i];
-        i += 1;
+    for i in 0..16 {
+        ct_out[128 + i] = xor_byte_fr(&pt[128 + i], &ks4[i]);
     }
 }
 
 /// Ciphertext hash: H("CT_HASH_V1" || ct)
 /// Fixed 154-byte preimage for 144-byte ciphertext.
-
-fn ct_hash(h: &Poseidon2Core, ct: &[u8; 144]) -> (Bn254Fr, Hash32) {
-    let mut buf = [0u8; CT_HASH_BUF_LEN];
-    buf[..10].copy_from_slice(b"CT_HASH_V1");
-    buf[10..154].copy_from_slice(ct);
-    let fr = h.hash_padded_fr(&buf);
-    let bytes = bn254fr_to_hash32(&fr);
-    (fr, bytes)
+fn ct_hash_fr(h: &Poseidon2Core, ct: &[Bn254Fr; 144]) -> Bn254Fr {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(CT_HASH_BUF_LEN);
+    for b in b"CT_HASH_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(ct);
+    h.hash_padded_fr_bytes(&buf)
 }
 
 /// View MAC: H("VIEW_MAC_V1" || k || cm || ct_hash)
 /// Fixed 107-byte preimage.
-
-fn view_mac_fr(h: &Poseidon2Core, k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Bn254Fr {
-    let mut buf = [0u8; VIEW_MAC_BUF_LEN];
-    buf[..11].copy_from_slice(b"VIEW_MAC_V1");
-    buf[11..43].copy_from_slice(k);
-    buf[43..75].copy_from_slice(cm);
-    buf[75..107].copy_from_slice(ct_h);
-    h.hash_padded_fr(&buf)
+fn view_mac_fr(
+    h: &Poseidon2Core,
+    k: &[Bn254Fr; 32],
+    cm: &[Bn254Fr; 32],
+    ct_h: &[Bn254Fr; 32],
+) -> Bn254Fr {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(VIEW_MAC_BUF_LEN);
+    for b in b"VIEW_MAC_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(k);
+    buf.extend_from_slice(cm);
+    buf.extend_from_slice(ct_h);
+    h.hash_padded_fr_bytes(&buf)
 }
 
 /// Encode note plaintext for viewer encryption.
@@ -1091,8 +1225,6 @@ fn main() {
         );
     }
 
-    let mut ct_buf = [0u8; NOTE_PLAIN_LEN];
-
     let mut v_idx = base_after_outs + 1; // start right after n_viewers
     for _vi in 0..n_viewers {
         // PUBLIC: commitment/hash of the viewer key material.
@@ -1103,20 +1235,25 @@ fn main() {
         let fvk_priv = read_hash32(&args, v_idx);
         v_idx += 1;
 
-        let fvk_c_fr = fvk_commit_fr(&h, &fvk_priv);
+        let fvk_priv_fr = hash32_to_fr_bytes(&fvk_priv);
+        let fvk_c_fr = fvk_commit_fr(&h, &fvk_priv_fr);
         assert_fr_eq_hash32(&fvk_c_fr, &fvk_commit_pub);
 
         for j in 0..n_out {
             let outp = &outs[j];
-            let k = view_kdf(&h, &fvk_priv, &outp.cm);
-            stream_xor_encrypt_144(&h, &k, &out_pts[j], &mut ct_buf);
+            let cm_fr = hash32_to_fr_bytes(&outp.cm);
+            let k = view_kdf(&h, &fvk_priv_fr, &cm_fr);
+            let pt_fr = bytes144_to_fr_bytes(&out_pts[j]);
+            let mut ct_fr: [Bn254Fr; NOTE_PLAIN_LEN] = std::array::from_fn(|_| Bn254Fr::new());
+            stream_xor_encrypt_144(&h, &k, &pt_fr, &mut ct_fr);
 
-            let (ct_h_fr, ct_h_bytes) = ct_hash(&h, &ct_buf);
-            let macv_fr = view_mac_fr(&h, &k, &outp.cm, &ct_h_bytes);
-
+            let ct_h_fr = ct_hash_fr(&h, &ct_fr);
             let ct_hash_arg = read_hash32(&args, v_idx);
             v_idx += 1;
             assert_fr_eq_hash32(&ct_h_fr, &ct_hash_arg);
+
+            let ct_hash_arg_fr = hash32_to_fr_bytes(&ct_hash_arg);
+            let macv_fr = view_mac_fr(&h, &k, &cm_fr, &ct_hash_arg_fr);
 
             let mac_arg = read_hash32(&args, v_idx);
             v_idx += 1;

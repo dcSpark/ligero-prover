@@ -1130,7 +1130,6 @@ fn test_note_spend_viewer_attestation_roundtrip_and_rejects_mutation() -> Result
 
     let mut priv_idx = private_indices(depth, n_in, n_out, true);
     priv_idx.push(fvk_idx1);
-    let keep_private_indices = vec![fvk_idx1];
 
     runner.config_mut().private_indices = priv_idx.clone();
     runner.config_mut().args = args.clone();
@@ -1158,31 +1157,17 @@ fn test_note_spend_viewer_attestation_roundtrip_and_rejects_mutation() -> Result
     );
 
     // Sanity: verifies with the original statement.
-    let (ok, v_stdout, v_stderr) = verifier::verify_proof_with_output_keep_private_args(
-        &vpaths,
-        &proof_bytes,
-        args.clone(),
-        priv_idx.clone(),
-        keep_private_indices.clone(),
-    )
-    .context("Failed to run verifier")?;
+    let (ok, v_stdout, v_stderr) =
+        verifier::verify_proof_with_output(&vpaths, &proof_bytes, args.clone(), priv_idx.clone())
+            .context("Failed to run verifier")?;
     if !ok {
         anyhow::bail!("verifier did not report success\nstdout: {v_stdout}\nstderr: {v_stderr}");
     }
 
-    // IMPORTANT: when viewer attestations are present, the verifier binary currently needs access
-    // to the viewer key (`fvk`) to reconstruct the same circuit instance as the prover.
-    // Redacting *all* private args should therefore fail verification.
-    verify_expect_fail(&vpaths, &proof_bytes, args.clone(), priv_idx.clone())?;
+    // With constraint-driven viewer hashing, redacting private args must still verify.
 
-    let verify_expect_fail_keep_private = |bad_args: Vec<LigeroArg>| -> Result<()> {
-        match verifier::verify_proof_with_output_keep_private_args(
-            &vpaths,
-            &proof_bytes,
-            bad_args,
-            priv_idx.clone(),
-            keep_private_indices.clone(),
-        ) {
+    let verify_expect_fail_redacted = |bad_args: Vec<LigeroArg>| -> Result<()> {
+        match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone()) {
             Ok((ok, stdout, stderr)) => {
                 anyhow::ensure!(
                     !ok,
@@ -1212,13 +1197,13 @@ fn test_note_spend_viewer_attestation_roundtrip_and_rejects_mutation() -> Result
     bad_args[idx_fvk_commit - 1] = LigeroArg::Hex {
         hex: hx32(&bad_commit),
     };
-    verify_expect_fail_keep_private(bad_args)?;
+    verify_expect_fail_redacted(bad_args)?;
 
     let mut bad_ct = ct_h;
     bad_ct[0] ^= 1;
     let mut bad_args = args.clone();
     bad_args[idx_ct_hash - 1] = LigeroArg::Hex { hex: hx32(&bad_ct) };
-    verify_expect_fail_keep_private(bad_args)?;
+    verify_expect_fail_redacted(bad_args)?;
 
     let mut bad_mac = mac;
     bad_mac[0] ^= 1;
@@ -1226,7 +1211,7 @@ fn test_note_spend_viewer_attestation_roundtrip_and_rejects_mutation() -> Result
     bad_args[idx_mac - 1] = LigeroArg::Hex {
         hex: hx32(&bad_mac),
     };
-    verify_expect_fail_keep_private(bad_args)?;
+    verify_expect_fail_redacted(bad_args)?;
 
     Ok(())
 }
@@ -1433,8 +1418,6 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
     }); // n_viewers (pub)
 
     let mut priv_idx = private_indices(depth, n_in, n_out, true);
-    let mut keep_private_indices: Vec<usize> = Vec::new();
-
     for fvk in &viewer_fvks {
         let fvk_commitment = fvk_commit(fvk);
         args.push(LigeroArg::Hex {
@@ -1444,7 +1427,6 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
         let fvk_idx1 = args.len() + 1; // 1-based index of the next arg (fvk)
         args.push(LigeroArg::Hex { hex: hx32(fvk) }); // fvk (priv)
         priv_idx.push(fvk_idx1);
-        keep_private_indices.push(fvk_idx1);
 
         // Output 0 digests.
         let k0 = view_kdf(fvk, &cm_out0);
@@ -1492,14 +1474,9 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
         packing,
     );
 
-    let (ok, v_stdout, v_stderr) = verifier::verify_proof_with_output_keep_private_args(
-        &vpaths,
-        &proof_bytes,
-        args.clone(),
-        priv_idx.clone(),
-        keep_private_indices.clone(),
-    )
-    .context("Failed to run verifier")?;
+    let (ok, v_stdout, v_stderr) =
+        verifier::verify_proof_with_output(&vpaths, &proof_bytes, args.clone(), priv_idx.clone())
+            .context("Failed to run verifier")?;
     if !ok {
         anyhow::bail!("verifier did not report success\nstdout: {v_stdout}\nstderr: {v_stderr}");
     }
@@ -1517,13 +1494,7 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
         let mut bad_args = args.clone();
         bad_args[idx_n_viewers - 1] = LigeroArg::I64 { i64: 3 }; // but only 2 viewer blocks present
 
-        match verifier::verify_proof_with_output_keep_private_args(
-            &vpaths,
-            &proof_bytes,
-            bad_args,
-            priv_idx.clone(),
-            keep_private_indices.clone(),
-        ) {
+        match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone()) {
             Ok((ok_bad, _stdout, _stderr)) => {
                 anyhow::ensure!(!ok_bad, "expected verification to fail")
             }
@@ -1535,13 +1506,7 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
     {
         let mut bad_args = args.clone();
         bad_args.pop();
-        match verifier::verify_proof_with_output_keep_private_args(
-            &vpaths,
-            &proof_bytes,
-            bad_args,
-            priv_idx.clone(),
-            keep_private_indices.clone(),
-        ) {
+        match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone()) {
             Ok((ok_bad, _stdout, _stderr)) => {
                 anyhow::ensure!(!ok_bad, "expected verification to fail")
             }

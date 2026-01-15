@@ -96,6 +96,12 @@ impl Poseidon2Context {
         self.state[0].clone()
     }
 
+    /// Finalize without applying byte padding.
+    /// Use only when the caller already applied padding explicitly.
+    pub fn digest_final_no_pad(&self) -> Bn254Fr {
+        self.state[0].clone()
+    }
+
     /// Internal permutation function for Poseidon2
     fn permute(&mut self) {
         // External MDS multiplication

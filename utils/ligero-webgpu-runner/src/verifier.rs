@@ -296,27 +296,6 @@ pub fn verify_proof_with_output(
     )
 }
 
-/// Verify a proof while redacting *all* private args except the indices in `keep_private_indices`.
-///
-/// Some circuits (e.g. viewer-attestation extensions) require a subset of private inputs to be
-/// present at verification time so the verifier binary can reconstruct the same circuit instance.
-pub fn verify_proof_with_output_keep_private_args(
-    paths: &VerifierPaths,
-    proof_bytes: &[u8],
-    args: Vec<LigeroArg>,
-    private_indices: Vec<usize>,
-    keep_private_indices: Vec<usize>,
-) -> Result<(bool, String, String)> {
-    verify_proof_with_output_keep_private_args_in_pool(
-        default_verifier_pool(),
-        paths,
-        proof_bytes,
-        args,
-        private_indices,
-        keep_private_indices,
-    )
-}
-
 /// Verify a proof and return `(success, stdout, stderr)` for debugging, running on a provided worker pool.
 pub fn verify_proof_with_output_in_pool(
     pool: &BinaryWorkerPool,
@@ -328,32 +307,7 @@ pub fn verify_proof_with_output_in_pool(
     let paths = paths.clone();
     let proof_bytes = proof_bytes.to_vec();
     pool.execute(move || {
-        verify_proof_with_output_direct(&paths, &proof_bytes, args, private_indices, Vec::new())
-    })
-}
-
-/// Verify a proof and return `(success, stdout, stderr)` for debugging, running on a provided worker pool.
-///
-/// Private arguments are redacted according to `private_indices` except for indices listed in
-/// `keep_private_indices` (1-based).
-pub fn verify_proof_with_output_keep_private_args_in_pool(
-    pool: &BinaryWorkerPool,
-    paths: &VerifierPaths,
-    proof_bytes: &[u8],
-    args: Vec<LigeroArg>,
-    private_indices: Vec<usize>,
-    keep_private_indices: Vec<usize>,
-) -> Result<(bool, String, String)> {
-    let paths = paths.clone();
-    let proof_bytes = proof_bytes.to_vec();
-    pool.execute(move || {
-        verify_proof_with_output_direct(
-            &paths,
-            &proof_bytes,
-            args,
-            private_indices,
-            keep_private_indices,
-        )
+        verify_proof_with_output_direct(&paths, &proof_bytes, args, private_indices)
     })
 }
 
@@ -376,7 +330,6 @@ fn verify_proof_with_output_direct(
     proof_bytes: &[u8],
     mut args: Vec<LigeroArg>,
     private_indices: Vec<usize>,
-    keep_private_indices: Vec<usize>,
 ) -> Result<(bool, String, String)> {
     let temp_dir =
         tempdir().context("Failed to create temporary directory for Ligero verification")?;
@@ -395,9 +348,6 @@ fn verify_proof_with_output_direct(
 
     // Redact private arguments (replace with dummy values) while preserving basic parseability.
     for &idx in &private_indices {
-        if keep_private_indices.contains(&idx) {
-            continue;
-        }
         if idx > 0 && idx <= args.len() {
             let arg_idx = idx - 1;
             args[arg_idx] = redact_arg(&args[arg_idx]);
