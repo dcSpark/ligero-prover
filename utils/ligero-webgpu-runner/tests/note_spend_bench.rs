@@ -1082,7 +1082,7 @@ fn build_statement(
     pos: u64,
     use_case: NoteSpendUseCase,
     include_viewers: bool,
-) -> Result<(Vec<LigeroArg>, NoteSpendPublicSummary, Vec<usize>)> {
+) -> Result<(Vec<LigeroArg>, NoteSpendPublicSummary)> {
     anyhow::ensure!(
         !matches!(use_case, NoteSpendUseCase::Deposit),
         "deposit uses note-deposit guest; build_statement is for spend (transfer/withdraw)"
@@ -1242,7 +1242,6 @@ fn build_statement(
         NoteSpendUseCase::Deposit => unreachable!("guarded above"),
     }
 
-    let mut keep_private_indices: Vec<usize> = Vec::new();
     if include_viewers {
         // Add 1 viewer attestation (fvk is private; digests are public).
         let n_viewers: u64 = 1;
@@ -1255,9 +1254,7 @@ fn build_statement(
         }); // n_viewers (pub)
         args.push(arg32(&fvk_commitment)); // fvk_commit (pub)
 
-        let fvk_idx1 = args.len() + 1;
         args.push(arg32(&fvk)); // fvk (priv)
-        keep_private_indices.push(fvk_idx1);
 
         for (out_value, out_rho, _out_pk_spend, _out_pk_ivk, out_recipient, cm_out) in out_triples {
             let k = view_kdf(&fvk, &cm_out);
@@ -1281,7 +1278,6 @@ fn build_statement(
             n_in,
             n_out,
         },
-        keep_private_indices,
     ))
 }
 
@@ -1355,8 +1351,7 @@ fn test_note_spend_daemon_bench() -> Result<()> {
     let mut public_summaries: Vec<NoteSpendPublicSummary> = Vec::new();
 
     for run in 0..3u8 {
-        let (args, summary, _keep_priv_idx) =
-            build_statement(run, depth, domain, value, pos, use_case, false)?;
+        let (args, summary) = build_statement(run, depth, domain, value, pos, use_case, false)?;
         runner.config_mut().private_indices =
             private_indices_note_spend(depth, summary.n_in, summary.n_out, true);
         runner.config_mut().args = args;
@@ -1567,13 +1562,13 @@ fn run_note_spend_direct_bench(
             NoteSpendUseCase::Transfer | NoteSpendUseCase::Withdraw
         );
 
-    let (run0_args, run0_priv_idx, run0_keep_priv_idx, run0_summary) = match use_case {
+    let (run0_args, run0_priv_idx, run0_summary) = match use_case {
         NoteSpendUseCase::Deposit => {
             let args = build_deposit_statement(0, domain, value)?;
-            (args, private_indices_note_deposit(), Vec::new(), None)
+            (args, private_indices_note_deposit(), None)
         }
         NoteSpendUseCase::Transfer | NoteSpendUseCase::Withdraw => {
-            let (args, summary, keep_priv_idx) =
+            let (args, summary) =
                 build_statement(0, depth, domain, value, pos, use_case, include_viewers)?;
             (
                 args,
@@ -1583,7 +1578,6 @@ fn run_note_spend_direct_bench(
                     summary.n_out,
                     matches!(use_case, NoteSpendUseCase::Transfer),
                 ),
-                keep_priv_idx,
                 Some(summary),
             )
         }
@@ -1818,27 +1812,22 @@ fn run_note_spend_direct_bench(
     let mut proofs: Vec<Vec<u8>> = Vec::new();
     let mut configs: Vec<Vec<LigeroArg>> = Vec::new();
     let mut all_priv_idx: Vec<Vec<usize>> = Vec::new();
-    let mut all_keep_priv_idx: Vec<Vec<usize>> = Vec::new();
     let mut last_prover_stdout = String::new();
     let mut last_prover_time = Duration::default();
     let mut last_proof_size = 0usize;
 
     for run in 0..num_runs {
-        let (args, mut priv_idx, keep_priv_idx) = if run == 0 {
-            (
-                run0_args.clone(),
-                run0_priv_idx.clone(),
-                run0_keep_priv_idx.clone(),
-            )
+        let (args, priv_idx) = if run == 0 {
+            (run0_args.clone(), run0_priv_idx.clone())
         } else {
             match use_case {
                 NoteSpendUseCase::Deposit => {
                     let args = build_deposit_statement(run, domain, value)?;
                     let priv_idx = private_indices_note_deposit();
-                    (args, priv_idx, Vec::new())
+                    (args, priv_idx)
                 }
                 NoteSpendUseCase::Transfer | NoteSpendUseCase::Withdraw => {
-                    let (args, summary, keep_priv_idx) =
+                    let (args, summary) =
                         build_statement(run, depth, domain, value, pos, use_case, include_viewers)?;
                     let priv_idx = private_indices_note_spend(
                         depth,
@@ -1846,16 +1835,10 @@ fn run_note_spend_direct_bench(
                         summary.n_out,
                         matches!(use_case, NoteSpendUseCase::Transfer),
                     );
-                    (args, priv_idx, keep_priv_idx)
+                    (args, priv_idx)
                 }
             }
         };
-
-        // Some circuit extensions require a subset of private inputs to be present for the verifier
-        // binary (e.g. viewer attestations need `fvk` to reconstruct the same instance).
-        priv_idx.extend_from_slice(&keep_priv_idx);
-        priv_idx.sort_unstable();
-        priv_idx.dedup();
         runner.config_mut().private_indices = priv_idx.clone();
         runner.config_mut().args = args.clone();
 
@@ -1896,7 +1879,6 @@ fn run_note_spend_direct_bench(
         proofs.push(proof);
         configs.push(args);
         all_priv_idx.push(priv_idx);
-        all_keep_priv_idx.push(keep_priv_idx);
     }
 
     // Verify the proofs (timed).
@@ -1910,21 +1892,19 @@ fn run_note_spend_direct_bench(
     let mut last_verifier_stdout = String::new();
     let mut last_verifier_time = Duration::default();
 
-    for (i, (((proof, args), priv_idx), keep_priv_idx)) in proofs
+    for (i, ((proof, args), priv_idx)) in proofs
         .iter()
         .zip(configs.iter())
         .zip(all_priv_idx.iter())
-        .zip(all_keep_priv_idx.iter())
         .enumerate()
     {
         let tv = Instant::now();
-        let (ok, vs, ve) = verifier::verify_proof_with_output_keep_private_args_in_pool(
+        let (ok, vs, ve) = verifier::verify_proof_with_output_in_pool(
             &verifier_pool,
             &vpaths,
             proof,
             args.clone(),
             priv_idx.clone(),
-            keep_priv_idx.clone(),
         )?;
         let vd = tv.elapsed();
         last_verifier_time = vd;
@@ -1975,13 +1955,12 @@ fn run_note_spend_direct_bench(
                 if i == j {
                     continue;
                 }
-                match verifier::verify_proof_with_output_keep_private_args_in_pool(
+                match verifier::verify_proof_with_output_in_pool(
                     &verifier_pool,
                     &vpaths,
                     &proofs[i],
                     configs[j].clone(),
                     all_priv_idx[j].clone(),
-                    all_keep_priv_idx[j].clone(),
                 ) {
                     Ok((ok, _vs, _ve)) => {
                         anyhow::ensure!(

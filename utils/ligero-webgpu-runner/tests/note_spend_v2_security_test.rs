@@ -1424,7 +1424,6 @@ fn test_note_spend_v2_max_bounds_sanity() -> Result<()> {
         .map(|o| recipient_from_pk(&domain, &o.pk_spend, &o.pk_ivk))
         .collect();
 
-    let mut keep_priv_idx: Vec<usize> = Vec::new();
     for v in 0..n_viewers {
         let fvk: Hash32 = [0x80u8.wrapping_add(v as u8); 32];
         let fvk_c = fvk_commit(&fvk);
@@ -1433,7 +1432,6 @@ fn test_note_spend_v2_max_bounds_sanity() -> Result<()> {
         let fvk_idx1 = args.len() + 1; // 1-based index of next arg
         args.push(LigeroArg::Hex { hex: hx32(&fvk) });
         priv_idx.push(fvk_idx1);
-        keep_priv_idx.push(fvk_idx1);
 
         for j in 0..outputs.len() {
             let cm = &info.cm_outs[j];
@@ -1464,13 +1462,8 @@ fn test_note_spend_v2_max_bounds_sanity() -> Result<()> {
         }
     };
 
-    let (ok, _stdout, _stderr) = verifier::verify_proof_with_output_keep_private_args(
-        &vpaths,
-        &proof,
-        args,
-        priv_idx,
-        keep_priv_idx,
-    )?;
+    let (ok, _stdout, _stderr) =
+        verifier::verify_proof_with_output(&vpaths, &proof, args, priv_idx)?;
     anyhow::ensure!(ok, "max-bounds sanity proof must verify");
 
     Ok(())
