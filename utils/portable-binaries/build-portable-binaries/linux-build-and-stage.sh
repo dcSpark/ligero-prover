@@ -37,7 +37,8 @@ Environment:
   CMAKE_JOB_COUNT  Parallel build jobs
   DAWN_GIT_REF      Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
   LIGERO_REPO       Ligero prover git URL (default: https://github.com/dcspark/ligero-prover.git)
-  LIGERO_BRANCH     Ligero prover git branch (default: feature/midnight-l2)
+  LIGERO_BRANCH     Ligero prover git branch (default: main)
+  FORCE_DOWNLOAD    Ignored in Docker (no persistent cache); included for parity with macOS script
 EOF
 }
 
@@ -209,7 +210,7 @@ trap cleanup EXIT
 
 DAWN_GIT_REF="${DAWN_GIT_REF:-cec4482eccee45696a7c0019e750c77f101ced04}"
 LIGERO_REPO="${LIGERO_REPO:-https://github.com/dcspark/ligero-prover.git}"
-LIGERO_BRANCH="${LIGERO_BRANCH:-feature/midnight-l2}"
+LIGERO_BRANCH="${LIGERO_BRANCH:-main}"
 
 DEPOT_TOOLS_DIR="$TMP_ROOT/depot_tools"
 DAWN_SRC="$TMP_ROOT/dawn"

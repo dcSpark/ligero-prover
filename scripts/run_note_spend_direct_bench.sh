@@ -24,6 +24,11 @@ export LIGERO_RUNS="${LIGERO_RUNS:-1}"
 # Enable viewer attestations by default for this benchmark (transfer/withdraw only).
 export LIGERO_ENABLE_VIEWERS="${LIGERO_ENABLE_VIEWERS:-1}"
 
+# Prefer locally-built binaries (if present) over packaged portable ones.
+if [[ -x "$REPO_ROOT/build/webgpu_prover" ]]; then
+    export LIGERO_PROVER_BIN="$REPO_ROOT/build/webgpu_prover"
+fi
+
 # Colors for output
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'

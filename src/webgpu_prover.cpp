@@ -20,14 +20,26 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <format>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_set>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <transpiler.hpp>
 #include <interpreter.hpp>
@@ -76,8 +88,164 @@ struct DaemonError final : public std::runtime_error {
     std::exit(EXIT_FAILURE);
 }
 
+static std::vector<u8> decode_base64_arg_or_fail(std::string_view in, bool daemon_mode) {
+    // RFC 4648 base64 decoder (lenient: strips ASCII whitespace; supports '+'/'/' and URL-safe '-'/'_').
+    // Returns raw bytes with no terminator.
+
+    // 1) strip whitespace and reject embedded NULs (JSON strings should not contain them, but be safe).
+    std::string s;
+    s.reserve(in.size());
+    for (unsigned char c : in) {
+        if (c == '\0') {
+            fail(daemon_mode, "Error: bytes_b64 arg contains embedded NUL byte");
+        }
+        if (std::isspace(c) != 0) {
+            continue;
+        }
+        s.push_back(static_cast<char>(c));
+    }
+
+    if (s.empty()) {
+        return {};
+    }
+
+    const size_t rem = s.size() % 4;
+    if (rem == 1) {
+        fail(daemon_mode, "Error: invalid base64 length (mod 4 == 1)");
+    }
+    if (rem != 0) {
+        // Accept unpadded base64 by adding '=' padding.
+        s.append(4 - rem, '=');
+    }
+
+    auto val = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return static_cast<int>(c - 'A');
+        if (c >= 'a' && c <= 'z') return static_cast<int>(c - 'a' + 26);
+        if (c >= '0' && c <= '9') return static_cast<int>(c - '0' + 52);
+        if (c == '+' || c == '-') return 62;  // '-' = URL-safe '+'
+        if (c == '/' || c == '_') return 63;  // '_' = URL-safe '/'
+        return -1;
+    };
+
+    std::vector<u8> out;
+    out.reserve((s.size() / 4) * 3);
+
+    for (size_t i = 0; i < s.size(); i += 4) {
+        const unsigned char c0 = static_cast<unsigned char>(s[i]);
+        const unsigned char c1 = static_cast<unsigned char>(s[i + 1]);
+        const unsigned char c2 = static_cast<unsigned char>(s[i + 2]);
+        const unsigned char c3 = static_cast<unsigned char>(s[i + 3]);
+
+        const int v0 = val(c0);
+        const int v1 = val(c1);
+        if (v0 < 0 || v1 < 0) {
+            fail(daemon_mode, "Error: invalid base64 character");
+        }
+
+        if (c2 == '=') {
+            // Only legal as '==', and only in the final quantum.
+            if (c3 != '=' || i + 4 != s.size()) {
+                fail(daemon_mode, "Error: invalid base64 padding");
+            }
+            out.push_back(static_cast<u8>((v0 << 2) | (v1 >> 4)));
+            break;
+        }
+
+        const int v2 = val(c2);
+        if (v2 < 0) {
+            fail(daemon_mode, "Error: invalid base64 character");
+        }
+
+        if (c3 == '=') {
+            // Only legal in the final quantum.
+            if (i + 4 != s.size()) {
+                fail(daemon_mode, "Error: invalid base64 padding");
+            }
+            out.push_back(static_cast<u8>((v0 << 2) | (v1 >> 4)));
+            out.push_back(static_cast<u8>(((v1 & 0x0f) << 4) | (v2 >> 2)));
+            break;
+        }
+
+        const int v3 = val(c3);
+        if (v3 < 0) {
+            fail(daemon_mode, "Error: invalid base64 character");
+        }
+
+        out.push_back(static_cast<u8>((v0 << 2) | (v1 >> 4)));
+        out.push_back(static_cast<u8>(((v1 & 0x0f) << 4) | (v2 >> 2)));
+        out.push_back(static_cast<u8>(((v2 & 0x03) << 6) | v3));
+    }
+
+    return out;
+}
+
 struct NullBuffer final : public std::streambuf {
-    int overflow(int c) override { return c; }
+    using int_type = std::streambuf::int_type;
+    int_type overflow(int_type ch) override { return traits_type::not_eof(ch); }
+    int sync() override { return 0; }
+};
+
+#if !defined(_WIN32)
+struct ScopedStdoutFdNull final {
+    int saved_fd = -1;
+
+    explicit ScopedStdoutFdNull(bool daemon_mode) {
+        // In daemon mode, stdout is reserved for the JSON protocol. Redirect FD 1 to /dev/null
+        // while running the prover so *any* stdout writes (printf, puts, library logs) do not
+        // corrupt the protocol stream.
+        std::fflush(stdout);
+        saved_fd = ::dup(1);
+        if (saved_fd < 0) {
+            fail(daemon_mode, "Error: failed to dup stdout fd");
+        }
+
+        const int null_fd = ::open("/dev/null", O_WRONLY);
+        if (null_fd < 0) {
+            ::close(saved_fd);
+            saved_fd = -1;
+            fail(daemon_mode, "Error: failed to open /dev/null for stdout redirection");
+        }
+
+        if (::dup2(null_fd, 1) < 0) {
+            ::close(null_fd);
+            ::close(saved_fd);
+            saved_fd = -1;
+            fail(daemon_mode, "Error: failed to redirect stdout fd to /dev/null");
+        }
+
+        ::close(null_fd);
+    }
+
+    ScopedStdoutFdNull(const ScopedStdoutFdNull&) = delete;
+    ScopedStdoutFdNull& operator=(const ScopedStdoutFdNull&) = delete;
+
+    ~ScopedStdoutFdNull() {
+        if (saved_fd >= 0) {
+            std::fflush(stdout);
+            ::dup2(saved_fd, 1);
+            ::close(saved_fd);
+            saved_fd = -1;
+        }
+    }
+};
+#endif
+
+struct ScopedCoutSilence final {
+    std::ostream& out;
+    std::streambuf* saved_buf;
+
+    explicit ScopedCoutSilence(std::ostream& out, std::streambuf* new_buf)
+        : out(out), saved_buf(out.rdbuf(new_buf)) {
+        out.clear();
+    }
+
+    ScopedCoutSilence(const ScopedCoutSilence&) = delete;
+    ScopedCoutSilence& operator=(const ScopedCoutSilence&) = delete;
+
+    ~ScopedCoutSilence() {
+        out.rdbuf(saved_buf);
+        out.clear();
+    }
 };
 
 struct ProverDaemonCache {
@@ -150,12 +318,17 @@ static void ensure_cached_module(ProverDaemonCache& cache, const fs::path& progr
     }
 
     const bool same_path = (!cache.program_path.empty() && cache.program_path == program_name);
-    const bool same_mtime =
-        same_path && cache.program_mtime.has_value() && mt.has_value() &&
-        *cache.program_mtime == *mt;
-
-    if (cache.module && same_path && (same_mtime || !mt.has_value() || !cache.program_mtime.has_value())) {
-        return;
+    if (cache.module && same_path) {
+        // If we can read an mtime now, require that it matches the cached one; if the cached mtime is
+        // missing but a current mtime is available, reload once to establish a reliable baseline.
+        if (mt.has_value()) {
+            if (cache.program_mtime.has_value() && *cache.program_mtime == *mt) {
+                return;
+            }
+        } else {
+            // No current mtime: best-effort reuse by path.
+            return;
+        }
     }
 
     cache.module = parse_wasm_module_or_fail(program_name, daemon_mode);
@@ -211,7 +384,16 @@ std::string make_temp_proof_path(bool gzip_proof) {
     const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const uint64_t c = ++ctr;
-    fs::path dir = fs::temp_directory_path() / std::format("ligero-proof-{}-{}", now_us, c);
+    const uint64_t r = (static_cast<uint64_t>(std::random_device{}()) << 32) ^
+                       static_cast<uint64_t>(std::random_device{}());
+    int pid = 0;
+#if defined(_WIN32)
+    pid = _getpid();
+#else
+    pid = ::getpid();
+#endif
+    fs::path dir = fs::temp_directory_path() /
+                   std::format("ligero-proof-{}-{}-{}-{:016x}", pid, now_us, c, r);
     fs::create_directories(dir);
     return (dir / (gzip_proof ? "proof_data.gz" : "proof_data.bin")).string();
 }
@@ -243,7 +425,10 @@ int run_prover_from_config(const json& jconfig,
     if (jconfig.contains("proof-path")) {
         proof_name = jconfig["proof-path"].template get<std::string>();
         try {
-            fs::create_directories(fs::path(proof_name).parent_path());
+            const auto parent = fs::path(proof_name).parent_path();
+            if (!parent.empty()) {
+                fs::create_directories(parent);
+            }
         } catch (const std::exception& e) {
             fail(daemon_mode,
                  std::format("Error: failed to create proof directory for {}: {}",
@@ -281,54 +466,87 @@ int run_prover_from_config(const json& jconfig,
         const std::string arg0("Ligero");
         input_args.emplace_back((u8*)arg0.c_str(), (u8*)arg0.c_str() + arg0.size() + 1);
     }
+
+    // NOTE [byte args: `hex` and `bytes_b64`]
+    //
+    // JSON configs cannot carry raw bytes directly, so we encode byte strings as either:
+    // - `{"hex":"..."}`      (hex string, optionally `0x`-prefixed), or
+    // - `{"bytes_b64":"..."}` (base64 string).
+    //
+    // Both are decoded here and passed to the WASM guest as raw bytes (no terminator). Guests should
+    // use `args.get_as_bytes()` to read them.
+    //
+    // Rationale: decoding on the host avoids expensive per-proof parsing inside the WASM guest
+    // (especially when many 32-byte values are passed). Prefer `bytes_b64` for large blobs since it
+    // is more compact than hex in JSON.
     
+    const bool log_args = !daemon_mode && (std::getenv("LIGERO_LOG_ARGS") != nullptr);
     if (jconfig.contains("args")) {
+        size_t arg_idx = 0;
         for (const auto& arg : jconfig["args"]) {
-            std::cout << "args: " << arg.dump() << std::endl;
+            ++arg_idx;
             
             if (arg.contains("i64")) {
                 auto i = arg["i64"].template get<int64_t>();
+                if (log_args) {
+                    std::cout << "[arg#" << arg_idx << "] i64\n";
+                }
                 input_args.emplace_back((u8*)&i, (u8*)&i + sizeof(int64_t));
             }
             else if (arg.contains("str")) {
                 auto str = arg["str"].template get<std::string>();
+                if (log_args) {
+                    std::cout << "[arg#" << arg_idx << "] str len=" << str.size() << "\n";
+                }
                 input_args.emplace_back((u8*)str.c_str(), (u8*)str.c_str() + str.size() + 1);
             }
+            else if (arg.contains("bytes_b64")) {
+                const std::string b64 = arg["bytes_b64"].template get<std::string>();
+                if (log_args) {
+                    std::cout << "[arg#" << arg_idx << "] bytes_b64 chars=" << b64.size() << "\n";
+                }
+                input_args.emplace_back(decode_base64_arg_or_fail(b64, daemon_mode));
+            }
             else if (arg.contains("hex")) {
-                // Pass hex as ASCII string (not decoded bytes) - guest parses it
                 std::string hex_str = arg["hex"].template get<std::string>();
+                if (log_args) {
+                    std::cout << "[arg#" << arg_idx << "] hex chars=" << hex_str.size() << "\n";
+                }
 
-                // Ensure no embedded NULs (would truncate if guest uses C-string ops)
+                // Reject embedded NULs (should not be present in JSON strings, but be safe).
                 if (hex_str.find('\0') != std::string::npos) {
                     fail(daemon_mode, "Error: hex arg contains embedded NUL byte");
                 }
 
-                // Ensure 0x prefix (guest/SDK expects it for base-0 parsing)
-                if (!(hex_str.size() >= 2 && hex_str[0] == '0' &&
-                      (hex_str[1] == 'x' || hex_str[1] == 'X'))) {
-                    hex_str = "0x" + hex_str;
-                } else if (hex_str[1] == 'X') {
-                    hex_str[1] = 'x';  // normalize to lowercase
+                // Strip optional 0x prefix.
+                if (hex_str.size() >= 2 && hex_str[0] == '0' &&
+                    (hex_str[1] == 'x' || hex_str[1] == 'X')) {
+                    hex_str.erase(0, 2);
                 }
 
-                // Pad odd digit counts with leading 0 (after 0x) for proper byte alignment
-                const size_t digit_count = hex_str.size() - 2;
-                if (digit_count % 2 == 1) {
-                    hex_str.insert(hex_str.begin() + 2, '0');
+                // Pad odd digit counts with leading 0 for proper byte alignment.
+                if (hex_str.size() % 2 == 1) {
+                    hex_str.insert(hex_str.begin(), '0');
                 }
 
-                // Validate hex characters
+                // Validate hex characters.
                 auto is_hex_digit = [](unsigned char c) { return std::isxdigit(c) != 0; };
-                if (!std::all_of(hex_str.begin() + 2, hex_str.end(), is_hex_digit)) {
+                if (!std::all_of(hex_str.begin(), hex_str.end(), is_hex_digit)) {
                     fail(daemon_mode, std::format("Error: invalid hex string: {}", hex_str));
                 }
 
-                // Pass as ASCII string with explicit NUL terminator
-                std::vector<u8> buf(hex_str.size() + 1);
-                std::memcpy(buf.data(), hex_str.data(), hex_str.size());
-                buf[hex_str.size()] = 0;
-
-                input_args.emplace_back(std::move(buf));
+                // Decode hex string to raw bytes (no terminator); guest reads bytes directly.
+                std::vector<u8> raw;
+                raw.reserve(hex_str.size() / 2);
+                try {
+                    boost::algorithm::unhex(hex_str.begin(), hex_str.end(),
+                                           std::back_inserter(raw));
+                } catch (const std::exception& e) {
+                    fail(daemon_mode,
+                         std::format("Error: failed to decode hex string: {} ({})", hex_str,
+                                     e.what()));
+                }
+                input_args.emplace_back(std::move(raw));
             }
             else {
                 fail(daemon_mode, std::format("Error: Invalid args type: {}", arg.dump()));
@@ -518,7 +736,13 @@ int run_prover_from_config(const json& jconfig,
     // -------------------------------------------------------------------------------- //
     std::cout << "Start Stage 3" << std::endl;
 
-    std::stringstream proof_bytes;
+    std::ofstream proof_file(proof_name,
+                             std::ios::out | std::ios::binary | std::ios::trunc);
+
+    if (!proof_file) {
+        fail(daemon_mode, std::format("Error: Could not write to file \"{}\"", proof_name));
+    }
+
     {
         auto t3 = make_timer("stage3");
 
@@ -527,7 +751,7 @@ int run_prover_from_config(const json& jconfig,
             constexpr int gzip_compression_level = 6;
             proof_stream.push(io::gzip_compressor(io::gzip_params(gzip_compression_level)));
         }
-        proof_stream.push(proof_bytes);
+        proof_stream.push(proof_file);
         portable_binary_oarchive oa(proof_stream);
     
         oa << stage1_root
@@ -549,14 +773,6 @@ int run_prover_from_config(const json& jconfig,
         run_program(*wabt_module_ptr, *ctx3, input_args, indices_set);
     }
 
-    std::ofstream proof_file(proof_name,
-                             std::ios::out | std::ios::binary | std::ios::trunc);
-
-    if (!proof_file) {
-        fail(daemon_mode, std::format("Error: Could not write to file \"{}\"", proof_name));
-    }
-
-    proof_file << proof_bytes.rdbuf();
     proof_file.close();
 
     // ================================================================================
@@ -603,7 +819,6 @@ int main(int argc, const char *argv[]) {
         // stdout is reserved for the protocol, so silence normal informational logs while proving.
         NullBuffer null_buf;
         std::ostream null_out(&null_buf);
-        auto* orig_cout_buf = std::cout.rdbuf();
 
         ProverDaemonCache cache;
 
@@ -617,28 +832,30 @@ int main(int argc, const char *argv[]) {
                 }
 
                 std::string proof_path;
-                std::cout.rdbuf(null_out.rdbuf());
-                int exit_code =
-                    run_prover_from_config(jconfig, /*daemon_mode=*/true, &proof_path, &cache);
-                std::cout.rdbuf(orig_cout_buf);
+                {
+#if !defined(_WIN32)
+                    ScopedStdoutFdNull fd_null(/*daemon_mode=*/true);
+#endif
+                    ScopedCoutSilence silence(std::cout, null_out.rdbuf());
+                    int exit_code =
+                        run_prover_from_config(jconfig, /*daemon_mode=*/true, &proof_path, &cache);
+                    resp["ok"] = (exit_code == 0);
+                    resp["exit_code"] = exit_code;
+                    resp["proof_path"] = proof_path;
+                }
 
-                resp["ok"] = (exit_code == 0);
-                resp["exit_code"] = exit_code;
-                resp["proof_path"] = proof_path;
             } catch (const json::exception& e) {
-                std::cout.rdbuf(orig_cout_buf);
                 resp["ok"] = false;
                 resp["error"] = std::string("json parse error: ") + e.what();
             } catch (const DaemonError& e) {
-                std::cout.rdbuf(orig_cout_buf);
                 resp["ok"] = false;
                 resp["error"] = e.what();
             } catch (const std::exception& e) {
-                std::cout.rdbuf(orig_cout_buf);
                 resp["ok"] = false;
                 resp["error"] = e.what();
             }
 
+            std::cout.clear();
             std::cout << resp.dump() << "\n" << std::flush;
         }
         return 0;

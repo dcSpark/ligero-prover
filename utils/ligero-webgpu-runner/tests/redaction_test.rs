@@ -198,6 +198,7 @@ fn test_note_spend_argument_layout_shape() {
     let depth: usize = 4; // Use smaller depth for test
     let n_in: usize = 1;
     let n_out: usize = 1;
+    let bl_depth: usize = 16;
 
     // Build argument vector matching note-spend v2 layout (see utils/circuits/note-spend/src/main.rs)
     let mut args: Vec<LigeroArg> = Vec::new();
@@ -224,14 +225,8 @@ fn test_note_spend_argument_layout_shape() {
     // 9: sender_id_in_0 (hex) - PRIVATE
     args.push(LigeroArg::Hex { hex: hex32(0x06) });
 
-    // 10..(9+depth): position bits - PRIVATE
-    for i in 0..depth {
-        let mut bit_bytes = [0u8; 32];
-        bit_bytes[31] = (i % 2) as u8; // Alternating bits
-        args.push(LigeroArg::Hex {
-            hex: hex::encode(bit_bytes),
-        });
-    }
+    // 10: pos_in_0 (i64) - PRIVATE
+    args.push(LigeroArg::I64 { i64: 0 });
 
     // siblings - PRIVATE
     for i in 0..depth {
@@ -245,6 +240,8 @@ fn test_note_spend_argument_layout_shape() {
 
     // withdraw_amount (i64) - PUBLIC
     args.push(LigeroArg::I64 { i64: 200 });
+    // withdraw_to (hex) - PUBLIC
+    args.push(LigeroArg::Hex { hex: hex32(0x00) });
     // n_out (i64) - PUBLIC
     args.push(LigeroArg::I64 { i64: n_out as i64 });
 
@@ -262,6 +259,24 @@ fn test_note_spend_argument_layout_shape() {
     // inv_enforce (hex) - PRIVATE
     args.push(LigeroArg::Hex { hex: hex32(0xEF) });
 
+    // blacklist_root (hex) - PUBLIC
+    args.push(LigeroArg::Hex { hex: hex32(0xF0) });
+    // bl_bucket_entries (hex) - PRIVATE
+    const BL_BUCKET_SIZE: usize = 12;
+    for i in 0..BL_BUCKET_SIZE {
+        args.push(LigeroArg::Hex {
+            hex: hex32(0xF1 + i as u8),
+        });
+    }
+    // bl_bucket_inv (hex) - PRIVATE
+    args.push(LigeroArg::Hex { hex: hex32(0xFE) });
+    // bl_siblings - PRIVATE
+    for i in 0..bl_depth {
+        args.push(LigeroArg::Hex {
+            hex: hex32(0x20 + i as u8),
+        });
+    }
+
     // Private indices (1-based)
     let mut private_indices: Vec<usize> = Vec::new();
     private_indices.push(2); // spend_sk
@@ -269,19 +284,28 @@ fn test_note_spend_argument_layout_shape() {
     private_indices.push(7); // value_in_0
     private_indices.push(8); // rho_in_0
     private_indices.push(9); // sender_id_in_0
+    private_indices.push(10); // pos_in_0
     for i in 0..depth {
-        private_indices.push(10 + i); // pos_bits
-        private_indices.push(10 + depth + i); // siblings
+        private_indices.push(11 + i); // siblings
     }
     // Outputs: value, rho, pk_spend, pk_ivk are private
-    let per_in = 4 + 2 * depth;
+    let per_in = 5 + depth;
     let withdraw_idx = 7 + n_in * per_in;
-    let out0_base = withdraw_idx + 2; // 1-based index of value_out_0
+    let out0_base = withdraw_idx + 3; // 1-based index of value_out_0
     private_indices.push(out0_base + 0); // value_out_0
     private_indices.push(out0_base + 1); // rho_out_0
     private_indices.push(out0_base + 2); // pk_spend_out_0
     private_indices.push(out0_base + 3); // pk_ivk_out_0
     private_indices.push(out0_base + 5); // inv_enforce
+    let inv_enforce_idx = out0_base + 5;
+    let blacklist_root_idx = inv_enforce_idx + 1;
+    for i in 0..BL_BUCKET_SIZE {
+        private_indices.push(blacklist_root_idx + 1 + i); // bl_bucket_entry
+    }
+    private_indices.push(blacklist_root_idx + 1 + BL_BUCKET_SIZE); // bl_bucket_inv
+    for i in 0..bl_depth {
+        private_indices.push(blacklist_root_idx + 2 + BL_BUCKET_SIZE + i); // bl_sibling
+    }
 
     let redacted = redacted_args(&args, &private_indices);
     assert_eq!(redacted.len(), args.len());
@@ -291,8 +315,17 @@ fn test_note_spend_argument_layout_shape() {
     assert_eq!(redacted[3], args[3]); // depth
     assert_eq!(redacted[4], args[4]); // anchor
     assert_eq!(redacted[5], args[5]); // n_in
-    assert_eq!(redacted[17], args[17]); // nullifier_0
-    assert_eq!(redacted[18], args[18]); // withdraw_amount
-    assert_eq!(redacted[19], args[19]); // n_out
-    assert_eq!(redacted[24], args[24]); // cm_out_0
+    let nullifier0_idx = 7 + 4 + depth; // 1-based index
+    assert_eq!(redacted[nullifier0_idx - 1], args[nullifier0_idx - 1]); // nullifier_0
+    assert_eq!(redacted[withdraw_idx - 1], args[withdraw_idx - 1]); // withdraw_amount
+    assert_eq!(redacted[withdraw_idx], args[withdraw_idx]); // withdraw_to
+    assert_eq!(redacted[withdraw_idx + 1], args[withdraw_idx + 1]); // n_out
+    assert_eq!(
+        redacted[out0_base + 4 - 1],
+        args[out0_base + 4 - 1]
+    ); // cm_out_0
+    assert_eq!(
+        redacted[blacklist_root_idx - 1],
+        args[blacklist_root_idx - 1]
+    ); // blacklist_root
 }
