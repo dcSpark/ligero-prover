@@ -1252,8 +1252,8 @@ fn main() {
             v_idx += 1;
             assert_fr_eq_hash32(&ct_h_fr, &ct_hash_arg);
 
-            let ct_hash_arg_fr = hash32_to_fr_bytes(&ct_hash_arg);
-            let macv_fr = view_mac_fr(&h, &k, &cm_fr, &ct_hash_arg_fr);
+            let ct_hash_bytes = fr_to_bytes_be_bits(&ct_h_fr);
+            let macv_fr = view_mac_fr(&h, &k, &cm_fr, &ct_hash_bytes);
 
             let mac_arg = read_hash32(&args, v_idx);
             v_idx += 1;
