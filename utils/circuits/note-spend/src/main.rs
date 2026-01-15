@@ -374,6 +374,16 @@ fn hash32_to_fr_bytes(h: &Hash32) -> [Bn254Fr; 32] {
     out
 }
 
+/// Convert a private 32-byte array into field-byte elements and enforce 8-bit range.
+#[inline(always)]
+fn hash32_to_fr_bytes_range_checked(h: &Hash32) -> [Bn254Fr; 32] {
+    let out = hash32_to_fr_bytes(h);
+    for i in 0..32 {
+        let _ = out[i].to_bits(8);
+    }
+    out
+}
+
 /// Convert a public 32-byte array into field-byte elements and bind each byte.
 #[inline(always)]
 fn hash32_to_fr_bytes_constrained(h: &Hash32) -> [Bn254Fr; 32] {
@@ -1251,7 +1261,7 @@ fn main() {
         let fvk_priv = read_hash32(&args, v_idx);
         v_idx += 1;
 
-        let fvk_priv_fr = hash32_to_fr_bytes(&fvk_priv);
+        let fvk_priv_fr = hash32_to_fr_bytes_range_checked(&fvk_priv);
         let fvk_c_fr = fvk_commit_fr(&h, &fvk_priv_fr);
         assert_fr_eq_hash32(&fvk_c_fr, &fvk_commit_pub);
 
