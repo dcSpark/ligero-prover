@@ -374,6 +374,16 @@ fn hash32_to_fr_bytes(h: &Hash32) -> [Bn254Fr; 32] {
     out
 }
 
+/// Convert a public 32-byte array into field-byte elements and bind each byte.
+#[inline(always)]
+fn hash32_to_fr_bytes_constrained(h: &Hash32) -> [Bn254Fr; 32] {
+    let out = hash32_to_fr_bytes(h);
+    for i in 0..32 {
+        Bn254Fr::assert_equal_bytes_be(&out[i], &h[i..i + 1]);
+    }
+    out
+}
+
 /// Convert a 144-byte array into field-byte elements (byte value only).
 #[inline(always)]
 fn bytes144_to_fr_bytes(bytes: &[u8; NOTE_PLAIN_LEN]) -> [Bn254Fr; NOTE_PLAIN_LEN] {
@@ -1225,6 +1235,12 @@ fn main() {
         );
     }
 
+    let mut out_cm_fr: [[Bn254Fr; 32]; MAX_OUTS] =
+        std::array::from_fn(|_| std::array::from_fn(|_| Bn254Fr::new()));
+    for j in 0..n_out {
+        out_cm_fr[j] = hash32_to_fr_bytes_constrained(&outs[j].cm);
+    }
+
     let mut v_idx = base_after_outs + 1; // start right after n_viewers
     for _vi in 0..n_viewers {
         // PUBLIC: commitment/hash of the viewer key material.
@@ -1240,9 +1256,8 @@ fn main() {
         assert_fr_eq_hash32(&fvk_c_fr, &fvk_commit_pub);
 
         for j in 0..n_out {
-            let outp = &outs[j];
-            let cm_fr = hash32_to_fr_bytes(&outp.cm);
-            let k = view_kdf(&h, &fvk_priv_fr, &cm_fr);
+            let cm_fr = &out_cm_fr[j];
+            let k = view_kdf(&h, &fvk_priv_fr, cm_fr);
             let pt_fr = bytes144_to_fr_bytes(&out_pts[j]);
             let mut ct_fr: [Bn254Fr; NOTE_PLAIN_LEN] = std::array::from_fn(|_| Bn254Fr::new());
             stream_xor_encrypt_144(&h, &k, &pt_fr, &mut ct_fr);
@@ -1253,7 +1268,7 @@ fn main() {
             assert_fr_eq_hash32(&ct_h_fr, &ct_hash_arg);
 
             let ct_hash_bytes = fr_to_bytes_be_bits(&ct_h_fr);
-            let macv_fr = view_mac_fr(&h, &k, &cm_fr, &ct_hash_bytes);
+            let macv_fr = view_mac_fr(&h, &k, cm_fr, &ct_hash_bytes);
 
             let mac_arg = read_hash32(&args, v_idx);
             v_idx += 1;
