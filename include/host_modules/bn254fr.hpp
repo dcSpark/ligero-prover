@@ -377,6 +377,18 @@ struct bn254fr_module : public host_module {
                    mpz);
 
         assert(written <= size && "invalid number of bytes written");
+
+        // Propagate secrecy: if the field element is a witness, its byte representation should be
+        // treated as secret; otherwise keep it public.
+        //
+        // This is important for circuits that derive further witnesses from `get_bytes_*()` output
+        // (e.g. view-key stream cipher), so private-derived bytes don't accidentally become public
+        // constants in the verifier's reconstruction.
+        if (wit->is_witness()) {
+            ctx_->memory().mark_secret_closed(data_addr, data_addr + size);
+        } else {
+            ctx_->memory().unmark_closed(data_addr, data_addr + size);
+        }
     }
 
     void bn254fr_get_bytes() {
@@ -407,6 +419,14 @@ struct bn254fr_module : public host_module {
                 // Little-endian: zero-pad on the right
                 std::memset(mem + data_addr + count, 0, size - count);
             }
+        }
+
+        // Propagate secrecy: if the field element is a witness, its byte representation should be
+        // treated as secret; otherwise keep it public.
+        if (wit->is_witness()) {
+            ctx_->memory().mark_secret_closed(data_addr, data_addr + size);
+        } else {
+            ctx_->memory().unmark_closed(data_addr, data_addr + size);
         }
     }
 
