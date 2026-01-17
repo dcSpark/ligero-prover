@@ -1,4 +1,8 @@
-//! HTTP server for Ligero proving/verifying service.
+//! HTTP server for Ligero proving/verifying service using daemon mode.
+//!
+//! This server maintains long-lived `webgpu_prover --daemon` and `webgpu_verifier --daemon`
+//! processes for high-throughput proving and verification. This avoids the overhead of
+//! spawning a new process for each request.
 //!
 //! Exposes two synchronous POST endpoints:
 //! - `/prove` - Generate a proof for a given circuit and arguments
@@ -24,16 +28,22 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tiny_http::{Header, Method, Request, Response, Server};
 
+/// Global atomic counter to ensure unique proof directory IDs even under high concurrency.
+static PROOF_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 use ligero_runner::{
-    verifier::{verify_proof_with_output, VerifierPaths},
-    LigeroArg, LigeroPaths, LigeroRunner, ProverRunOptions,
+    daemon::DaemonPool,
+    redaction::redacted_args,
+    LigeroArg, LigeroPaths,
 };
 
 /// Request body for `/prove` and `/verify` endpoints.
@@ -49,7 +59,14 @@ struct ProveVerifyRequest {
     /// Optional private argument indices (1-based)
     #[serde(default, rename = "privateIndices")]
     private_indices: Vec<usize>,
+    /// Optional packing size (defaults to 8192)
+    #[serde(default)]
+    packing: Option<u32>,
+    /// Whether to gzip the proof (defaults to false)
+    #[serde(default)]
+    gzip: Option<bool>,
 }
+
 
 /// Response body for `/prove` and `/verify` endpoints.
 #[derive(Debug, Clone, Serialize)]
@@ -67,15 +84,23 @@ struct ProveVerifyResponse {
     error: Option<String>,
 }
 
-/// Shared state for the HTTP server.
+/// Shared state for the HTTP server with daemon pools.
 struct ServerState {
     paths: LigeroPaths,
+    prover_pool: DaemonPool,
+    verifier_pool: DaemonPool,
     proof_outputs_base: PathBuf,
     keep_proof_dir: bool,
 }
 
 impl ServerState {
-    fn new(paths: LigeroPaths, proof_outputs_base: Option<PathBuf>, keep_proof_dir: bool) -> Self {
+    fn new(
+        paths: LigeroPaths,
+        prover_pool: DaemonPool,
+        verifier_pool: DaemonPool,
+        proof_outputs_base: Option<PathBuf>,
+        keep_proof_dir: bool,
+    ) -> Self {
         let proof_outputs_base = proof_outputs_base.unwrap_or_else(|| {
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
@@ -83,6 +108,8 @@ impl ServerState {
         });
         Self {
             paths,
+            prover_pool,
+            verifier_pool,
             proof_outputs_base,
             keep_proof_dir,
         }
@@ -90,11 +117,19 @@ impl ServerState {
 
     /// Resolve circuit name to a program path.
     fn resolve_circuit(&self, circuit: &str) -> Result<String> {
-        // Try common naming patterns
+        // If the input looks like a path (contains / or \) or ends with .wasm,
+        // try to resolve it directly first without modifications.
+        if circuit.contains('/') || circuit.contains('\\') || circuit.ends_with(".wasm") {
+            if let Ok(path) = ligero_runner::resolve_program(circuit) {
+                return Ok(path.to_string_lossy().into_owned());
+            }
+        }
+
+        // Try common naming patterns for circuit names
         let candidates = [
+            circuit.to_string(),
             format!("{}_guest", circuit),
             format!("{}_guest.wasm", circuit),
-            circuit.to_string(),
             format!("{}.wasm", circuit),
         ];
 
@@ -111,7 +146,24 @@ impl ServerState {
         )
     }
 
-    /// Run the prover for the given request.
+    /// Build a Ligero config JSON Value for the daemon.
+    fn build_config(&self, req: &ProveVerifyRequest, program: &str, use_gzip: bool) -> Value {
+        let mut config = serde_json::json!({
+            "program": program,
+            "shader-path": self.paths.shader_dir.to_string_lossy(),
+            "packing": req.packing.unwrap_or(8192),
+            "gzip-proof": use_gzip,
+            "args": req.args,
+        });
+
+        if !req.private_indices.is_empty() {
+            config["private-indices"] = serde_json::json!(req.private_indices);
+        }
+
+        config
+    }
+
+    /// Run the prover for the given request using daemon pool.
     fn prove(&self, req: &ProveVerifyRequest) -> ProveVerifyResponse {
         let program = match self.resolve_circuit(&req.circuit) {
             Ok(p) => p,
@@ -125,54 +177,98 @@ impl ServerState {
             }
         };
 
-        let mut runner = LigeroRunner::new_with_paths(&program, self.paths.clone());
+        // Generate a unique proof output path for this request.
+        let counter = PROOF_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let proof_dir_name = format!("ligero_proof_http_{}_{}", timestamp, counter);
+        let proof_dir = self.proof_outputs_base.join(&proof_dir_name);
 
-        // Set private indices if provided
-        if !req.private_indices.is_empty() {
-            runner = runner.with_private_indices(req.private_indices.clone());
+        // Create the proof output directory
+        if let Err(e) = std::fs::create_dir_all(&proof_dir) {
+            return ProveVerifyResponse {
+                success: false,
+                exit_code: 1,
+                proof: None,
+                error: Some(format!("Failed to create proof directory: {}", e)),
+            };
         }
 
-        // Add arguments
-        for arg in &req.args {
-            runner.config_mut().args.push(arg.clone());
-        }
+        // Determine if we should use gzip (defaults to false)
+        let use_gzip = req.gzip.unwrap_or(false);
 
-        // Generate a unique proof dir ID
-        let proof_id = format!(
-            "http_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        runner.set_proof_dir_id(proof_id);
+        // Build config with ABSOLUTE proof output path (daemon runs in bins_dir)
+        let mut config = self.build_config(req, &program, use_gzip);
+        // Canonicalize to get absolute path for the proof file
+        let proof_filename = if use_gzip { "proof_data.gz" } else { "proof_data.bin" };
+        let proof_path_abs = proof_dir
+            .canonicalize()
+            .unwrap_or_else(|_| proof_dir.clone())
+            .join(proof_filename);
+        config["proof-path"] = Value::String(proof_path_abs.to_string_lossy().to_string());
 
-        let options = ProverRunOptions {
-            keep_proof_dir: self.keep_proof_dir,
-            proof_outputs_base: Some(self.proof_outputs_base.clone()),
-            write_replay_script: true,
-        };
+        // Send to prover daemon
+        match self.prover_pool.prove(config) {
+            Ok(resp) => {
+                if resp.ok {
+                    // Read the proof file - prefer the path from daemon response, fallback to our absolute path
+                    let proof_file = resp
+                        .proof_path
+                        .as_ref()
+                        .map(PathBuf::from)
+                        .unwrap_or(proof_path_abs);
 
-        match runner.run_prover_with_options(options) {
-            Ok(proof_bytes) => {
-                let proof_b64 = BASE64.encode(&proof_bytes);
-                ProveVerifyResponse {
-                    success: true,
-                    exit_code: 0,
-                    proof: Some(proof_b64),
-                    error: None,
+                    match std::fs::read(&proof_file) {
+                        Ok(proof_bytes) => {
+                            // Clean up proof directory unless keeping it
+                            if !self.keep_proof_dir {
+                                let _ = std::fs::remove_dir_all(&proof_dir);
+                            }
+
+                            let proof_b64 = BASE64.encode(&proof_bytes);
+                            ProveVerifyResponse {
+                                success: true,
+                                exit_code: 0,
+                                proof: Some(proof_b64),
+                                error: None,
+                            }
+                        }
+                        Err(e) => ProveVerifyResponse {
+                            success: false,
+                            exit_code: 1,
+                            proof: None,
+                            error: Some(format!(
+                                "Prover daemon succeeded but failed to read proof: {}\nproof dir: {}",
+                                e,
+                                proof_dir.display()
+                            )),
+                        },
+                    }
+                } else {
+                    ProveVerifyResponse {
+                        success: false,
+                        exit_code: resp.exit_code.unwrap_or(1) as i32,
+                        proof: None,
+                        error: Some(format!(
+                            "Prover daemon failed: {}\nproof dir: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string()),
+                            proof_dir.display()
+                        )),
+                    }
                 }
             }
             Err(e) => ProveVerifyResponse {
                 success: false,
                 exit_code: 1,
                 proof: None,
-                error: Some(format!("Prover failed: {}", e)),
+                error: Some(format!("Prover daemon request failed: {}", e)),
             },
         }
     }
 
-    /// Run the verifier for the given request.
+    /// Run the verifier for the given request using daemon pool.
     fn verify(&self, req: &ProveVerifyRequest) -> ProveVerifyResponse {
         let proof_b64 = match &req.proof {
             Some(p) => p,
@@ -210,34 +306,69 @@ impl ServerState {
             }
         };
 
-        let verifier_paths = VerifierPaths::from_explicit(
-            PathBuf::from(&program),
-            self.paths.shader_dir.clone(),
-            self.paths.verifier_bin.clone(),
-            8192, // default packing
-        );
+        // Write proof to a temp file for the verifier daemon
+        let temp_dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => {
+                return ProveVerifyResponse {
+                    success: false,
+                    exit_code: 1,
+                    proof: None,
+                    error: Some(format!("Failed to create temp directory: {}", e)),
+                }
+            }
+        };
 
-        match verify_proof_with_output(
-            &verifier_paths,
-            &proof_bytes,
-            req.args.clone(),
-            req.private_indices.clone(),
-        ) {
-            Ok((success, _stdout, _stderr)) => ProveVerifyResponse {
-                success,
-                exit_code: if success { 0 } else { 1 },
+        // Detect if proof is gzip-compressed
+        let is_gzip = proof_bytes.len() >= 2 && proof_bytes[0] == 0x1f && proof_bytes[1] == 0x8b;
+        let proof_filename = if is_gzip {
+            "proof_data.gz"
+        } else {
+            "proof_data.bin"
+        };
+        let proof_path = temp_dir.path().join(proof_filename);
+
+        if let Err(e) = std::fs::write(&proof_path, &proof_bytes) {
+            return ProveVerifyResponse {
+                success: false,
+                exit_code: 1,
                 proof: None,
-                error: if success {
-                    None
-                } else {
-                    Some("Verification failed".to_string())
-                },
-            },
+                error: Some(format!("Failed to write proof file: {}", e)),
+            };
+        }
+
+        // Build config for verifier with redacted private args (preserving original lengths)
+        // Use detected gzip status from the proof bytes
+        let redacted_req = ProveVerifyRequest {
+            circuit: req.circuit.clone(),
+            args: redacted_args(&req.args, &req.private_indices),
+            proof: req.proof.clone(),
+            private_indices: req.private_indices.clone(),
+            packing: req.packing,
+            gzip: req.gzip,
+        };
+        let config = self.build_config(&redacted_req, &program, is_gzip);
+
+        // Send to verifier daemon
+        match self.verifier_pool.verify(config, &proof_path.to_string_lossy()) {
+            Ok(resp) => {
+                let success = resp.ok && resp.verify_ok == Some(true);
+                ProveVerifyResponse {
+                    success,
+                    exit_code: if success { 0 } else { resp.exit_code.unwrap_or(1) as i32 },
+                    proof: None,
+                    error: if success {
+                        None
+                    } else {
+                        Some(resp.error.unwrap_or_else(|| "Verification failed".to_string()))
+                    },
+                }
+            }
             Err(e) => ProveVerifyResponse {
                 success: false,
                 exit_code: 1,
                 proof: None,
-                error: Some(format!("Verifier failed: {}", e)),
+                error: Some(format!("Verifier daemon request failed: {}", e)),
             },
         }
     }
@@ -357,6 +488,8 @@ fn main() -> Result<()> {
     let mut proof_outputs: Option<PathBuf> = None;
     let mut keep_proof_dir = false;
     let mut num_threads: Option<usize> = None;
+    let mut prover_workers: Option<usize> = None;
+    let mut verifier_workers: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -378,19 +511,32 @@ fn main() -> Result<()> {
                 i += 1;
                 num_threads = Some(parse_usize("--threads", args.get(i))?);
             }
+            "--prover-workers" | "-p" => {
+                i += 1;
+                prover_workers = Some(parse_usize("--prover-workers", args.get(i))?);
+            }
+            "--verifier-workers" | "-v" => {
+                i += 1;
+                verifier_workers = Some(parse_usize("--verifier-workers", args.get(i))?);
+            }
             "--help" | "-h" => {
                 eprintln!(
-                    r#"Ligero HTTP Proving/Verifying Service
+                    r#"Ligero HTTP Proving/Verifying Service (Daemon Mode)
+
+This server uses long-lived daemon processes for high-throughput proving
+and verification, avoiding process spawn overhead per request.
 
 Usage:
   ligero-http-server [OPTIONS]
 
 Options:
-  -b, --bind <ADDR>          Bind address (default: 127.0.0.1:1313)
-  --proof-outputs <PATH>     Base directory for proof outputs
-  --keep-proof-dir           Keep proof directories after completion
-  -t, --threads <N>          Number of worker threads (default: CPU count)
-  -h, --help                 Show this help message
+  -b, --bind <ADDR>            Bind address (default: 127.0.0.1:1313)
+  --proof-outputs <PATH>       Base directory for proof outputs
+  --keep-proof-dir             Keep proof directories after completion
+  -t, --threads <N>            Number of HTTP worker threads (default: CPU count)
+  -p, --prover-workers <N>     Number of prover daemon workers (default: CPU count)
+  -v, --verifier-workers <N>   Number of verifier daemon workers (default: CPU count)
+  -h, --help                   Show this help message
 
 Endpoints:
   POST /prove   Generate a proof
@@ -438,23 +584,46 @@ Environment variables:
     tracing::info!("  Prover binary: {}", paths.prover_bin.display());
     tracing::info!("  Verifier binary: {}", paths.verifier_bin.display());
     tracing::info!("  Shader directory: {}", paths.shader_dir.display());
+    tracing::info!("  Bins directory: {}", paths.bins_dir.display());
 
-    let state = Arc::new(ServerState::new(paths, proof_outputs, keep_proof_dir));
+    // Calculate default worker counts
+    let default_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let prover_workers = prover_workers.unwrap_or(default_workers);
+    let verifier_workers = verifier_workers.unwrap_or(default_workers);
+
+    // Create daemon pools
+    tracing::info!("Starting {} prover daemon workers...", prover_workers);
+    let prover_pool = DaemonPool::new_prover(&paths, prover_workers)
+        .context("Failed to start prover daemon pool")?;
+    tracing::info!("✓ Prover daemon pool started");
+
+    tracing::info!("Starting {} verifier daemon workers...", verifier_workers);
+    let verifier_pool = DaemonPool::new_verifier(&paths, verifier_workers)
+        .context("Failed to start verifier daemon pool")?;
+    tracing::info!("✓ Verifier daemon pool started");
+
+    let state = Arc::new(ServerState::new(
+        paths,
+        prover_pool,
+        verifier_pool,
+        proof_outputs,
+        keep_proof_dir,
+    ));
 
     // Create the HTTP server
     let server = Server::http(bind_addr)
         .map_err(|e| anyhow::anyhow!("Failed to bind HTTP server: {}", e))?;
 
-    let num_threads = num_threads.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    });
+    let num_threads = num_threads.unwrap_or(default_workers);
 
     tracing::info!(
-        "Starting Ligero HTTP server on {} with {} worker threads",
+        "Starting Ligero HTTP server on {} with {} HTTP threads, {} prover daemons, {} verifier daemons",
         bind_addr,
-        num_threads
+        num_threads,
+        prover_workers,
+        verifier_workers
     );
 
     // Spawn worker threads

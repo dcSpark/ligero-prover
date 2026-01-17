@@ -9,7 +9,7 @@
 //! Configuration (environment variables):
 //! - TRANSFER_N: number of proofs per round (default: 16) (fallback if stdin prompt is skipped)
 //! - TRANSFER_ROUNDS: number of rounds (default: 1) (fallback if stdin prompt is skipped)
-//! - TRANSFER_TREE_DEPTH: Merkle tree depth (default: 16)
+//! - TRANSFER_TREE_DEPTH: Merkle tree depth (default: 8)
 //! - LIGERO_PACKING: packing (default: 8192)
 //! - LIGERO_GZIP_PROOF: whether to gzip proof files (default: false)
 //! - LIGERO_PROVER_WORKERS: default value for interactive prover concurrency (default: 1)
@@ -22,12 +22,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ligetron::poseidon2_hash_bytes;
+use ligetron::{poseidon2_hash_bytes, Bn254Fr};
 use rand::RngCore;
 
 use ligero_runner::{daemon::DaemonPool, LigeroArg, LigeroConfig, LigeroPaths};
 
 type Hash32 = [u8; 32];
+
+// Blacklist constants (must match circuit)
+const BL_BUCKET_SIZE: usize = 12;
+const BL_DEPTH: usize = 16;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -119,23 +123,34 @@ fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"MT_NODE_V1", &[&lvl, left, right])
 }
 
-fn note_commitment(domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash32) -> Hash32 {
-    // Guest encodes value as 16-byte LE (u64 zero-extended to 16 bytes).
+fn note_commitment(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> Hash32 {
     let mut v16 = [0u8; 16];
     v16[..8].copy_from_slice(&value.to_le_bytes());
-    poseidon2_hash_domain(b"NOTE_V1", &[domain, &v16, rho, recipient])
+    poseidon2_hash_domain(b"NOTE_V2", &[domain, &v16, rho, recipient, sender_id])
 }
 
 fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PK_V1", &[spend_sk])
 }
 
-fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
-    poseidon2_hash_domain(b"ADDR_V1", &[domain, pk])
+fn ivk_seed(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"IVK_SEED_V1", &[domain, spend_sk])
+}
+
+fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"ADDR_V2", &[domain, pk_spend, pk_ivk])
 }
 
 fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    recipient_from_pk(domain, &pk_from_sk(spend_sk))
+    let pk_spend = pk_from_sk(spend_sk);
+    let pk_ivk = ivk_seed(domain, spend_sk);
+    recipient_from_pk(domain, &pk_spend, &pk_ivk)
 }
 
 fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
@@ -144,6 +159,89 @@ fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
 
 fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PRF_NF_V1", &[domain, nf_key, rho])
+}
+
+fn fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
+    let mut fr = Bn254Fr::new();
+    fr.set_bytes_big(h);
+    fr
+}
+
+fn compute_inv_enforce(
+    in_values: &[u64],
+    in_rhos: &[Hash32],
+    out_values: &[u64],
+    out_rhos: &[Hash32],
+) -> Hash32 {
+    let mut prod = Bn254Fr::from_u32(1);
+    for &v in in_values {
+        prod.mulmod_checked(&Bn254Fr::from_u64(v));
+    }
+    for &v in out_values {
+        prod.mulmod_checked(&Bn254Fr::from_u64(v));
+    }
+    for out_rho in out_rhos {
+        let out_fr = fr_from_hash32_be(out_rho);
+        for in_rho in in_rhos {
+            let in_fr = fr_from_hash32_be(in_rho);
+            let mut delta = out_fr.clone();
+            delta.submod_checked(&in_fr);
+            prod.mulmod_checked(&delta);
+        }
+    }
+    if out_rhos.len() == 2 {
+        let out0 = fr_from_hash32_be(&out_rhos[0]);
+        let out1 = fr_from_hash32_be(&out_rhos[1]);
+        let mut delta = out0.clone();
+        delta.submod_checked(&out1);
+        prod.mulmod_checked(&delta);
+    }
+    assert!(!prod.is_zero(), "inv_enforce undefined");
+    let mut inv = prod.clone();
+    inv.inverse();
+    inv.to_bytes_be()
+}
+
+// --- Blacklist helpers ---
+
+fn bl_empty_bucket_entries() -> [Hash32; BL_BUCKET_SIZE] {
+    [[0u8; 32]; BL_BUCKET_SIZE]
+}
+
+fn bl_bucket_leaf(entries: &[Hash32; BL_BUCKET_SIZE]) -> Hash32 {
+    let mut buf = Vec::with_capacity(12 + 32 * BL_BUCKET_SIZE);
+    buf.extend_from_slice(b"BL_BUCKET_V1");
+    for e in entries {
+        buf.extend_from_slice(e);
+    }
+    poseidon2_hash_bytes(&buf).to_bytes_be()
+}
+
+fn merkle_default_nodes_from_leaf(depth: usize, leaf0: &Hash32) -> Vec<Hash32> {
+    let mut out = Vec::with_capacity(depth + 1);
+    out.push(*leaf0);
+    for lvl in 0..depth {
+        let prev = out[lvl];
+        out.push(mt_combine(lvl as u8, &prev, &prev));
+    }
+    out
+}
+
+fn bl_bucket_inv_for_id(id: &Hash32, bucket_entries: &[Hash32; BL_BUCKET_SIZE]) -> Option<Hash32> {
+    let id_fr = fr_from_hash32_be(id);
+    let mut prod = Bn254Fr::from_u32(1);
+    for e in bucket_entries.iter() {
+        let e_fr = fr_from_hash32_be(e);
+        let mut delta = id_fr.clone();
+        delta.submod_checked(&e_fr);
+        prod.mulmod_checked(&delta);
+    }
+    if prod.is_zero() {
+        return None;
+    }
+    let mut inv = prod.clone();
+    inv.inverse();
+    Some(inv.to_bytes_be())
 }
 
 fn hx32(b: &Hash32) -> String {
@@ -208,22 +306,42 @@ impl MerkleTree {
     }
 }
 
-fn private_indices(depth: usize, n_out: usize) -> Vec<usize> {
-    // 1-based indices into args list.
-    let mut idx = Vec::new();
-    idx.push(4); // recipient
-    idx.push(5); // spend_sk
-    for i in 0..depth {
-        idx.push(7 + i); // pos_bits
+fn private_indices(depth: usize, n_in: usize, n_out: usize, is_transfer: bool) -> Vec<usize> {
+    // 1-based indices into args list matching V2 protocol.
+    let mut idx = vec![2usize, 3usize]; // spend_sk, pk_ivk
+    let per_in = 5usize + depth;
+    for i in 0..n_in {
+        let base = 7 + i * per_in;
+        idx.push(base);     // value_in
+        idx.push(base + 1); // rho_in
+        idx.push(base + 2); // sender_id_in
+        idx.push(base + 3); // pos
+        for k in 0..depth {
+            idx.push(base + 4 + k); // siblings
+        }
     }
-    for i in 0..depth {
-        idx.push(7 + depth + i); // siblings
-    }
-    let outs_base = 11 + 2 * depth;
+    let withdraw_idx = 7 + n_in * per_in;
+    let outs_base = withdraw_idx + 3;
     for j in 0..n_out {
-        idx.push(outs_base + 4 * j + 0); // value_out_j
-        idx.push(outs_base + 4 * j + 1); // rho_out_j
-        idx.push(outs_base + 4 * j + 2); // pk_out_j
+        idx.push(outs_base + 5 * j);     // value_out
+        idx.push(outs_base + 5 * j + 1); // rho_out
+        idx.push(outs_base + 5 * j + 2); // pk_spend_out
+        idx.push(outs_base + 5 * j + 3); // pk_ivk_out
+    }
+    let inv_enforce_idx = outs_base + 5 * n_out;
+    idx.push(inv_enforce_idx);
+    let bl_checks = if is_transfer { 2usize } else { 1usize };
+    let mut cur = inv_enforce_idx + 2;
+    for _ in 0..bl_checks {
+        for i in 0..BL_BUCKET_SIZE {
+            idx.push(cur + i);
+        }
+        idx.push(cur + BL_BUCKET_SIZE);
+        cur += BL_BUCKET_SIZE + 1;
+        for k in 0..BL_DEPTH {
+            idx.push(cur + k);
+        }
+        cur += BL_DEPTH;
     }
     idx
 }
@@ -233,6 +351,7 @@ struct WalletNote {
     value: u64,
     rho: Hash32,
     spend_sk: Hash32,
+    sender_id: Hash32,
 }
 
 #[derive(Clone)]
@@ -254,10 +373,15 @@ fn build_transfer_witness(
     out_value: u64,
     proof_path: PathBuf,
     rng: &mut impl RngCore,
+    blacklist_root: &Hash32,
+    bl_bucket_entries: &[Hash32; BL_BUCKET_SIZE],
+    bl_siblings: &[Hash32],
 ) -> TransferWitness {
-    let recipient = recipient_from_sk(&domain, &note.spend_sk);
-    let siblings = tree.open(pos);
+    let pk_ivk_owner = ivk_seed(&domain, &note.spend_sk);
+    let recipient_owner = recipient_from_sk(&domain, &note.spend_sk);
+    let sender_id_current = recipient_owner; // for transfer, sender is self
 
+    let siblings = tree.open(pos);
     let nf_key = nf_key_from_sk(&domain, &note.spend_sk);
     let nf = nullifier(&domain, &nf_key, &note.rho);
 
@@ -266,63 +390,90 @@ fn build_transfer_witness(
     rng.fill_bytes(&mut out_rho);
     let mut out_spend_sk = [0u8; 32];
     rng.fill_bytes(&mut out_spend_sk);
-    let out_pk = pk_from_sk(&out_spend_sk);
-    let out_recipient = recipient_from_pk(&domain, &out_pk);
-    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
+    let out_pk_spend = pk_from_sk(&out_spend_sk);
+    let out_pk_ivk = ivk_seed(&domain, &out_spend_sk);
+    let out_recipient = recipient_from_pk(&domain, &out_pk_spend, &out_pk_ivk);
+    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient, &sender_id_current);
 
-    // args layout follows `note-spend/src/main.rs` top-of-file comment.
+    // Compute inv_enforce
+    let inv_enforce = compute_inv_enforce(
+        &[note.value],
+        &[note.rho],
+        &[out_value],
+        &[out_rho],
+    );
+
+    // V2 argument layout
     let mut args: Vec<LigeroArg> = Vec::new();
+    // 1: domain
     args.push(LigeroArg::Hex { hex: hx32(&domain) });
-    args.push(LigeroArg::I64 {
-        i64: note.value as i64,
-    });
-    args.push(LigeroArg::Hex {
-        hex: hx32(&note.rho),
-    });
-    args.push(LigeroArg::Hex {
-        hex: hx32(&recipient),
-    });
-    args.push(LigeroArg::Hex {
-        hex: hx32(&note.spend_sk),
-    });
+    // 2: spend_sk (private)
+    args.push(LigeroArg::Hex { hex: hx32(&note.spend_sk) });
+    // 3: pk_ivk_owner (private)
+    args.push(LigeroArg::Hex { hex: hx32(&pk_ivk_owner) });
+    // 4: depth
     args.push(LigeroArg::I64 { i64: depth as i64 });
+    // 5: anchor (public)
+    args.push(LigeroArg::Hex { hex: hx32(&anchor) });
+    // 6: n_in
+    args.push(LigeroArg::I64 { i64: 1 });
 
-    // pos bits: field elements 0/1 as 32-byte BE.
-    for lvl in 0..depth {
-        let bit = ((pos >> lvl) & 1) as u8;
-        let mut bit_bytes = [0u8; 32];
-        bit_bytes[31] = bit;
-        args.push(LigeroArg::Hex {
-            hex: hex::encode(bit_bytes),
-        });
-    }
-
-    // siblings
+    // Input note 0
+    // 7: value_in (private)
+    args.push(LigeroArg::I64 { i64: note.value as i64 });
+    // 8: rho_in (private)
+    args.push(LigeroArg::Hex { hex: hx32(&note.rho) });
+    // 9: sender_id_in (private)
+    args.push(LigeroArg::Hex { hex: hx32(&note.sender_id) });
+    // 10: pos (private)
+    args.push(LigeroArg::I64 { i64: pos as i64 });
+    // 11..(11+depth): siblings (private)
     for s in &siblings {
         args.push(LigeroArg::Hex { hex: hx32(s) });
     }
+    // nullifier (public)
+    args.push(LigeroArg::Hex { hex: hx32(&nf) });
 
-    // public: anchor + nullifier
-    args.push(LigeroArg::String {
-        str: format!("0x{}", hx32(&anchor)),
-    });
-    args.push(LigeroArg::String {
-        str: format!("0x{}", hx32(&nf)),
-    });
-
-    // withdraw_amount + n_out
+    // withdraw_amount, withdraw_recipient (public)
     args.push(LigeroArg::I64 { i64: 0 });
+    args.push(LigeroArg::Hex { hex: hx32(&[0u8; 32]) });
+
+    // n_out
     args.push(LigeroArg::I64 { i64: 1 });
 
-    // output 0
-    args.push(LigeroArg::I64 {
-        i64: out_value as i64,
-    });
-    args.push(LigeroArg::Hex {
-        hex: hx32(&out_rho),
-    });
-    args.push(LigeroArg::Hex { hex: hx32(&out_pk) });
+    // Output note 0
+    // value_out (private)
+    args.push(LigeroArg::I64 { i64: out_value as i64 });
+    // rho_out (private)
+    args.push(LigeroArg::Hex { hex: hx32(&out_rho) });
+    // pk_spend_out (private)
+    args.push(LigeroArg::Hex { hex: hx32(&out_pk_spend) });
+    // pk_ivk_out (private)
+    args.push(LigeroArg::Hex { hex: hx32(&out_pk_ivk) });
+    // cm_out (public)
     args.push(LigeroArg::Hex { hex: hx32(&cm_out) });
+
+    // inv_enforce (private)
+    args.push(LigeroArg::Hex { hex: hx32(&inv_enforce) });
+
+    // blacklist_root (public)
+    args.push(LigeroArg::Hex { hex: hx32(blacklist_root) });
+
+    // Blacklist checks for transfer: sender_id_current, out_recipient
+    for id in [sender_id_current, out_recipient] {
+        // bucket entries (private)
+        for e in bl_bucket_entries.iter() {
+            args.push(LigeroArg::Hex { hex: hx32(e) });
+        }
+        // bucket inv (private)
+        let inv = bl_bucket_inv_for_id(&id, bl_bucket_entries)
+            .expect("unexpected: id collides with empty blacklist bucket");
+        args.push(LigeroArg::Hex { hex: hx32(&inv) });
+        // blacklist siblings (private)
+        for sib in bl_siblings.iter() {
+            args.push(LigeroArg::Hex { hex: hx32(sib) });
+        }
+    }
 
     TransferWitness {
         wallet_idx: pos,
@@ -332,6 +483,7 @@ fn build_transfer_witness(
             value: out_value,
             rho: out_rho,
             spend_sk: out_spend_sk,
+            sender_id: sender_id_current,
         },
         new_cm: cm_out,
     }
@@ -393,7 +545,7 @@ fn main() -> Result<()> {
     let rounds_default = env_usize("TRANSFER_ROUNDS", 1);
     let n = prompt_usize("Transfers per round", n_default)?;
     let rounds = prompt_usize("Number of rounds (0 = run indefinitely)", rounds_default)?;
-    let depth = env_usize("TRANSFER_TREE_DEPTH", 16);
+    let depth = env_usize("TRANSFER_TREE_DEPTH", 8);
     let packing = env_u32("LIGERO_PACKING", 8192);
     let gzip_proof = env_bool("LIGERO_GZIP_PROOF", false);
 
@@ -449,6 +601,13 @@ fn main() -> Result<()> {
     // Domain used by the guest/circuit.
     let domain: Hash32 = [1u8; 32];
 
+    // Initialize blacklist data (empty blacklist).
+    let bl_bucket_entries = bl_empty_bucket_entries();
+    let leaf0 = bl_bucket_leaf(&bl_bucket_entries);
+    let bl_default_nodes = merkle_default_nodes_from_leaf(BL_DEPTH, &leaf0);
+    let blacklist_root = bl_default_nodes[BL_DEPTH];
+    let bl_siblings: Vec<Hash32> = bl_default_nodes.iter().take(BL_DEPTH).copied().collect();
+
     // Initialize N wallet notes and build the initial tree.
     let mut rng = rand::thread_rng();
     let value_in: u64 = 100;
@@ -460,12 +619,16 @@ fn main() -> Result<()> {
         let mut spend_sk = [0u8; 32];
         rng.fill_bytes(&mut spend_sk);
         let recipient = recipient_from_sk(&domain, &spend_sk);
-        let cm_in = note_commitment(&domain, value_in, &rho, &recipient);
+        // Initial sender_id is random (simulates deposit)
+        let mut sender_id = [0u8; 32];
+        rng.fill_bytes(&mut sender_id);
+        let cm_in = note_commitment(&domain, value_in, &rho, &recipient, &sender_id);
         tree.set_leaf(i, cm_in);
         wallets.push(WalletNote {
             value: value_in,
             rho,
             spend_sk,
+            sender_id,
         });
     }
 
@@ -498,11 +661,14 @@ fn main() -> Result<()> {
                 out_value,
                 proof_path,
                 &mut rng,
+                &blacklist_root,
+                &bl_bucket_entries,
+                &bl_siblings,
             );
             witnesses.push(w);
         }
 
-        let priv_idx = private_indices(depth, 1);
+        let priv_idx = private_indices(depth, 1, 1, true);
         let program_s = program.to_string_lossy().to_string();
 
         eprintln!("[round {}/{}] proving {} proofs...", round + 1, rounds, n);
