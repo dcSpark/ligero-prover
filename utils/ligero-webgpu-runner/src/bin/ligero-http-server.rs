@@ -42,6 +42,7 @@ static PROOF_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use ligero_runner::{
     daemon::DaemonPool,
+    redaction::redacted_args,
     LigeroArg, LigeroPaths,
 };
 
@@ -66,26 +67,6 @@ struct ProveVerifyRequest {
     gzip: Option<bool>,
 }
 
-/// Redact a JSON argument value while preserving its type.
-fn redact_json_arg(arg: &Value) -> Value {
-    if let Value::Object(obj) = arg {
-        if obj.contains_key("str") || obj.contains_key("string") {
-            serde_json::json!({"str": "REDACTED"})
-        } else if obj.contains_key("i64") {
-            serde_json::json!({"i64": 0})
-        } else if obj.contains_key("hex") {
-            serde_json::json!({"hex": "0000000000000000000000000000000000000000000000000000000000000000"})
-        } else if obj.contains_key("hex_bytes_b64") || obj.contains_key("hexBytesB64") {
-            serde_json::json!({"hex_bytes_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="})
-        } else {
-            // Unknown type, replace with hex zero
-            serde_json::json!({"hex": "0000000000000000000000000000000000000000000000000000000000000000"})
-        }
-    } else {
-        // Fallback for unexpected structure
-        serde_json::json!({"hex": "0000000000000000000000000000000000000000000000000000000000000000"})
-    }
-}
 
 /// Response body for `/prove` and `/verify` endpoints.
 #[derive(Debug, Clone, Serialize)]
@@ -356,20 +337,17 @@ impl ServerState {
             };
         }
 
-        // Build config for verifier (with redacted private args)
+        // Build config for verifier with redacted private args (preserving original lengths)
         // Use detected gzip status from the proof bytes
-        let mut config = self.build_config(req, &program, is_gzip);
-
-        // Redact private arguments for verification, preserving argument types
-        if let Value::Array(ref mut args) = config["args"] {
-            for &idx in &req.private_indices {
-                if idx > 0 && idx <= args.len() {
-                    let arg_idx = idx - 1;
-                    // Preserve the type when redacting
-                    args[arg_idx] = redact_json_arg(&args[arg_idx]);
-                }
-            }
-        }
+        let redacted_req = ProveVerifyRequest {
+            circuit: req.circuit.clone(),
+            args: redacted_args(&req.args, &req.private_indices),
+            proof: req.proof.clone(),
+            private_indices: req.private_indices.clone(),
+            packing: req.packing,
+            gzip: req.gzip,
+        };
+        let config = self.build_config(&redacted_req, &program, is_gzip);
 
         // Send to verifier daemon
         match self.verifier_pool.verify(config, &proof_path.to_string_lossy()) {
