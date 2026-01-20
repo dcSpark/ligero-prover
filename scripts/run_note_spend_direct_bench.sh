@@ -9,6 +9,7 @@
 #   LIGERO_RUNS=N     - Number of proofs to generate (default: 1, use 3 for cross-verification)
 #   LIGERO_PACKING=N  - Override packing size (default: 8192)
 #   LIGERO_ENABLE_VIEWERS=1 - Enable viewer attestations (FVK) for transfer/withdraw (default: 1)
+#   LIGERO_SHOW_VIEWER_PAYLOAD=1 - Print decrypted viewer payload for TRANSFER run0 (default: 1)
 
 set -e
 
@@ -24,6 +25,9 @@ export LIGERO_RUNS="${LIGERO_RUNS:-1}"
 # Enable viewer attestations by default for this benchmark (transfer/withdraw only).
 export LIGERO_ENABLE_VIEWERS="${LIGERO_ENABLE_VIEWERS:-1}"
 
+# Print decrypted viewer payload for transfer by default (sensitive; set to 0 to disable).
+export LIGERO_SHOW_VIEWER_PAYLOAD="${LIGERO_SHOW_VIEWER_PAYLOAD:-1}"
+
 # Prefer locally-built binaries (if present) over packaged portable ones.
 if [[ -x "$REPO_ROOT/build/webgpu_prover" ]]; then
     export LIGERO_PROVER_BIN="$REPO_ROOT/build/webgpu_prover"
@@ -38,6 +42,7 @@ NC='\033[0m' # No Color
 
 echo -e "${BLUE}=== Note Spend Direct Benchmark ===${NC}"
 echo -e "${BLUE}Viewers (FVK attestations): ${LIGERO_ENABLE_VIEWERS}${NC}"
+echo -e "${BLUE}Show decrypted viewer payload (TRANSFER run0): ${LIGERO_SHOW_VIEWER_PAYLOAD}${NC}"
 echo ""
 
 # Step 1: Rebuild the circuits
