@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service identifier -->
+    <key>Label</key>
+    <string>com.dcspark.ligero-http-server</string>
+
+    <!-- Path to the binary - UPDATE THIS PATH -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ec2-user/ligero-prover/utils/ligero-webgpu-runner/target/release/ligero-http-server</string>
+        <string>--bind</string>
+        <string>0.0.0.0:1313</string>
+        <string>--prover-workers</string>
+        <string>4</string>
+        <string>--verifier-workers</string>
+        <string>4</string>
+    </array>
+
+    <!-- Working directory for proof outputs -->
+    <key>WorkingDirectory</key>
+    <string>/Users/ec2-user/ligero-prover/utils/ligero-webgpu-runner</string>
+
+    <!-- Environment variables for Ligero path discovery -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LIGERO_ROOT</key>
+        <string>/Users/ec2-user/ligero-prover</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <!-- Keep alive - restart if it exits -->
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Always restart unless we explicitly unload the service -->
+        <key>SuccessfulExit</key>
+        <false/>
+        <!-- Also restart on crash -->
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Restart throttling: wait 5 seconds between restarts -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Start immediately when loaded -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/Users/ec2-user/ligero-prover/utils/ligero-webgpu-runner/logs/ligero-http-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ec2-user/ligero-prover/utils/ligero-webgpu-runner/logs/ligero-http-server.error.log</string>
+
+    <!-- Process type - interactive for GPU access -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- Nice level (0 = normal priority) -->
+    <key>Nice</key>
+    <integer>0</integer>
+</dict>
+</plist>
