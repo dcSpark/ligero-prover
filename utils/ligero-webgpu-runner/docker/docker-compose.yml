@@ -1,0 +1,78 @@
+# docker-compose.yml for Ligero HTTP Server
+#
+# Usage:
+#   docker-compose up -d        # Start the server
+#   docker-compose logs -f      # View logs
+#   docker-compose down         # Stop the server
+#
+# Then test from host:
+#   ./scripts/test_prove_verify.sh http://localhost:1313
+
+services:
+  ligero-http-server:
+    build:
+      context: ../..
+      dockerfile: utils/ligero-webgpu-runner/docker/Dockerfile
+      args:
+        # Auto-detected from DOCKER_DEFAULT_PLATFORM or set ARCH env var
+        # For Apple Silicon: ARCH=linux-arm64
+        # For Intel/AMD: ARCH=linux-amd64
+        ARCH: ${ARCH:-linux-arm64}
+    image: ligero-http-server:latest
+    container_name: ligero-http-server
+    ports:
+      - "1313:1313"
+    environment:
+      # Force software Vulkan rendering (lavapipe)
+      # VK_ICD_FILENAMES is auto-detected by entrypoint.sh based on architecture
+      - MESA_VK_DEVICE_SELECT=llvmpipe
+      - WGPU_TIMEOUT_MS=120000
+      # Logging
+      - RUST_LOG=info
+    volumes:
+      # Optional: persist proof outputs
+      - ligero-proofs:/app/proof_outputs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-X", "POST", "http://localhost:1313/health", "-H", "Content-Type: application/json", "-d", "{}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+  # Optional: GPU-accelerated version (requires nvidia-container-toolkit)
+  # Uncomment this service and comment out the above to use GPU acceleration
+  # ligero-http-server-gpu:
+  #   build:
+  #     context: ../..
+  #     dockerfile: utils/ligero-webgpu-runner/docker/Dockerfile
+  #     args:
+  #       ARCH: linux-amd64
+  #   image: ligero-http-server:latest
+  #   container_name: ligero-http-server-gpu
+  #   ports:
+  #     - "1313:1313"
+  #   environment:
+  #     - RUST_LOG=info
+  #   volumes:
+  #     - ligero-proofs:/app/proof_outputs
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu, compute, utility]
+  #   restart: unless-stopped
+
+volumes:
+  ligero-proofs:
