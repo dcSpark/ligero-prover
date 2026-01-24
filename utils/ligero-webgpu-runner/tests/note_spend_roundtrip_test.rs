@@ -275,6 +275,9 @@ fn compute_inv_enforce(
 
 // === Viewer attestation helpers (must match the guest program) ===
 
+const MAX_INS: usize = 4;
+const NOTE_PLAIN_LEN: usize = 144 + 32 * MAX_INS;
+
 fn fvk_commit(fvk: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"FVK_COMMIT_V1", &[fvk])
 }
@@ -287,12 +290,12 @@ fn stream_block(k: &Hash32, ctr: u32) -> Hash32 {
     poseidon2_hash_domain(b"VIEW_STREAM_V1", &[k, &ctr.to_le_bytes()])
 }
 
-fn stream_xor_encrypt_144(k: &Hash32, pt: &[u8; 144]) -> [u8; 144] {
-    let mut ct = [0u8; 144];
-    for ctr in 0u32..5u32 {
+fn stream_xor_encrypt_note_plain(k: &Hash32, pt: &[u8; NOTE_PLAIN_LEN]) -> [u8; NOTE_PLAIN_LEN] {
+    let mut ct = [0u8; NOTE_PLAIN_LEN];
+    for ctr in 0u32..9u32 {
         let ks = stream_block(k, ctr);
         let off = (ctr as usize) * 32;
-        let take = core::cmp::min(32, 144 - off);
+        let take = core::cmp::min(32, NOTE_PLAIN_LEN - off);
         for i in 0..take {
             ct[off + i] = pt[off + i] ^ ks[i];
         }
@@ -300,7 +303,7 @@ fn stream_xor_encrypt_144(k: &Hash32, pt: &[u8; 144]) -> [u8; 144] {
     ct
 }
 
-fn ct_hash(ct: &[u8; 144]) -> Hash32 {
+fn ct_hash(ct: &[u8; NOTE_PLAIN_LEN]) -> Hash32 {
     poseidon2_hash_domain(b"CT_HASH_V1", &[ct])
 }
 
@@ -314,14 +317,20 @@ fn encode_note_plain(
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
-) -> [u8; 144] {
-    let mut out = [0u8; 144];
+    cm_ins: &[Hash32; MAX_INS],
+) -> [u8; NOTE_PLAIN_LEN] {
+    let mut out = [0u8; NOTE_PLAIN_LEN];
     out[0..32].copy_from_slice(domain);
     out[32..40].copy_from_slice(&value.to_le_bytes());
     // out[40..48] is already zero (u64 zero-extended to 16 bytes).
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
     out[112..144].copy_from_slice(sender_id);
+    let mut off = 144usize;
+    for cm in cm_ins {
+        out[off..off + 32].copy_from_slice(cm);
+        off += 32;
+    }
     out
 }
 
@@ -1054,9 +1063,20 @@ fn test_note_spend_viewer_attestation_roundtrip_and_rejects_mutation() -> Result
     let n_viewers: u64 = 1;
     let fvk: Hash32 = [11u8; 32];
     let fvk_commitment = fvk_commit(&fvk);
+
+    let mut cm_ins = [[0u8; 32]; MAX_INS];
+    cm_ins[0] = cm_in;
+
     let k = view_kdf(&fvk, &cm_out);
-    let pt = encode_note_plain(&domain, out_value, &out_rho, &out_recipient, &sender_id);
-    let ct = stream_xor_encrypt_144(&k, &pt);
+    let pt = encode_note_plain(
+        &domain,
+        out_value,
+        &out_rho,
+        &out_recipient,
+        &sender_id,
+        &cm_ins,
+    );
+    let ct = stream_xor_encrypt_note_plain(&k, &pt);
     let ct_h = ct_hash(&ct);
     let mac = view_mac(&k, &cm_out, &ct_h);
 
@@ -1167,7 +1187,8 @@ fn test_note_spend_viewer_attestation_roundtrip_and_rejects_mutation() -> Result
     // With constraint-driven viewer hashing, redacting private args must still verify.
 
     let verify_expect_fail_redacted = |bad_args: Vec<LigeroArg>| -> Result<()> {
-        match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone()) {
+        match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone())
+        {
             Ok((ok, stdout, stderr)) => {
                 anyhow::ensure!(
                     !ok,
@@ -1320,12 +1341,16 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
     let viewer_fvks: [Hash32; 2] = [[11u8; 32], [12u8; 32]];
 
     // Precompute per-output plaintext and digests for each viewer.
+    let mut cm_ins = [[0u8; 32]; MAX_INS];
+    cm_ins[0] = cm_in;
+
     let pt0 = encode_note_plain(
         &domain,
         out0_value,
         &out0_rho,
         &out0_recipient,
         &sender_id_current,
+        &cm_ins,
     );
     let pt1 = encode_note_plain(
         &domain,
@@ -1333,6 +1358,7 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
         &out1_rho,
         &out1_recipient,
         &sender_id_current,
+        &cm_ins,
     );
 
     // Build args (v2 ABI).
@@ -1430,7 +1456,7 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
 
         // Output 0 digests.
         let k0 = view_kdf(fvk, &cm_out0);
-        let ct0 = stream_xor_encrypt_144(&k0, &pt0);
+        let ct0 = stream_xor_encrypt_note_plain(&k0, &pt0);
         let ct0_h = ct_hash(&ct0);
         let mac0 = view_mac(&k0, &cm_out0, &ct0_h);
         args.push(LigeroArg::Hex { hex: hx32(&ct0_h) }); // ct_hash_0 (pub)
@@ -1438,7 +1464,7 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
 
         // Output 1 digests.
         let k1 = view_kdf(fvk, &cm_out1);
-        let ct1 = stream_xor_encrypt_144(&k1, &pt1);
+        let ct1 = stream_xor_encrypt_note_plain(&k1, &pt1);
         let ct1_h = ct_hash(&ct1);
         let mac1 = view_mac(&k1, &cm_out1, &ct1_h);
         args.push(LigeroArg::Hex { hex: hx32(&ct1_h) }); // ct_hash_1 (pub)
@@ -1494,7 +1520,8 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
         let mut bad_args = args.clone();
         bad_args[idx_n_viewers - 1] = LigeroArg::I64 { i64: 3 }; // but only 2 viewer blocks present
 
-        match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone()) {
+        match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone())
+        {
             Ok((ok_bad, _stdout, _stderr)) => {
                 anyhow::ensure!(!ok_bad, "expected verification to fail")
             }
@@ -1506,7 +1533,8 @@ fn test_note_spend_viewer_attestation_two_outputs_multiple_viewers_and_rejects_m
     {
         let mut bad_args = args.clone();
         bad_args.pop();
-        match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone()) {
+        match verifier::verify_proof_with_output(&vpaths, &proof_bytes, bad_args, priv_idx.clone())
+        {
             Ok((ok_bad, _stdout, _stderr)) => {
                 anyhow::ensure!(!ok_bad, "expected verification to fail")
             }
@@ -1990,9 +2018,7 @@ fn test_note_spend_rejects_invalid_shapes_and_invalid_pos() -> Result<()> {
     // Invalid: pos must be < 2^depth.
     let mut bad_args = args;
     let idx_pos_1based: usize = 7 + 3; // header(6) + value + rho + sender_id_in + pos
-    bad_args[idx_pos_1based - 1] = LigeroArg::I64 {
-        i64: 1i64 << depth,
-    };
+    bad_args[idx_pos_1based - 1] = LigeroArg::I64 { i64: 1i64 << depth };
     run_expect_reject(bad_args)?;
 
     Ok(())

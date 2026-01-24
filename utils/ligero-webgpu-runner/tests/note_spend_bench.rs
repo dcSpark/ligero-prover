@@ -406,6 +406,13 @@ fn enable_viewers() -> bool {
         .unwrap_or(false)
 }
 
+fn show_viewer_payload() -> bool {
+    std::env::var("LIGERO_SHOW_VIEWER_PAYLOAD")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Generate labels for each argument position (1-indexed to match circuit docs).
 fn arg_labels(args: &[LigeroArg], use_case: NoteSpendUseCase) -> Vec<(&'static str, &'static str)> {
     // Returns (name, visibility) tuples (1-based positions excluding argv[0]).
@@ -556,7 +563,11 @@ fn print_labeled_args(args: &[LigeroArg], use_case: NoteSpendUseCase) {
                 }
                 LigeroArg::BytesB64 { bytes_b64 } => {
                     if bytes_b64.len() > 24 {
-                        format!("b64:{}...{}", &bytes_b64[..12], &bytes_b64[bytes_b64.len() - 8..])
+                        format!(
+                            "b64:{}...{}",
+                            &bytes_b64[..12],
+                            &bytes_b64[bytes_b64.len() - 8..]
+                        )
                     } else {
                         format!("b64:{}", bytes_b64)
                     }
@@ -763,6 +774,9 @@ fn compute_inv_enforce(
 
 // === Viewer attestation helpers (must match the guest program) ===
 
+const MAX_INS: usize = 4;
+const NOTE_PLAIN_LEN: usize = 144 + 32 * MAX_INS;
+
 fn fvk_commit(fvk: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"FVK_COMMIT_V1", &[fvk])
 }
@@ -775,12 +789,12 @@ fn stream_block(k: &Hash32, ctr: u32) -> Hash32 {
     poseidon2_hash_domain(b"VIEW_STREAM_V1", &[k, &ctr.to_le_bytes()])
 }
 
-fn stream_xor_encrypt_144(k: &Hash32, pt: &[u8; 144]) -> [u8; 144] {
-    let mut ct = [0u8; 144];
-    for ctr in 0u32..5u32 {
+fn stream_xor_encrypt_note_plain(k: &Hash32, pt: &[u8; NOTE_PLAIN_LEN]) -> [u8; NOTE_PLAIN_LEN] {
+    let mut ct = [0u8; NOTE_PLAIN_LEN];
+    for ctr in 0u32..9u32 {
         let ks = stream_block(k, ctr);
         let off = (ctr as usize) * 32;
-        let take = core::cmp::min(32, 144 - off);
+        let take = core::cmp::min(32, NOTE_PLAIN_LEN - off);
         for i in 0..take {
             ct[off + i] = pt[off + i] ^ ks[i];
         }
@@ -788,7 +802,7 @@ fn stream_xor_encrypt_144(k: &Hash32, pt: &[u8; 144]) -> [u8; 144] {
     ct
 }
 
-fn ct_hash(ct: &[u8; 144]) -> Hash32 {
+fn ct_hash(ct: &[u8; NOTE_PLAIN_LEN]) -> Hash32 {
     poseidon2_hash_domain(b"CT_HASH_V1", &[ct])
 }
 
@@ -802,15 +816,65 @@ fn encode_note_plain(
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
-) -> [u8; 144] {
-    let mut out = [0u8; 144];
+    cm_ins: &[Hash32; MAX_INS],
+) -> [u8; NOTE_PLAIN_LEN] {
+    let mut out = [0u8; NOTE_PLAIN_LEN];
     out[0..32].copy_from_slice(domain);
     out[32..40].copy_from_slice(&value.to_le_bytes());
     // out[40..48] is already zero (u64 zero-extended to 16 bytes).
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
     out[112..144].copy_from_slice(sender_id);
+    let mut off = 144usize;
+    for cm in cm_ins {
+        out[off..off + 32].copy_from_slice(cm);
+        off += 32;
+    }
     out
+}
+
+#[derive(Clone, Debug)]
+struct DecodedNotePlain {
+    domain: Hash32,
+    value: u64,
+    rho: Hash32,
+    recipient: Hash32,
+    sender_id: Hash32,
+    cm_ins: [Hash32; MAX_INS],
+}
+
+fn decode_note_plain(pt: &[u8; NOTE_PLAIN_LEN]) -> DecodedNotePlain {
+    let mut domain = [0u8; 32];
+    domain.copy_from_slice(&pt[0..32]);
+
+    let mut value_le = [0u8; 8];
+    value_le.copy_from_slice(&pt[32..40]);
+    let value = u64::from_le_bytes(value_le);
+
+    let mut rho = [0u8; 32];
+    rho.copy_from_slice(&pt[48..80]);
+
+    let mut recipient = [0u8; 32];
+    recipient.copy_from_slice(&pt[80..112]);
+
+    let mut sender_id = [0u8; 32];
+    sender_id.copy_from_slice(&pt[112..144]);
+
+    let cm_ins: [Hash32; MAX_INS] = std::array::from_fn(|i| {
+        let start = 144 + 32 * i;
+        let mut cm = [0u8; 32];
+        cm.copy_from_slice(&pt[start..start + 32]);
+        cm
+    });
+
+    DecodedNotePlain {
+        domain,
+        value,
+        rho,
+        recipient,
+        sender_id,
+        cm_ins,
+    }
 }
 
 struct MerkleTree {
@@ -908,7 +972,7 @@ fn private_indices_note_spend(
         idx.push(base + 1); // rho_in_i
         idx.push(base + 2); // sender_id_in_i
         idx.push(base + 3); // pos_i
-        // siblings_i
+                            // siblings_i
         for k in 0..depth {
             idx.push(base + 4 + k);
         }
@@ -1256,15 +1320,115 @@ fn build_statement(
 
         args.push(arg32(&fvk)); // fvk (priv)
 
-        for (out_value, out_rho, _out_pk_spend, _out_pk_ivk, out_recipient, cm_out) in out_triples {
+        let mut cm_ins = [[0u8; 32]; MAX_INS];
+        cm_ins[0] = cm_in;
+
+        let show_payload =
+            run == 0 && matches!(use_case, NoteSpendUseCase::Transfer) && show_viewer_payload();
+        let mut payload_lines: Vec<String> = Vec::new();
+        let mut viewer_notes: Vec<serde_json::Value> = Vec::new();
+        let mut viewer_payloads: Vec<serde_json::Value> = Vec::new();
+        if show_payload {
+            payload_lines.push(format!("fvk_commit={}", hx32_short(&fvk_commitment)));
+        }
+
+        for (j, (out_value, out_rho, _out_pk_spend, _out_pk_ivk, out_recipient, cm_out)) in
+            out_triples.into_iter().enumerate()
+        {
             let k = view_kdf(&fvk, &cm_out);
-            let pt = encode_note_plain(&domain, out_value, &out_rho, &out_recipient, &sender_id);
-            let ct = stream_xor_encrypt_144(&k, &pt);
+            let pt = encode_note_plain(
+                &domain,
+                out_value,
+                &out_rho,
+                &out_recipient,
+                &sender_id,
+                &cm_ins,
+            );
+            let ct = stream_xor_encrypt_note_plain(&k, &pt);
             let ct_h = ct_hash(&ct);
             let mac = view_mac(&k, &cm_out, &ct_h);
 
             args.push(arg32(&ct_h)); // ct_hash (pub)
             args.push(arg32(&mac)); // mac (pub)
+
+            if show_payload {
+                // Decrypt (stream XOR is symmetric).
+                let pt_dec = stream_xor_encrypt_note_plain(&k, &ct);
+                let dec = decode_note_plain(&pt_dec);
+
+                payload_lines.push(format!(
+                    "out{j}: cm_out={} ct_len={}",
+                    hx32_short(&cm_out),
+                    NOTE_PLAIN_LEN
+                ));
+                payload_lines.push(format!(
+                    "  domain={} value={}",
+                    hx32_short(&dec.domain),
+                    dec.value,
+                ));
+                payload_lines.push(format!(
+                    "  rho={} recipient={}",
+                    hx32_short(&dec.rho),
+                    hx32_short(&dec.recipient),
+                ));
+                payload_lines.push(format!(
+                    "  sender_id={} cm_in0={}",
+                    hx32_short(&dec.sender_id),
+                    hx32_short(&dec.cm_ins[0]),
+                ));
+                payload_lines.push(format!(
+                    "  cm_in1={} cm_in2={}",
+                    hx32_short(&dec.cm_ins[1]),
+                    hx32_short(&dec.cm_ins[2]),
+                ));
+                payload_lines.push(format!("  cm_in3={}", hx32_short(&dec.cm_ins[3]),));
+
+                let nonce = [0u8; 24];
+                viewer_notes.push(serde_json::json!({
+                    "cm": format!("0x{}", hex::encode(cm_out)),
+                    "nonce": format!("0x{}", hex::encode(nonce)),
+                    "ct": format!("0x{}", hex::encode(ct)),
+                    "fvk_commitment": format!("0x{}", hex::encode(fvk_commitment)),
+                    "mac": format!("0x{}", hex::encode(mac)),
+                }));
+
+                let cm_ins: Vec<String> = dec
+                    .cm_ins
+                    .iter()
+                    .map(|cm| format!("0x{}", hex::encode(cm)))
+                    .collect();
+                viewer_payloads.push(serde_json::json!({
+                    "cm": format!("0x{}", hex::encode(cm_out)),
+                    "pt": {
+                        "domain": format!("0x{}", hex::encode(dec.domain)),
+                        "value": dec.value,
+                        "rho": format!("0x{}", hex::encode(dec.rho)),
+                        "recipient": format!("0x{}", hex::encode(dec.recipient)),
+                        "sender_id": format!("0x{}", hex::encode(dec.sender_id)),
+                        "cm_ins": cm_ins,
+                    },
+                    "pt_hex": format!("0x{}", hex::encode(pt_dec)),
+                }));
+
+                // Sanity: ensure the decoded plaintext matches what we constructed.
+                anyhow::ensure!(
+                    dec.domain == domain,
+                    "viewer payload domain mismatch (expected {}, got {})",
+                    hx32_short(&domain),
+                    hx32_short(&dec.domain)
+                );
+            }
+        }
+
+        if show_payload {
+            print_box(
+                "👁 VIEWER - Decrypted payload (TRANSFER run0)",
+                &payload_lines,
+            );
+            println!("[TRANSFER] viewer_encrypted_notes (run0):");
+            println!("{}", serde_json::to_string_pretty(&viewer_notes)?);
+            println!("[TRANSFER] viewer_decrypted_payloads (run0):");
+            println!("{}", serde_json::to_string_pretty(&viewer_payloads)?);
         }
     }
 

@@ -252,6 +252,7 @@ struct SpendTxInfo {
     #[allow(dead_code)]
     anchor: Hash32,
     sender_id_current: Hash32,
+    cm_ins: Vec<Hash32>,
     cm_outs: Vec<Hash32>,
 }
 
@@ -305,7 +306,10 @@ fn bl_bucket_inv_for_id(id: &Hash32, bucket_entries: &[Hash32; BL_BUCKET_SIZE]) 
     Some(inv.to_bytes_be())
 }
 
-fn append_empty_blacklist_interval(args: &mut Vec<LigeroArg>, ids_to_check: &[Hash32]) -> Result<()> {
+fn append_empty_blacklist_interval(
+    args: &mut Vec<LigeroArg>,
+    ids_to_check: &[Hash32],
+) -> Result<()> {
     let bucket_entries = bl_empty_bucket_entries();
     let leaf0 = bl_bucket_leaf(&bucket_entries);
     let default_nodes = merkle_default_nodes_from_leaf(BL_DEPTH, &leaf0);
@@ -431,6 +435,7 @@ fn build_spend_tx(
 
     // Compute leaves (cm_in_i) for the Merkle tree.
     let mut leaf_pairs: Vec<(u64, Hash32)> = Vec::with_capacity(inputs.len());
+    let mut cm_ins: Vec<Hash32> = Vec::with_capacity(inputs.len());
     for inp in inputs {
         let cm_in = note_commitment(
             &domain,
@@ -440,6 +445,7 @@ fn build_spend_tx(
             &inp.sender_id_in,
         );
         leaf_pairs.push((inp.pos, cm_in));
+        cm_ins.push(cm_in);
     }
 
     let (anchor, openings) = merkle_root_and_openings_sparse(depth, &leaf_pairs)?;
@@ -576,6 +582,7 @@ fn build_spend_tx(
         SpendTxInfo {
             anchor,
             sender_id_current,
+            cm_ins,
             cm_outs,
         },
     ))
@@ -583,7 +590,7 @@ fn build_spend_tx(
 
 // === Viewer attestation helpers (must match the guest program) ===
 
-const NOTE_PLAIN_LEN: usize = 144;
+const NOTE_PLAIN_LEN: usize = 144 + 32 * MAX_INS;
 
 fn fvk_commit(fvk: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"FVK_COMMIT_V1", &[fvk])
@@ -597,9 +604,9 @@ fn stream_block(k: &Hash32, ctr: u32) -> Hash32 {
     poseidon2_hash_domain(b"VIEW_STREAM_V1", &[k, &ctr.to_le_bytes()])
 }
 
-fn stream_xor_encrypt_144(k: &Hash32, pt: &[u8; NOTE_PLAIN_LEN]) -> [u8; NOTE_PLAIN_LEN] {
+fn stream_xor_encrypt_note_plain(k: &Hash32, pt: &[u8; NOTE_PLAIN_LEN]) -> [u8; NOTE_PLAIN_LEN] {
     let mut ct = [0u8; NOTE_PLAIN_LEN];
-    for ctr in 0u32..5u32 {
+    for ctr in 0u32..9u32 {
         let ks = stream_block(k, ctr);
         let off = (ctr as usize) * 32;
         let take = core::cmp::min(32, NOTE_PLAIN_LEN - off);
@@ -624,6 +631,7 @@ fn encode_note_plain(
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
+    cm_ins: &[Hash32; MAX_INS],
 ) -> [u8; NOTE_PLAIN_LEN] {
     let mut out = [0u8; NOTE_PLAIN_LEN];
     out[0..32].copy_from_slice(domain);
@@ -632,6 +640,11 @@ fn encode_note_plain(
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
     out[112..144].copy_from_slice(sender_id);
+    let mut off = 144usize;
+    for cm in cm_ins {
+        out[off..off + 32].copy_from_slice(cm);
+        off += 32;
+    }
     out
 }
 
@@ -1424,6 +1437,11 @@ fn test_note_spend_v2_max_bounds_sanity() -> Result<()> {
         .map(|o| recipient_from_pk(&domain, &o.pk_spend, &o.pk_ivk))
         .collect();
 
+    let mut cm_ins_fixed = [[0u8; 32]; MAX_INS];
+    for (i, cm) in info.cm_ins.iter().enumerate() {
+        cm_ins_fixed[i] = *cm;
+    }
+
     for v in 0..n_viewers {
         let fvk: Hash32 = [0x80u8.wrapping_add(v as u8); 32];
         let fvk_c = fvk_commit(&fvk);
@@ -1442,8 +1460,9 @@ fn test_note_spend_v2_max_bounds_sanity() -> Result<()> {
                 &outputs[j].rho,
                 &out_recipients[j],
                 &info.sender_id_current,
+                &cm_ins_fixed,
             );
-            let ct = stream_xor_encrypt_144(&k, &pt);
+            let ct = stream_xor_encrypt_note_plain(&k, &pt);
             let ct_h = ct_hash(&ct);
             let mac = view_mac(&k, cm, &ct_h);
             args.push(LigeroArg::Hex { hex: hx32(&ct_h) });
@@ -1673,9 +1692,7 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
             });
 
             let pos_i = positions[i];
-            args.push(LigeroArg::I64 {
-                i64: pos_i as i64,
-            });
+            args.push(LigeroArg::I64 { i64: pos_i as i64 });
 
             let sibs = if i == 0 { &siblings0 } else { &siblings1 };
             for s in sibs {
@@ -1718,9 +1735,7 @@ fn test_note_spend_v2_rejects_invalid_witnesses() -> Result<()> {
     {
         let mut bad_args = base_args.clone();
         let idx_pos0 = 7 + 3; // value,rho,sender_id
-        bad_args[idx_pos0 - 1] = LigeroArg::I64 {
-            i64: 1i64 << depth,
-        };
+        bad_args[idx_pos0 - 1] = LigeroArg::I64 { i64: 1i64 << depth };
         assert_rejected(&mut runner, &vpaths, bad_args, base_priv.clone())?;
     }
 
