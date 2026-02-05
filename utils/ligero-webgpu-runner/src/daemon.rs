@@ -98,10 +98,31 @@ struct DaemonIo {
 /// A single daemon worker process.
 pub struct DaemonWorker {
     io: Mutex<DaemonIo>,
+    /// Path to the binary for respawning
+    bin_path: std::path::PathBuf,
+    /// Arguments for respawning
+    args: Vec<String>,
+    /// Working directory for respawning
+    cwd: std::path::PathBuf,
 }
 
 impl DaemonWorker {
     fn spawn(bin: &Path, args: &[&str], cwd: &Path) -> Result<Self> {
+        let (io, bin_path, args_owned, cwd_owned) = Self::spawn_process(bin, args, cwd)?;
+
+        Ok(Self {
+            io: Mutex::new(io),
+            bin_path,
+            args: args_owned,
+            cwd: cwd_owned,
+        })
+    }
+
+    fn spawn_process(
+        bin: &Path,
+        args: &[&str],
+        cwd: &Path,
+    ) -> Result<(DaemonIo, std::path::PathBuf, Vec<String>, std::path::PathBuf)> {
         let mut child = Command::new(bin)
             .args(args)
             .current_dir(cwd)
@@ -150,16 +171,65 @@ impl DaemonWorker {
             .take()
             .ok_or_else(|| anyhow!("failed to open stdout"))?;
 
-        Ok(Self {
-            io: Mutex::new(DaemonIo {
-                child,
-                stdin: BufWriter::new(stdin),
-                stdout: BufReader::new(stdout),
-            }),
-        })
+        let io = DaemonIo {
+            child,
+            stdin: BufWriter::new(stdin),
+            stdout: BufReader::new(stdout),
+        };
+
+        Ok((
+            io,
+            bin.to_path_buf(),
+            args.iter().map(|s| s.to_string()).collect(),
+            cwd.to_path_buf(),
+        ))
+    }
+
+    /// Check if the daemon process is still alive.
+    fn is_alive(&self) -> bool {
+        if let Ok(mut io) = self.io.lock() {
+            matches!(io.child.try_wait(), Ok(None))
+        } else {
+            false
+        }
+    }
+
+    /// Attempt to respawn the daemon process after a crash.
+    fn respawn(&self) -> Result<()> {
+        let args_refs: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
+        let (new_io, _, _, _) = Self::spawn_process(&self.bin_path, &args_refs, &self.cwd)?;
+
+        let mut io = self.io.lock().unwrap();
+        // Best-effort cleanup of old process
+        let _ = io.child.kill();
+        let _ = io.child.wait();
+        *io = new_io;
+
+        tracing::info!("Respawned daemon worker: {}", self.bin_path.display());
+        Ok(())
     }
 
     fn request_json_line(&self, config: &Value) -> Result<DaemonResponse> {
+        let result = self.request_json_line_inner(config);
+
+        // If request failed, check if daemon died and try to respawn
+        if result.is_err() && !self.is_alive() {
+            tracing::warn!(
+                "Daemon {} appears to have crashed, attempting respawn...",
+                self.bin_path.display()
+            );
+            if let Err(e) = self.respawn() {
+                tracing::error!("Failed to respawn daemon: {}", e);
+                return result; // Return original error
+            }
+            // Retry the request once after respawn
+            return self.request_json_line_inner(config);
+        }
+
+        result
+    }
+
+    fn request_json_line_inner(&self, config: &Value) -> Result<DaemonResponse> {
         let mut io = self.io.lock().unwrap();
 
         let line = serde_json::to_string(config).context("Failed to serialize daemon request")?;

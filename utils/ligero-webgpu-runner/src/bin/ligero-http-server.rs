@@ -209,6 +209,15 @@ impl ServerState {
             .join(proof_filename);
         config["proof-path"] = Value::String(proof_path_abs.to_string_lossy().to_string());
 
+        // Helper to clean up proof directory if not keeping it
+        let cleanup_proof_dir = |keep: bool, dir: &PathBuf| {
+            if !keep {
+                if let Err(e) = std::fs::remove_dir_all(dir) {
+                    tracing::debug!("Failed to clean up proof directory {}: {}", dir.display(), e);
+                }
+            }
+        };
+
         // Send to prover daemon
         match self.prover_pool.prove(config) {
             Ok(resp) => {
@@ -223,9 +232,7 @@ impl ServerState {
                     match std::fs::read(&proof_file) {
                         Ok(proof_bytes) => {
                             // Clean up proof directory unless keeping it
-                            if !self.keep_proof_dir {
-                                let _ = std::fs::remove_dir_all(&proof_dir);
-                            }
+                            cleanup_proof_dir(self.keep_proof_dir, &proof_dir);
 
                             let proof_b64 = BASE64.encode(&proof_bytes);
                             ProveVerifyResponse {
@@ -235,36 +242,44 @@ impl ServerState {
                                 error: None,
                             }
                         }
-                        Err(e) => ProveVerifyResponse {
-                            success: false,
-                            exit_code: 1,
-                            proof: None,
-                            error: Some(format!(
-                                "Prover daemon succeeded but failed to read proof: {}\nproof dir: {}",
-                                e,
-                                proof_dir.display()
-                            )),
-                        },
+                        Err(e) => {
+                            // Clean up even on read failure
+                            cleanup_proof_dir(self.keep_proof_dir, &proof_dir);
+                            ProveVerifyResponse {
+                                success: false,
+                                exit_code: 1,
+                                proof: None,
+                                error: Some(format!(
+                                    "Prover daemon succeeded but failed to read proof: {}",
+                                    e,
+                                )),
+                            }
+                        }
                     }
                 } else {
+                    // Clean up on prover failure
+                    cleanup_proof_dir(self.keep_proof_dir, &proof_dir);
                     ProveVerifyResponse {
                         success: false,
                         exit_code: resp.exit_code.unwrap_or(1) as i32,
                         proof: None,
                         error: Some(format!(
-                            "Prover daemon failed: {}\nproof dir: {}",
+                            "Prover daemon failed: {}",
                             resp.error.unwrap_or_else(|| "unknown error".to_string()),
-                            proof_dir.display()
                         )),
                     }
                 }
             }
-            Err(e) => ProveVerifyResponse {
-                success: false,
-                exit_code: 1,
-                proof: None,
-                error: Some(format!("Prover daemon request failed: {}", e)),
-            },
+            Err(e) => {
+                // Clean up on daemon request failure
+                cleanup_proof_dir(self.keep_proof_dir, &proof_dir);
+                ProveVerifyResponse {
+                    success: false,
+                    exit_code: 1,
+                    proof: None,
+                    error: Some(format!("Prover daemon request failed: {}", e)),
+                }
+            }
         }
     }
 
@@ -630,18 +645,63 @@ Environment variables:
     let server = Arc::new(server);
     let mut handles = Vec::with_capacity(num_threads);
 
-    for _ in 0..num_threads {
+    for thread_id in 0..num_threads {
         let server = Arc::clone(&server);
         let state = Arc::clone(&state);
         handles.push(std::thread::spawn(move || {
+            let mut consecutive_errors = 0u32;
+            const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+            const ERROR_BACKOFF_MS: u64 = 100;
+
             loop {
                 match server.recv() {
                     Ok(request) => {
+                        consecutive_errors = 0; // Reset on successful receive
                         handle_request(&state, request);
                     }
                     Err(e) => {
-                        tracing::error!("Error receiving request: {}", e);
-                        break;
+                        consecutive_errors += 1;
+                        let error_str = e.to_string();
+
+                        // Check if this is a recoverable error (like EMFILE - too many open files)
+                        let is_resource_error = error_str.contains("Too many open files")
+                            || error_str.contains("os error 24")
+                            || error_str.contains("EMFILE")
+                            || error_str.contains("resource temporarily unavailable");
+
+                        if is_resource_error {
+                            tracing::warn!(
+                                thread = thread_id,
+                                consecutive_errors,
+                                "Recoverable resource error receiving request: {}. Backing off...",
+                                e
+                            );
+                            // Back off to allow file descriptors to be reclaimed
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                ERROR_BACKOFF_MS * consecutive_errors as u64,
+                            ));
+                            // Don't break - keep trying
+                            continue;
+                        }
+
+                        tracing::error!(
+                            thread = thread_id,
+                            consecutive_errors,
+                            "Error receiving request: {}",
+                            e
+                        );
+
+                        // Only terminate if we hit too many consecutive non-recoverable errors
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            tracing::error!(
+                                thread = thread_id,
+                                "Too many consecutive errors, thread exiting"
+                            );
+                            break;
+                        }
+
+                        // Brief pause before retrying
+                        std::thread::sleep(std::time::Duration::from_millis(ERROR_BACKOFF_MS));
                     }
                 }
             }
