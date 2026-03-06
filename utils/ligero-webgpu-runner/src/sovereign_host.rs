@@ -224,3 +224,54 @@ impl LigeroHostCore {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::LigeroHostCore;
+    use crate::LigeroArg;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(msg) = payload.downcast_ref::<&'static str>() {
+            return (*msg).to_string();
+        }
+        if let Some(msg) = payload.downcast_ref::<String>() {
+            return msg.clone();
+        }
+        "non-string panic payload".to_string()
+    }
+
+    #[test]
+    fn value_out_1_greater_than_i64_max_fails() {
+        let mut host = LigeroHostCore::new("note_spend_guest");
+        let value_out_1 = (i64::MAX as u64) + 1;
+
+        let panic_payload = catch_unwind(AssertUnwindSafe(|| host.add_u64_arg(value_out_1)))
+            .expect_err("value_out_1 > i64::MAX must fail");
+        let panic_msg = panic_payload_to_string(panic_payload);
+
+        assert!(
+            panic_msg.contains("u64 value too large for i64 encoding"),
+            "unexpected panic message: {panic_msg}"
+        );
+    }
+
+    #[test]
+    fn value_out_1_less_or_equal_i64_max_works() {
+        let mut host = LigeroHostCore::new("note_spend_guest");
+        let i64_max_u64 = i64::MAX as u64;
+
+        host.add_u64_arg(i64_max_u64 - 1);
+        host.add_u64_arg(i64_max_u64);
+
+        assert_eq!(
+            host.runner().config().args,
+            vec![
+                LigeroArg::I64 {
+                    i64: i64::MAX - 1
+                },
+                LigeroArg::I64 { i64: i64::MAX },
+            ]
+        );
+    }
+}
